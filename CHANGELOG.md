@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix `audio_language`/`subtitle_language` `plex_search` filters matching zero items whenever a library has multiple Plex-reported locale variants for the requested language (e.g. `de` + `de-DE`); the variants were being `AND` together into an impossible filter instead of `OR`. Regression from #3440.
 - Fix `episode_*` ratings from producing a critical error when Trakt did not have an episode in its database
 - Allow runs to continue when GitHub version, public Trakt client-ID, or Anime-IDs mapping requests fail.
-- Added GitHub status checks and standardize some errors when GitHub responds with 429 errors
+- Check all GitHub Status components before version resolution and standardize GitHub 429 errors.
 
 ## [v2.4.8] - 2026-08-15
 

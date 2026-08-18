@@ -47,19 +47,26 @@ class TestVersion:
         assert not requests._version("develop")
         logger.warning.assert_called_once_with("GitHub Version Warning: (429) Too Many Requests")
 
-    def test_github_status_outage_skips_version_check(self, monkeypatch):
+    def test_github_status_outage_still_checks_version(self, monkeypatch):
         from modules.request import Version
 
         requests = make_requests()
         requests._github_is_operational = None
         requests._latest = None
-        requests.get_json = MagicMock(return_value={"components": [{"name": "Git Operations", "status": "degraded_performance"}, {"name": "Webhooks", "status": "operational"}, {"name": "API Requests", "status": "operational"}]})
+        requests._branch = None
+        requests._develop = None
+        requests.git_branch = "develop"
+        requests.env_branch = None
+        requests.local = Version("2.4.8-build1")
+        requests.get_json = MagicMock(return_value={"components": [{"name": "Git Operations", "status": "degraded_performance"}, {"name": "Actions", "status": "partial_outage"}]})
         requests._version = MagicMock(return_value=Version("2.4.9"))
-        monkeypatch.setattr("modules.request.logger", MagicMock())
+        logger = MagicMock()
+        monkeypatch.setattr("modules.request.logger", logger)
 
         assert not requests.github_is_operational
-        assert not requests.latest
-        requests._version.assert_not_called()
+        assert str(requests.latest) == "2.4.9"
+        requests._version.assert_called_once_with("develop")
+        logger.error.assert_called_once_with("GitHub Status Error: Git Operations (degraded_performance), Actions (partial_outage). Check https://www.githubstatus.com/")
 
 
 class TestGetHeader:

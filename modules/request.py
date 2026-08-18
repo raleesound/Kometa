@@ -18,7 +18,6 @@ logger = util.logger
 
 image_content_types = ["image/png", "image/jpeg", "image/webp"]
 github_status_url = "https://www.githubstatus.com/api/v2/summary.json"
-github_status_components = ["Git Operations", "Webhooks", "API Requests"]
 github_hosts = ["api.github.com", "github.com", "raw.githubusercontent.com"]
 
 # Per-socket-operation timeout for every outbound request; without one a
@@ -258,14 +257,13 @@ class Requests:
         if self._github_is_operational is None:
             try:
                 summary = self.get_json(github_status_url)
-                components = {component["name"]: component["status"] for component in summary.get("components", [])}
-                affected = [f"{component} ({components[component]})" for component in github_status_components if components.get(component) != "operational"]
+                affected = [f"{component.get('name', 'Unknown')} ({component.get('status', 'unknown')})" for component in summary.get("components", []) if component.get("status") != "operational"]
                 if affected:
-                    logger.error(f"GitHub Status Error: {', '.join(affected)}")
+                    logger.error(f"GitHub Status Error: {', '.join(affected)}. Check https://www.githubstatus.com/")
                     self._github_is_operational = False
                 else:
                     self._github_is_operational = True
-            except (ConnectionError, RetryError, ValueError) as e:
+            except (ConnectionError, RetryError, Failed, ValueError) as e:
                 logger.warning(f"GitHub Status Warning: Unable to check GitHub status: {e}")
                 self._github_is_operational = True
         return self._github_is_operational
@@ -278,9 +276,8 @@ class Requests:
             elif self.env_branch in ["develop", "nightly"]:
                 self._branch = self.env_branch
             elif self.local.build > 0:
-                if not self.github_is_operational:
-                    self._branch = "nightly"
-                elif self.local.main != self.develop.main or self.local.build <= self.develop.build:
+                self.github_is_operational
+                if self.local.main != self.develop.main or self.local.build <= self.develop.build:
                     self._branch = "develop"
                 else:
                     self._branch = "nightly"
@@ -291,9 +288,8 @@ class Requests:
     @property
     def latest(self):
         if self._latest is None:
-            if not self.github_is_operational:
-                self._latest = Version()
-            elif self.branch == "develop":
+            self.github_is_operational
+            if self.branch == "develop":
                 self._latest = self.develop
             elif self.branch == "nightly":
                 self._latest = self.nightly
