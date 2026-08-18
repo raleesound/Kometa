@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+from tenacity import RetryError
 
 import modules.builder  # noqa: F401
 
@@ -36,6 +37,38 @@ class TestConvert:
     def test_tvdb_to_tmdb_cache_hit(self, adapter):
         adapter.cache.query_tmdb_to_tvdb_map.return_value = (550, False)
         assert adapter.tvdb_to_tmdb(368207, fail=False) == 550
+
+    def test_anidb_ids_fetch_failure_is_non_fatal(self, monkeypatch):
+        from modules.convert import Convert
+
+        requests = MagicMock()
+        requests.get_json.side_effect = ValueError("invalid JSON")
+        logger = MagicMock()
+        monkeypatch.setattr("modules.convert.logger", logger)
+
+        convert = Convert(requests, MagicMock(), MagicMock())
+
+        assert convert._anidb_ids == {}
+        logger.error.assert_called_once_with("Convert Error: Unable to fetch AniDB IDs from https://raw.githubusercontent.com/Kometa-Team/Anime-IDs/master/anime_ids.json: invalid JSON")
+
+    def test_anidb_ids_retry_failure_is_non_fatal(self, monkeypatch):
+        from modules.convert import Convert
+
+        requests = MagicMock()
+        requests.get_json.side_effect = RetryError(MagicMock())
+        monkeypatch.setattr("modules.convert.logger", MagicMock())
+
+        assert Convert(requests, MagicMock(), MagicMock())._anidb_ids == {}
+
+    def test_anidb_ids_rate_limit_is_non_fatal(self, monkeypatch):
+        from modules.convert import Convert
+        from modules.util import Failed
+
+        requests = MagicMock()
+        requests.get_json.side_effect = Failed("URL Error: (429) Too Many Requests")
+        monkeypatch.setattr("modules.convert.logger", MagicMock())
+
+        assert Convert(requests, MagicMock(), MagicMock())._anidb_ids == {}
 
     def test_hama_suffix_extracts_trailing_id(self):
         from modules.convert import Convert

@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import modules.builder  # noqa: F401
+from modules.util import Failed
 
 
 class TestGitHub:
@@ -37,3 +38,9 @@ class TestGitHub:
     def test_translation_keys_returns_cached_list(self, adapter):
         adapter._translation_keys = ["en"]
         assert adapter.translation_keys == ["en"]
+
+    def test_rate_limited_translation_has_a_clear_error(self, adapter):
+        adapter._requests = MagicMock(side_effect=Failed("URL Error: (429) Too Many Requests"))
+
+        with pytest.raises(Failed, match="Translations Error: Unable to fetch translations"):
+            adapter.translation_yaml("en")

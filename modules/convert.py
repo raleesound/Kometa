@@ -2,6 +2,7 @@ import re
 
 from plexapi.exceptions import BadRequest
 from requests.exceptions import ConnectionError
+from tenacity import RetryError
 
 from modules import timings, util
 from modules.request import urlparse
@@ -29,7 +30,10 @@ class Convert:
         self._tmdb_show_to_anidb = {}
         self._imdb_to_anidb = {}
         self._tvdb_to_anidb = {}
-        self._anidb_ids = self.requests.get_json(anime_lists_url)
+        try:
+            self._anidb_ids = self.requests.get_json(anime_lists_url)
+        except (ConnectionError, RetryError, Failed, ValueError) as e:
+            logger.error(f"Convert Error: Unable to fetch AniDB IDs from {anime_lists_url}: {e}")
         for anidb_id, ids in self._anidb_ids.items():
             anidb_id = int(anidb_id)
             if "mal_id" in ids:

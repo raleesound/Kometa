@@ -1,7 +1,7 @@
 import time
 from typing import Any
 
-from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_fixed
+from tenacity import RetryError, retry, retry_if_not_exception_type, stop_after_attempt, wait_fixed
 
 from modules import util
 from modules.request import urlparse
@@ -76,7 +76,10 @@ class Trakt:
         self._show_certifications = None
 
     def _get_public_client_id(self) -> str:
-        response = self.requests.get(utilities_client_ids_url)
+        try:
+            response = self.requests.get(utilities_client_ids_url)
+        except RetryError as e:
+            raise Failed(f"Trakt Error: Unable to fetch public Client IDs from {utilities_client_ids_url}: {e}")
         if response.status_code != 200:
             raise Failed(f"Trakt Error: Unable to fetch public Client IDs from {utilities_client_ids_url}: ({response.status_code}) {response.reason}")
         for line in response.text.splitlines():

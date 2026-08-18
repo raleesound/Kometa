@@ -8,7 +8,7 @@ import requests
 import ruamel.yaml
 from lxml import html
 from requests.exceptions import ConnectionError, RequestException
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import RetryError, retry, stop_after_attempt, wait_exponential
 
 from modules import timings, util
 from modules.poster import ImageData
@@ -17,6 +17,9 @@ from modules.util import Failed
 logger = util.logger
 
 image_content_types = ["image/png", "image/jpeg", "image/webp"]
+github_status_url = "https://www.githubstatus.com/api/v2/summary.json"
+github_status_components = ["Git Operations", "Webhooks", "API Requests"]
+github_hosts = ["api.github.com", "github.com", "raw.githubusercontent.com"]
 
 # Per-socket-operation timeout for every outbound request; without one a
 # stalled external server hangs the whole run (tenacity only retries on
@@ -86,6 +89,8 @@ class Requests:
         self._branch = None
         self._latest = None
         self._newest = None
+        self._github_is_operational = None
+        self._github_rate_limit_reported = False
         self.session = self.create_session()
         self.cloudscraper = cloudscraper.create_scraper()
         self.global_ssl = verify_ssl
@@ -137,7 +142,7 @@ class Requests:
         if response.status_code == 404:
             raise Failed(f"URL Error: No file found at {url}")
         if response.status_code == 429:
-            raise Failed(f"URL Error: Too many requests -  {url}")
+            raise Failed("URL Error: (429) Too Many Requests")
         if response.status_code >= 400:
             raise Failed(f"URL Error: {response.status_code} on {url}")
         # get_yaml never sets a path, so save() was already a no-op here - read_only=True is a pure speed win (safe loader) plus a defensive guard against future misuse.
@@ -207,6 +212,8 @@ class Requests:
 
     def get_json(self, url, json=None, headers=None, params=None, header=None, language=None):
         response = self.get(url, json=json, headers=headers, params=params, header=header, language=language)
+        if response.status_code == 429:
+            raise Failed("URL Error: (429) Too Many Requests")
         try:
             return response.json()
         except ValueError:
@@ -215,7 +222,11 @@ class Requests:
 
     @retry(stop=stop_after_attempt(6), wait=wait_exponential(multiplier=1, min=1, max=10))
     def get(self, url, json=None, headers=None, params=None, header=None, language=None):
-        return self.session.get(url, json=json, headers=get_header(headers, header, language), params=params, timeout=DEFAULT_TIMEOUT)
+        response = self.session.get(url, json=json, headers=get_header(headers, header, language), params=params, timeout=DEFAULT_TIMEOUT)
+        if response.status_code == 429 and urlparse(url).netloc in github_hosts and not getattr(self, "_github_rate_limit_reported", False):
+            logger.error("GitHub Error: GitHub appears to be having issues. Check https://www.githubstatus.com/")
+            self._github_rate_limit_reported = True
+        return response
 
     @retry(stop=stop_after_attempt(6), wait=wait_exponential(multiplier=1, min=1, max=10))
     def head(self, url, headers=None, header=None, language=None):
@@ -243,6 +254,23 @@ class Requests:
         return self.local and self.latest and self.local.main != self.latest.main or (self.local.build and self.local.build < self.latest.build)
 
     @property
+    def github_is_operational(self):
+        if self._github_is_operational is None:
+            try:
+                summary = self.get_json(github_status_url)
+                components = {component["name"]: component["status"] for component in summary.get("components", [])}
+                affected = [f"{component} ({components[component]})" for component in github_status_components if components.get(component) != "operational"]
+                if affected:
+                    logger.error(f"GitHub Status Error: {', '.join(affected)}")
+                    self._github_is_operational = False
+                else:
+                    self._github_is_operational = True
+            except (ConnectionError, RetryError, ValueError) as e:
+                logger.warning(f"GitHub Status Warning: Unable to check GitHub status: {e}")
+                self._github_is_operational = True
+        return self._github_is_operational
+
+    @property
     def branch(self):
         if self._branch is None:
             if self.git_branch in ["develop", "nightly"]:
@@ -250,7 +278,9 @@ class Requests:
             elif self.env_branch in ["develop", "nightly"]:
                 self._branch = self.env_branch
             elif self.local.build > 0:
-                if self.local.main != self.develop.main or self.local.build <= self.develop.build:
+                if not self.github_is_operational:
+                    self._branch = "nightly"
+                elif self.local.main != self.develop.main or self.local.build <= self.develop.build:
                     self._branch = "develop"
                 else:
                     self._branch = "nightly"
@@ -261,7 +291,9 @@ class Requests:
     @property
     def latest(self):
         if self._latest is None:
-            if self.branch == "develop":
+            if not self.github_is_operational:
+                self._latest = Version()
+            elif self.branch == "develop":
                 self._latest = self.develop
             elif self.branch == "nightly":
                 self._latest = self.nightly
@@ -300,8 +332,12 @@ class Requests:
     def _version(self, level):
         try:
             url = f"https://raw.githubusercontent.com/Kometa-Team/Kometa/{level}/VERSION"
-            return Version(self.get(url).content.decode().strip())
-        except ConnectionError:
+            response = self.get(url)
+            if response.status_code != 200:
+                logger.warning(f"GitHub Version Warning: ({response.status_code}) {response.reason}")
+                return Version()
+            return Version(response.content.decode().strip())
+        except (ConnectionError, RetryError):
             return Version()
 
 

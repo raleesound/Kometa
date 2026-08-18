@@ -6,6 +6,7 @@ from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
+from tenacity import RetryError
 
 import modules.builder  # noqa: F401
 
@@ -30,6 +31,35 @@ class TestVersion:
         from modules.request import Version
 
         assert bool(Version()) is False
+
+    def test_version_retry_failure_returns_unknown(self):
+        requests = make_requests()
+        requests.get = MagicMock(side_effect=RetryError(MagicMock()))
+
+        assert not requests._version("develop")
+
+    def test_rate_limited_version_returns_unknown(self, monkeypatch):
+        requests = make_requests()
+        requests.get = MagicMock(return_value=MagicMock(status_code=429, reason="Too Many Requests"))
+        logger = MagicMock()
+        monkeypatch.setattr("modules.request.logger", logger)
+
+        assert not requests._version("develop")
+        logger.warning.assert_called_once_with("GitHub Version Warning: (429) Too Many Requests")
+
+    def test_github_status_outage_skips_version_check(self, monkeypatch):
+        from modules.request import Version
+
+        requests = make_requests()
+        requests._github_is_operational = None
+        requests._latest = None
+        requests.get_json = MagicMock(return_value={"components": [{"name": "Git Operations", "status": "degraded_performance"}, {"name": "Webhooks", "status": "operational"}, {"name": "API Requests", "status": "operational"}]})
+        requests._version = MagicMock(return_value=Version("2.4.9"))
+        monkeypatch.setattr("modules.request.logger", MagicMock())
+
+        assert not requests.github_is_operational
+        assert not requests.latest
+        requests._version.assert_not_called()
 
 
 class TestGetHeader:
@@ -168,6 +198,15 @@ class CountingLogger:
 
 class TestTimeouts:
     """A stalled external server must not hang a run forever."""
+
+    def test_get_json_rejects_rate_limited_response(self):
+        from modules.util import Failed
+
+        req = make_requests()
+        req.get = MagicMock(return_value=MagicMock(status_code=429))
+
+        with pytest.raises(Failed, match=r"\(429\) Too Many Requests"):
+            req.get_json("https://example.com/data.json")
 
     def test_get_sends_default_timeout(self):
         import modules.request as request_module

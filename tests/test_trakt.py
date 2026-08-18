@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from tenacity import RetryError
 
 import modules.builder  # noqa: F401
 import modules.trakt as trakt_module
@@ -102,6 +103,14 @@ class TestTraktPublicClientId:
         trakt.requests.get.return_value = SimpleNamespace(status_code=200, text="OTHER_CLIENT_ID=other-client-id\n")
 
         with pytest.raises(Failed, match="Unable to find TRAKT_CLIENT_ID"):
+            trakt._get_public_client_id()
+
+    def test_raises_failed_when_client_id_request_retries_are_exhausted(self):
+        trakt = Trakt.__new__(Trakt)
+        trakt.requests = MagicMock()
+        trakt.requests.get.side_effect = RetryError(MagicMock())
+
+        with pytest.raises(Failed, match="Unable to fetch public Client IDs"):
             trakt._get_public_client_id()
 
 

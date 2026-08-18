@@ -104,7 +104,13 @@ class GitHub:
 
     def translation_yaml(self, translation_key):
         if translation_key not in self._translations:
-            yaml = self._requests(f"{self.translation_url}{translation_key}.yml", yaml=True).data
+            url = f"{self.translation_url}{translation_key}.yml"
+            try:
+                yaml = self._requests(url, yaml=True).data
+            except Failed as e:
+                if str(e) == "URL Error: (429) Too Many Requests":
+                    raise Failed(f"Translations Error: Unable to fetch translations from {url}: (429) Too Many Requests")
+                raise
             output = {"collections": {}, "key_names": {}, "variables": {}}
             for k in output:
                 if k in yaml:
