@@ -176,6 +176,53 @@ def test_tracearr_activity_builders_support_custom_sort(method):
     assert method in builder_module.playlist_attributes
 
 
+class TestValidateCustomSort:
+    """A custom sort is rejected only when a builder has no order to give.
+
+    `collection_order: custom` (and every playlist, which is always custom)
+    used to be refused outright as soon as a second builder appeared. Nothing
+    in the sort path needed that: kometa.py walks self.builders in config
+    order, each appending to found_items, and sort_collection replays
+    found_items as-is -- so several ordered builders concatenate cleanly.
+    Rob's collections rely on this to union an upstream Letterboxd list with a
+    local text_file while keeping list order.
+    """
+
+    @staticmethod
+    def _builder(builders, custom_sort="custom", playlist=False):
+        return make_builder(builders=builders, custom_sort=custom_sort, playlist=playlist, Type="Playlist" if playlist else "Collection")
+
+    def test_several_ordered_builders_are_allowed(self):
+        b = self._builder([("letterboxd_list", {}), ("text_file", "/config/movies/generated/spoof.txt")])
+        b._validate_custom_sort()
+
+    def test_single_ordered_builder_is_allowed(self):
+        self._builder([("letterboxd_list", {})])._validate_custom_sort()
+
+    def test_unordered_builder_is_rejected_and_named(self):
+        b = self._builder([("plex_all", {})])
+        with pytest.raises(builder_module.BuilderValidationError, match="cannot be used with plex_all"):
+            b._validate_custom_sort()
+
+    def test_one_unordered_builder_among_ordered_ones_is_rejected(self):
+        b = self._builder([("letterboxd_list", {}), ("plex_all", {}), ("text_file", "x.txt")])
+        with pytest.raises(builder_module.BuilderValidationError, match="cannot be used with plex_all"):
+            b._validate_custom_sort()
+
+    def test_a_field_sort_is_not_a_custom_sort(self):
+        # collection_order: random parses to a LIST of sort fields, which Plex
+        # applies itself -- builder order is irrelevant, so nothing to check.
+        self._builder([("plex_all", {})], custom_sort=["random"])._validate_custom_sort()
+
+    def test_no_custom_sort_checks_nothing(self):
+        self._builder([("plex_all", {})], custom_sort=None)._validate_custom_sort()
+
+    def test_playlist_error_says_playlists(self):
+        b = self._builder([("plex_all", {})], playlist=True)
+        with pytest.raises(builder_module.BuilderValidationError, match="Playlists cannot be used with plex_all"):
+            b._validate_custom_sort()
+
+
 def test_tracearr_parser_supports_user_and_quality_filters():
     builder = make_builder()
 

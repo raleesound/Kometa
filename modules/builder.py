@@ -1719,10 +1719,7 @@ class CollectionBuilder:
         if self.blank_collection and len(self.builders) > 0:
             raise BuilderValidationError(f"{self.Type} Error: No builders allowed with blank_collection")
 
-        if not isinstance(self.custom_sort, list) and self.custom_sort and (len(self.builders) > 1 or self.builders[0][0] not in custom_sort_builders):
-            raise BuilderValidationError(
-                f"{self.Type} Error: " + ("Playlists" if self.playlist else "collection_order: custom") + (f" can only be used with a single builder per {self.type}" if len(self.builders) > 1 else f" cannot be used with {self.builders[0][0]}")
-            )
+        self._validate_custom_sort()
 
         if "add_missing" not in self.radarr_details:
             self.radarr_details["add_missing"] = self.library.Radarr.add_missing if self.library.Radarr else False
@@ -1794,6 +1791,26 @@ class CollectionBuilder:
 
         logger.info("")
         logger.info("Validation Successful")
+
+    def _validate_custom_sort(self):
+        """Reject a custom sort only when a builder cannot contribute an order.
+
+        A custom sort means "keep the order the builders produced", and that is
+        already well defined for more than one of them: kometa.py iterates
+        self.builders in config order, each builder appending to found_items
+        and deduping as it goes (first occurrence wins), and sort_collection
+        walks found_items unchanged. So N builders give each list in its own
+        order, concatenated in the order they appear in the YAML.
+
+        The requirement is therefore not "exactly one builder" but "every
+        builder has an order of its own to contribute" -- an unordered source
+        has nothing to say about where its items belong.
+        """
+        if isinstance(self.custom_sort, list) or not self.custom_sort:
+            return
+        unordered = sorted({method for method, _ in self.builders if method not in custom_sort_builders})
+        if unordered:
+            raise BuilderValidationError(f"{self.Type} Error: " + ("Playlists" if self.playlist else "collection_order: custom") + f" cannot be used with {', '.join(unordered)}")
 
     def _summary(self, method_name, method_data):
         if method_name == "summary":
