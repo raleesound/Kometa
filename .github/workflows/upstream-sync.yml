@@ -28,6 +28,10 @@ on:
   schedule:
     # 05:20 UTC — after upstream's own nightly build, and outside the media
     # host's Kometa run windows.
+    #
+    # GitHub runs scheduled workflows ONLY from the repository's default branch,
+    # so this file has to live on the default branch to fire at all. It checks
+    # out and merges `nightly` regardless of where it runs from.
     - cron: "20 5 * * *"
   workflow_dispatch:
 
@@ -39,6 +43,8 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  # Required by claude-code-action for its default GitHub App authentication.
+  id-token: write
 
 env:
   UPSTREAM: https://github.com/Kometa-Team/Kometa.git
@@ -105,6 +111,11 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: --max-turns 40
+          # claude-code-action refuses to run for a bot actor. GitHub attributes a
+          # scheduled run to whoever last changed the cron line, which here is the
+          # commit bot, so the run would be rejected without this. Named explicitly
+          # rather than "*", which would let any external app trigger it on a public repo.
+          allowed_bots: "ai-app-factory-agent[bot]"
           prompt: |
             This repository is a fork of Kometa-Team/Kometa. An automated merge of
             upstream's `nightly` branch into ours has stopped with conflicts, and the
