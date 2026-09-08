@@ -6,8 +6,18 @@
 #
 # The merge is gated on the full test suite running here, not on branch
 # protection, so a green run means the tests actually passed rather than that no
-# checks were configured. A conflict or a failure opens an issue and stops; it
-# never leaves a half-merged branch behind.
+# checks were configured.
+#
+# A conflict is handed to Claude Code to resolve, because the alternative is an
+# issue nobody reads and a fork that quietly stops tracking upstream. The agent's
+# word is never taken for it: whatever it produces is re-tested from scratch by
+# this job, including tests/test_fork_invariants.py, which pins every feature
+# this fork owns. Resolving a conflict in upstream's favour deletes our work
+# silently and is the single most likely way for this to go wrong, so that check
+# is what actually guards the merge.
+#
+# An agent-resolved merge always goes to a pull request, never straight to the
+# branch, so a human sees the resolution even when everything is green.
 #
 # Nothing here deploys. The media host pins an explicit SHA in KOMETA_REF, so
 # upstream code reaches Plex only when someone bumps that and runs deploy.sh.
@@ -39,6 +49,11 @@ env:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      # `secrets` cannot be read from a step-level `if:`, but job env can be, and job
+      # env may read secrets. Without the token the agent steps skip and a conflict
+      # falls through to the issue path.
+      HAVE_AGENT_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,7 +65,7 @@ jobs:
         run: |
           git remote add upstream "$UPSTREAM"
           git fetch --no-tags upstream "$BRANCH"
-          behind=$(git rev-list --count HEAD..upstream/$BRANCH)
+          behind=$(git rev-list --count "HEAD..upstream/$BRANCH")
           echo "behind=$behind" >> "$GITHUB_OUTPUT"
           echo "Behind upstream/$BRANCH by $behind commit(s)."
 
@@ -60,7 +75,7 @@ jobs:
         run: |
           git config user.name "kometa-sync[bot]"
           git config user.email "kometa-sync[bot]@users.noreply.github.com"
-          if git merge --no-edit upstream/$BRANCH; then
+          if git merge --no-edit "upstream/$BRANCH"; then
             echo "conflict=false" >> "$GITHUB_OUTPUT"
           else
             # Leave nothing half-merged for the next run to trip over.
@@ -68,39 +83,149 @@ jobs:
             echo "conflict=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Re-merge, leaving the conflicts in the tree for the agent
+        id: remerge
+        if: steps.merge.outputs.conflict == 'true' && env.HAVE_AGENT_TOKEN == 'true'
+        run: |
+          git merge --no-commit --no-ff "upstream/$BRANCH" || true
+          {
+            echo "files<<EOF"
+            git diff --name-only --diff-filter=U
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Conflicted files:"
+          git diff --name-only --diff-filter=U
+
+      - name: Resolve conflicts with Claude Code
+        id: agent
+        if: steps.remerge.outcome == 'success'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_args: --max-turns 40
+          prompt: |
+            This repository is a fork of Kometa-Team/Kometa. An automated merge of
+            upstream's `nightly` branch into ours has stopped with conflicts, and the
+            conflicted working tree is in front of you right now.
+
+            Resolve every conflict, then make the test suite pass.
+
+            Conflicted files:
+            ${{ steps.remerge.outputs.files }}
+
+            What matters here:
+
+            - Keep BOTH sides' intent. Upstream's change is there for a reason and so is
+              ours. Taking one side wholesale is almost always wrong, and taking
+              upstream's side silently deletes features this fork exists to provide.
+            - `tests/test_fork_invariants.py` lists everything this fork owns and why.
+              Read it first. It is the specification for what must still work when you
+              are done. Do not edit or weaken it to make a failure go away — if one of
+              its assertions fails, the resolution is wrong, not the test.
+            - Where upstream has restructured code we changed, reapply our change in the
+              new structure rather than reverting to the old one.
+            - Run `python -m pytest tests/ -q` and iterate until it passes. Fix the
+              resolution, not the tests.
+            - Leave no conflict markers anywhere, including in YAML and Markdown, where
+              they parse happily and would ship.
+            - Do not commit, push, or open a pull request. Leave the resolved files in
+              the working tree; the workflow handles the rest.
+
+            If a conflict genuinely cannot be resolved without a decision only a human
+            can make, stop and explain which file and what the competing intents are,
+            rather than guessing.
+
+      - name: Commit the agent's resolution
+        id: agent_commit
+        if: steps.agent.outcome == 'success'
+        run: |
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            echo "Conflicts remain unresolved:"
+            git diff --name-only --diff-filter=U
+            git merge --abort || true
+            echo "resolved=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git add -A
+          git commit --no-edit || git commit -m "Merge upstream/${BRANCH} (conflicts resolved by Claude Code)"
+          echo "resolved=true" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-python@v7
-        if: steps.merge.outputs.conflict == 'false'
+        if: steps.merge.outputs.conflict == 'false' || steps.agent_commit.outputs.resolved == 'true'
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # Independent of anything the agent believes about its own work.
       - name: Test the merge result
         id: tests
-        if: steps.merge.outputs.conflict == 'false'
+        if: steps.merge.outputs.conflict == 'false' || steps.agent_commit.outputs.resolved == 'true'
         continue-on-error: true
         run: |
           pip install -q -r requirements.txt -r dev-requirements.txt pytest
           python -m pytest tests/ -q
 
-      - name: Push
+      - name: Push a clean merge
         if: steps.merge.outputs.conflict == 'false' && steps.tests.outcome == 'success'
         run: |
-          git push origin HEAD:$BRANCH
-          echo "Merged $(git rev-list --count HEAD@{1}..HEAD) upstream commit(s) into $BRANCH."
+          git push origin "HEAD:$BRANCH"
+          echo "Merged ${{ steps.fetch.outputs.behind }} upstream commit(s) into ${BRANCH}."
+
+      # An agent touched this one, so a human reviews it even though it is green.
+      # An agent touched this one, so a human reviews it even though it is green.
+      - name: Open a PR for the agent's resolution
+        if: steps.agent_commit.outputs.resolved == 'true' && steps.tests.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFLICTED: ${{ steps.remerge.outputs.files }}
+          BEHIND: ${{ steps.fetch.outputs.behind }}
+        run: |
+          pr_branch="upstream-sync/agent-$(date -u +%Y%m%d-%H%M)"
+          git push origin "HEAD:$pr_branch"
+          {
+            echo "Merging \`upstream/$BRANCH\` conflicted. Claude Code resolved it and the full"
+            echo "test suite passes on the result, including \`tests/test_fork_invariants.py\`,"
+            echo "which pins every feature this fork owns."
+            echo
+            echo "Review the resolution before merging. The thing to check is whether our change"
+            echo "and upstream's change both survived — a resolution that quietly drops one side"
+            echo "passes every test upstream wrote."
+            echo
+            echo "Behind upstream by $BEHIND commit(s). Conflicted files:"
+            echo
+            echo '```'
+            echo "$CONFLICTED"
+            echo '```'
+          } > /tmp/pr-body.md
+          gh pr create --base "$BRANCH" --head "$pr_branch" \
+            --title "Upstream sync: $BEHIND commit(s), conflicts resolved by Claude Code" \
+            --label upstream-sync \
+            --body-file /tmp/pr-body.md
 
       - name: Report a sync that needs a human
-        if: steps.merge.outputs.conflict == 'true' || (steps.tests.outcome == 'failure')
+        if: |
+          (steps.merge.outputs.conflict == 'false' && steps.tests.outcome == 'failure') ||
+          (steps.merge.outputs.conflict == 'true' && (steps.agent_commit.outputs.resolved != 'true' || steps.tests.outcome != 'success'))
         uses: actions/github-script@v7
         with:
           script: |
             const conflict = '${{ steps.merge.outputs.conflict }}' === 'true';
+            const agentRan = '${{ steps.agent.outcome }}' !== '';
+            const agentResolved = '${{ steps.agent_commit.outputs.resolved }}' === 'true';
             const behind = '${{ steps.fetch.outputs.behind }}';
             const title = conflict
               ? `Upstream sync: merge conflict against ${process.env.BRANCH}`
               : `Upstream sync: tests fail after merging ${process.env.BRANCH}`;
+            const cause = !conflict
+              ? `\`upstream/${process.env.BRANCH}\` merges cleanly but the test suite fails on the result. Nothing was pushed.`
+              : !agentRan
+                ? `Merging \`upstream/${process.env.BRANCH}\` conflicts with our diff, and no CLAUDE_CODE_OAUTH_TOKEN secret is set, so it could not be resolved automatically. The merge was aborted; the branch is untouched.`
+                : !agentResolved
+                  ? `Merging \`upstream/${process.env.BRANCH}\` conflicts with our diff and Claude Code could not resolve it. The merge was aborted; the branch is untouched.`
+                  : `Claude Code resolved the conflicts but the test suite still fails. Nothing was pushed. Check tests/test_fork_invariants.py first — a failure there means the resolution dropped one of our features.`;
             const body = [
-              conflict
-                ? `Merging \`upstream/${process.env.BRANCH}\` conflicts with our diff. The merge was aborted; the branch is untouched.`
-                : `\`upstream/${process.env.BRANCH}\` merges cleanly but the test suite fails on the result. Nothing was pushed.`,
+              cause,
               ``,
               `Behind upstream by **${behind}** commit(s).`,
               ``,
