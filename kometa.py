@@ -199,6 +199,7 @@ is_linuxserver = get_env("KOMETA_LINUXSERVER", False, arg_bool=True)
 secret_args = {}
 plex_url = None
 plex_token = None
+consumed_unknown = set()
 i = 0
 while i < len(unknown):
     test_var = str(unknown[i]).lower().replace("_", "-")
@@ -211,8 +212,20 @@ while i < len(unknown):
             secret_args[test_var[9:]] = str(unknown[i + 1])
         elif test_var.startswith("--pmm-"):
             secret_args[test_var[6:]] = str(unknown[i + 1])
+        consumed_unknown.update({i, i + 1})
         i += 1
     i += 1
+
+# Anything left that looks like a flag was a typo or a flag this build does not have.
+# Silently ignoring it is dangerous: an unrecognised scoping flag (--run-items, say) does
+# not narrow the run, it starts a full library sweep that the caller never asked for. The
+# Docker entrypoint always appends a bare "--", which argparse may leave here; that is not
+# a flag and is ignored.
+unrecognised = [str(unknown[u]) for u in range(len(unknown)) if u not in consumed_unknown and str(unknown[u]).startswith("-") and str(unknown[u]) != "--"]
+if unrecognised:
+    print(f"Argument Error: unrecognised argument{'s' if len(unrecognised) > 1 else ''}: {', '.join(unrecognised)}")
+    print("Run with --help to see the supported arguments. Refusing to start rather than run something that was not asked for.")
+    sys.exit(1)
 
 plex_url = get_env("KOMETA_PLEX_URL", plex_url)
 plex_token = get_env("KOMETA_PLEX_TOKEN", plex_token)

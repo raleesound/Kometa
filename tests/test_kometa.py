@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -231,3 +233,49 @@ def test_status_summary_skips_empty_tables() -> None:
     """
     text = KOMETA_PY.read_text(encoding="utf-8")
     assert "if not status:\n            return" in text
+
+
+class TestUnrecognisedArguments:
+    """kometa.py must refuse to start on a flag it does not know.
+
+    argparse is used via parse_known_args() so that --kometa-*/--pmm-* secret
+    arguments can be picked up by hand. That left every other unknown flag
+    silently discarded, which is worse than a crash: an ignored scoping flag
+    (--run-items, say) does not narrow the run, it starts a full library sweep
+    nobody asked for.
+    """
+
+    @staticmethod
+    def _run(*extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(KOMETA_PY), *extra],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=REPO_ROOT,
+        )
+
+    def test_unknown_flag_exits_nonzero(self):
+        result = self._run("--run-itemz", "123")
+        assert result.returncode == 1
+        assert "--run-itemz" in result.stdout
+
+    def test_all_unknown_flags_are_named(self):
+        result = self._run("--nope", "--also-nope")
+        assert result.returncode == 1
+        assert "--nope" in result.stdout and "--also-nope" in result.stdout
+
+    def test_bare_double_dash_is_never_reported(self):
+        # The Docker entrypoint ends with a bare "--", which tini consumes as its own
+        # option terminator, so python normally never sees it. Should that ever change,
+        # "--" is a separator and must not be mistaken for an unrecognised flag.
+        # Asserted against the source because a lone "--" starts the scheduler, which
+        # never returns.
+        source = KOMETA_PY.read_text(encoding="utf-8")
+        guard = re.search(r"unrecognised = \[.*\]", source)
+        assert guard is not None, "unrecognised-argument guard not found"
+        assert '!= "--"' in guard.group(0)
+
+    def test_secret_arguments_are_still_accepted(self):
+        result = self._run("--kometa-some-secret", "value", "--help")
+        assert result.returncode == 0
