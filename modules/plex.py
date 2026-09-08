@@ -961,6 +961,24 @@ class Plex(Library):
     def fetchItems(self, uri_args):
         return self.Plex.fetchItems(f"/library/sections/{self.Plex.key}/all{'' if uri_args is None else uri_args}")
 
+    def get_items_by_rating_key(self, rating_keys):
+        # Scoped counterpart to get_all() for --run-items. A rating key is server-wide, not
+        # library-scoped, so verify each item actually lives in this library before returning it —
+        # otherwise a stray key would get this library's operations applied to another section's item.
+        items = []
+        for rating_key in rating_keys:
+            try:
+                item = self.fetchItem(rating_key)
+            except (BadRequest, NotFound) as e:
+                logger.error(f"Plex Error: No item found in {self.name} for rating key {rating_key}: {e}")
+                continue
+            if str(getattr(item, "librarySectionID", "")) != str(self.Plex.key):
+                logger.warning(f"Plex Warning: Rating key {rating_key} ({item.title}) is not in the {self.name} library, skipping")
+                continue
+            items.append(item)
+        logger.info(f"Loaded {len(items)}/{len(rating_keys)} requested item{'' if len(rating_keys) == 1 else 's'} from Library: {self.name}")
+        return items
+
     def get_all(self, builder_level=None, load=False):
         cache_top_level = builder_level in [None, "show", "artist", "movie"]
         if load and cache_top_level:

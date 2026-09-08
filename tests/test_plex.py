@@ -211,6 +211,38 @@ class TestImageUpdate:
         assert plex.filter_attr_cache == {(7, "labels"): ["Keep"]}
 
 
+class TestGetItemsByRatingKey:
+    def _plex(self):
+        plex = make_plex(name="Movies")
+        plex.Plex = MagicMock()
+        plex.Plex.key = 1
+        return plex
+
+    def test_returns_items_in_this_library(self):
+        plex = self._plex()
+        wanted = make_plex_item(rating_key=10, librarySectionID=1)
+        plex.fetchItem = MagicMock(return_value=wanted)
+
+        assert plex.get_items_by_rating_key([10]) == [wanted]
+        plex.fetchItem.assert_called_once_with(10)
+
+    def test_drops_items_from_another_library(self):
+        # Rating keys are server-wide, so a TV key handed to the Movies library must not
+        # get the Movies operations applied to it.
+        plex = self._plex()
+        foreign = make_plex_item(rating_key=11, librarySectionID=2, title="Some Show")
+        plex.fetchItem = MagicMock(return_value=foreign)
+
+        assert plex.get_items_by_rating_key([11]) == []
+
+    def test_skips_keys_plex_cannot_resolve(self):
+        plex = self._plex()
+        found = make_plex_item(rating_key=13, librarySectionID=1)
+        plex.fetchItem = MagicMock(side_effect=[NotFound("gone"), found])
+
+        assert plex.get_items_by_rating_key([12, 13]) == [found]
+
+
 class TestDeferredImageLocks:
     def _plex(self, **attrs):
         plex = make_plex(mass_poster_update={"source": "tmdb", "language": None}, **attrs)

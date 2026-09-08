@@ -28,12 +28,25 @@ from modules.plex import Plex  # noqa: E402 -- must follow logger patch above
 # ---------------------------------------------------------------------------
 
 
+def make_config(**attrs):
+    """MagicMock config with plain-typed values for the attributes Operations reads directly.
+
+    A bare MagicMock returns a truthy Mock for every attribute, which silently flips
+    list-scoping flags like ``run_items`` on.
+    """
+    config = MagicMock()
+    config.run_items = attrs.pop("run_items", [])
+    for key, value in attrs.items():
+        setattr(config, key, value)
+    return config
+
+
 def make_ops(collections, collection_names):
     """Return a minimal Operations instance with mocked config and library."""
     library = MagicMock()
     library.collections = list(collections)
     library.collection_names = list(collection_names)
-    ops = Operations(config=MagicMock(), library=library)
+    ops = Operations(config=make_config(), library=library)
     return ops
 
 
@@ -68,7 +81,7 @@ class TestMDBListPrefetch:
     def test_delegates_enabled_mdblist_operations_to_library(self):
         items = [SimpleNamespace(ratingKey=1)]
         library = make_mass_edit_library(items, mass_critic_rating_update=["mdb_imdb"])
-        config = MagicMock()
+        config = make_config()
         config.MDBList.limit = False
 
         Operations(config=config, library=library)._prefetch_mdblist(items)
@@ -78,7 +91,7 @@ class TestMDBListPrefetch:
     def test_does_not_prefetch_without_an_mdblist_operation(self):
         items = [SimpleNamespace(ratingKey=1)]
         library = make_mass_edit_library(items, mass_critic_rating_update=["tmdb"])
-        config = MagicMock()
+        config = make_config()
         config.MDBList.limit = False
 
         Operations(config=config, library=library)._prefetch_mdblist(items)
@@ -87,7 +100,7 @@ class TestMDBListPrefetch:
     def test_stops_prefetching_after_limit_is_reached(self):
         items = [SimpleNamespace(ratingKey=1), SimpleNamespace(ratingKey=2)]
         library = make_mass_edit_library(items, mass_originally_available_update=["mdb"])
-        config = MagicMock()
+        config = make_config()
         config.MDBList.limit = True
 
         Operations(config=config, library=library)._prefetch_mdblist(items)
@@ -97,7 +110,7 @@ class TestMDBListPrefetch:
     def test_one_thousand_items_use_ten_bulk_requests(self):
         items = [SimpleNamespace(ratingKey=i) for i in range(1000)]
         library = make_mass_edit_library(items, mass_user_rating_update=["mdb"])
-        config = MagicMock()
+        config = make_config()
         config.MDBList = MDBList.__new__(MDBList)
         config.MDBList.cache = None
         config.MDBList.limit = False
@@ -408,7 +421,7 @@ def test_delete_collections_counts_successful_deletions_in_run_stats():
 
     library.delete_collection.side_effect = delete_collection
 
-    Operations(config=MagicMock(), library=library).run_operations()
+    Operations(config=make_config(), library=library).run_operations()
 
     assert library.stats["deleted"] == 2
     assert library.delete_collection.call_count == 2
@@ -499,7 +512,7 @@ class TestRemoveTitleParenthesesBatching:
         item_a = make_item(1, "Movie A (2020)")
         item_b = make_item(2, "Movie B (2021)")
         library = make_title_test_library([item_a, item_b])
-        ops = Operations(config=MagicMock(), library=library)
+        ops = Operations(config=make_config(), library=library)
 
         ops.run_operations()
 
@@ -514,7 +527,7 @@ class TestRemoveTitleParenthesesBatching:
         item_a = make_item(1, "Same Title (2020)")
         item_b = make_item(2, "Same Title (2021)")
         library = make_title_test_library([item_a, item_b])
-        ops = Operations(config=MagicMock(), library=library)
+        ops = Operations(config=make_config(), library=library)
 
         ops.run_operations()
 
@@ -525,7 +538,7 @@ class TestRemoveTitleParenthesesBatching:
     def test_skips_locked_title(self):
         item = make_item(1, "Movie A (2020)", title_locked=True)
         library = make_title_test_library([item])
-        ops = Operations(config=MagicMock(), library=library)
+        ops = Operations(config=make_config(), library=library)
 
         ops.run_operations()
 
@@ -535,7 +548,7 @@ class TestRemoveTitleParenthesesBatching:
     def test_skips_title_without_trailing_parentheses(self):
         item = make_item(1, "Movie A")
         library = make_title_test_library([item])
-        ops = Operations(config=MagicMock(), library=library)
+        ops = Operations(config=make_config(), library=library)
 
         ops.run_operations()
 
@@ -545,7 +558,7 @@ class TestRemoveTitleParenthesesBatching:
         item = make_item(1, "Movie A (2020)")
         library = make_title_test_library([item])
         library.remove_title_parentheses = False
-        ops = Operations(config=MagicMock(), library=library)
+        ops = Operations(config=make_config(), library=library)
 
         ops.run_operations()
 
@@ -644,6 +657,61 @@ def make_mass_edit_library(items, **mass_update_overrides):
     return library
 
 
+class TestRunItemsScoping:
+    """--run-items narrows library operations to specific rating keys."""
+
+    def test_walks_only_the_requested_items(self):
+        items = [make_mass_edit_item(1, "Kept"), make_mass_edit_item(2, "Wanted")]
+        library = make_mass_edit_library(items)
+        library.get_items_by_rating_key.return_value = [items[1]]
+        config = make_config(run_items=[2])
+
+        Operations(config=config, library=library).run_operations()
+
+        library.get_items_by_rating_key.assert_called_once_with([2])
+        library.get_all.assert_not_called()
+
+    def test_falls_back_to_the_whole_library_when_unscoped(self):
+        items = [make_mass_edit_item(1, "Kept")]
+        library = make_mass_edit_library(items)
+        config = make_config()
+
+        Operations(config=config, library=library).run_operations()
+
+        library.get_all.assert_called_once()
+        library.get_items_by_rating_key.assert_not_called()
+
+    def test_skips_whole_library_passes(self):
+        # A per-item trigger must not drag in the full-library sweeps; they are the
+        # expensive part and have nothing to do with the item that just arrived.
+        items = [make_mass_edit_item(1, "Wanted")]
+        library = make_mass_edit_library(
+            items,
+            split_duplicates=True,
+            radarr_remove_by_tag=True,
+            sonarr_remove_by_tag=True,
+            show_unmanaged=True,
+            metadata_backup={"path": "/nope"},
+        )
+        library.get_items_by_rating_key.return_value = items
+        config = make_config(run_items=[1])
+
+        Operations(config=config, library=library).run_operations()
+
+        library.search.assert_not_called()
+        library.get_all_collections.assert_not_called()
+
+    def test_no_matching_items_still_completes(self):
+        library = make_mass_edit_library([make_mass_edit_item(1, "Kept")])
+        library.get_items_by_rating_key.return_value = []
+        config = make_config(run_items=[999])
+
+        result = Operations(config=config, library=library).run_operations()
+
+        assert isinstance(result, str)
+        library.get_all.assert_not_called()
+
+
 class TestFlushCombinedEdits:
     def test_syncs_plex_watched_episodes_to_serializd_by_season(self):
         ops_module.logger.reset_mock()
@@ -658,7 +726,7 @@ class TestFlushCombinedEdits:
         library.is_show = True
         library.get_ids.return_value = (1429, None, None)
         library.cached_item_subitems.return_value = episodes
-        config = MagicMock()
+        config = make_config()
         config.Cache = None
         config.Serializd.log_watched_episodes.return_value = True
 
@@ -679,7 +747,7 @@ class TestFlushCombinedEdits:
         library.is_show = True
         library.get_ids.return_value = (97546, None, None)
         library.cached_item_subitems.return_value = [episode]
-        config = MagicMock()
+        config = make_config()
         config.Serializd.cache_key = "account-key"
         config.Cache.query_serializd_watched.return_value = [1]
 
@@ -699,7 +767,7 @@ class TestFlushCombinedEdits:
         library.is_show = True
         library.get_ids.return_value = (1429, None, None)
         library.cached_item_subitems.return_value = episodes
-        config = MagicMock()
+        config = make_config()
         config.Serializd.cache_key = "account-key"
         config.Serializd.log_watched_episodes.return_value = True
         config.Cache.query_serializd_watched.return_value = [1]
@@ -717,7 +785,7 @@ class TestFlushCombinedEdits:
         library.is_show = True
         library.get_ids.return_value = (1429, None, None)
         library.cached_item_subitems.return_value = [episode]
-        config = MagicMock()
+        config = make_config()
         config.Serializd.cache_key = "account-key"
         config.Serializd.log_watched_episodes.side_effect = ops_module.Failed("sync failed")
         config.Cache.query_serializd_watched.return_value = []
@@ -732,7 +800,7 @@ class TestFlushCombinedEdits:
         library.is_movie = False
         library.is_show = True
         library.get_ids.return_value = (1396, None, "tt0903747")
-        config = MagicMock()
+        config = make_config()
         config.Serializd.get_show_genres.return_value = ["Drama", "Crime"]
 
         Operations(config=config, library=library).run_operations()
@@ -747,7 +815,7 @@ class TestFlushCombinedEdits:
         library.is_movie = False
         library.is_show = True
         library.get_ids.return_value = (None, 371028, None)
-        config = MagicMock()
+        config = make_config()
         config.Convert.tvdb_to_tmdb.return_value = 94605
         config.Serializd.get_show_genres.return_value = ["Animation", "Drama"]
 
@@ -764,7 +832,7 @@ class TestFlushCombinedEdits:
         library.is_movie = False
         library.is_show = True
         library.get_ids.return_value = (1429, None, None)
-        config = MagicMock()
+        config = make_config()
         config.Serializd.get_show_nanogenres.return_value = ["Anime", "Monsters"]
 
         Operations(config=config, library=library).run_operations()
@@ -779,7 +847,7 @@ class TestFlushCombinedEdits:
         library.is_movie = False
         library.is_show = True
         library.get_ids.return_value = (1429, None, None)
-        config = MagicMock()
+        config = make_config()
         config.Serializd.get_show_rating.return_value = 9.07
 
         Operations(config=config, library=library).run_operations()
@@ -796,7 +864,7 @@ class TestFlushCombinedEdits:
         library.get_ids.return_value = (1429, None, None)
         library.cached_item_subitems.return_value = [episode]
         library.get_item_display_title.return_value = "S01E01"
-        config = MagicMock()
+        config = make_config()
         config.Serializd.get_episode_rating.return_value = 8.79
 
         Operations(config=config, library=library).run_operations()
@@ -813,7 +881,7 @@ class TestFlushCombinedEdits:
         library.get_ids.return_value = (1429, None, None)
         library.cached_item_subitems.return_value = [episode]
         library.get_item_display_title.return_value = "S01E01"
-        config = MagicMock()
+        config = make_config()
         config.Serializd.get_episode_user_rating.return_value = 9
 
         Operations(config=config, library=library).run_operations()
@@ -828,7 +896,7 @@ class TestFlushCombinedEdits:
         library.is_movie = False
         library.is_show = True
         library.get_ids.return_value = (None, 371028, "tt11126994")
-        config = MagicMock()
+        config = make_config()
         config.TMDb.get_item.return_value = SimpleNamespace(tmdb_id=94605)
         config.Floppy.get_rating.return_value = 5.0
 
@@ -848,7 +916,7 @@ class TestFlushCombinedEdits:
             mass_genre_update=[["Action"]],
             mass_content_rating_update=["PG-13"],
         )
-        ops = Operations(config=MagicMock(), library=library)
+        ops = Operations(config=make_config(), library=library)
 
         ops.run_operations()
 
@@ -864,7 +932,7 @@ class TestFlushCombinedEdits:
         per-attribute flush path, unaffected by the merge logic."""
         item = make_mass_edit_item(1, "Movie A")
         library = make_mass_edit_library([item], mass_genre_update=[["Action"]])
-        ops = Operations(config=MagicMock(), library=library)
+        ops = Operations(config=make_config(), library=library)
 
         ops.run_operations()
 
@@ -884,7 +952,7 @@ class TestFlushCombinedEdits:
             mass_genre_update=[["Action"]],
         )
         # Both items share the same config, so both get rating + genre and both should merge.
-        ops = Operations(config=MagicMock(), library=library)
+        ops = Operations(config=make_config(), library=library)
 
         ops.run_operations()
 
@@ -894,7 +962,7 @@ class TestFlushCombinedEdits:
     def test_no_mass_update_flags_does_nothing(self):
         item = make_mass_edit_item(1, "Movie A")
         library = make_mass_edit_library([item])
-        ops = Operations(config=MagicMock(), library=library)
+        ops = Operations(config=make_config(), library=library)
 
         ops.run_operations()
 

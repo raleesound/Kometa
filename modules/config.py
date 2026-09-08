@@ -302,6 +302,14 @@ class ConfigFile:
         self.metadata_only = attrs["metadata_only"] if "metadata_only" in attrs else False
         self.operations_only = attrs["operations_only"] if "operations_only" in attrs else False
         self.overlays_only = attrs["overlays_only"] if "overlays_only" in attrs else False
+        # --run-items: restrict library operations to these Plex rating keys instead of the whole
+        # library, so a newly imported item can have its operations applied without a full sweep.
+        self.run_items = []
+        for rating_key in util.get_list_bar_then_comma(attrs.get("run_items"), return_none=False):
+            try:
+                self.run_items.append(int(str(rating_key).strip()))
+            except ValueError:
+                logger.error(f"Config Error: --run-items value '{rating_key}' is not a Plex rating key")
         self.env_plex_url = attrs["plex_url"] if "plex_url" in attrs else ""
         self.env_plex_token = attrs["plex_token"] if "plex_token" in attrs else ""
         self.tpdb_timer = None

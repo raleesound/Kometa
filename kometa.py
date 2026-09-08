@@ -105,6 +105,7 @@ arguments = {
     "run-collections": {"args": ["rc", "cl", "collection", "collections", "run-collection"], "type": "str", "help": "Process only specified collections (pipe-separated list '|')"},
     "run-libraries": {"args": ["rl", "l", "library", "libraries", "run-library"], "type": "str", "help": "Process only specified libraries (pipe-separated list '|')"},
     "run-files": {"args": ["rf", "rm", "m", "run-file", "metadata", "metadata-files", "run-metadata-files"], "type": "str", "help": "Process only specified Files (pipe-separated list '|')"},
+    "run-items": {"args": ["ri", "item", "items", "run-item"], "type": "str", "help": "Run library operations against only these Plex rating keys (pipe-separated list '|')"},
     "ignore-schedules": {"args": "is", "type": "bool", "help": "Run ignoring collection schedules"},
     "ignore-ghost": {"args": "ig", "type": "bool", "help": "Run ignoring ghost logging"},
     "delete-collections": {"args": ["dc", "delete", "delete-collection"], "type": "bool", "help": "Deletes all Collections in the Plex Library before running"},
@@ -548,6 +549,7 @@ def start(attrs):
         attrs["playlist_only"] = run_args["playlists-only"]
         attrs["operations_only"] = run_args["operations-only"]
         attrs["overlays_only"] = run_args["overlays-only"]
+        attrs["run_items"] = run_args["run-items"]
         attrs["plex_url"] = plex_url
         attrs["plex_token"] = plex_token
 
@@ -1645,7 +1647,8 @@ def run_playlists(config):
 
 if __name__ == "__main__":
     try:
-        if run_args["run"] or run_args["tests"] or run_args["run-collections"] or run_args["run-libraries"] or run_args["run-files"] or run_args["resume"] or run_args["validate"] or run_args["validate-file"] or run_args["validate-dir"]:
+        run_now_args = ["run", "tests", "run-collections", "run-libraries", "run-files", "run-items", "resume", "validate", "validate-file", "validate-dir"]
+        if any(run_args[a] for a in run_now_args):
             exit_code = process({"collections": run_args["run-collections"], "libraries": run_args["run-libraries"], "files": run_args["run-files"]})
             sys.exit(exit_code)
         else:

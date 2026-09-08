@@ -189,13 +189,13 @@ class Operations:
         def should_be_deleted(col_in, labels_in, configured_in, managed_in, less_in):
             return self._should_be_deleted(col_in, labels_in, configured_in, managed_in, less_in, configured_names=configured_names)
 
-        if self.library.split_duplicates:
+        if self.library.split_duplicates and not self.config.run_items:
             items = self.library.search(**{"duplicate": True})
             for item in items:
                 item.split()
                 logger.info(f"{item.title[:25]:<25} | Splitting")
 
-        if self.library.update_blank_track_titles:
+        if self.library.update_blank_track_titles and not self.config.run_items:
             tracks = self.library.get_all(builder_level="track")
             num_edited = 0
             for i, track in enumerate(tracks, 1):
@@ -210,7 +210,12 @@ class Operations:
             if self.library.assets_for_all and not self.library.asset_directory:
                 logger.error("Asset Error: No Asset Directory for Assets For All")
 
-            items = self.library.get_all()
+            # --run-items narrows the sweep to specific rating keys so a newly imported item can have
+            # its operations applied immediately, reusing this whole walk rather than a parallel path.
+            if self.config.run_items:
+                items = self.library.get_items_by_rating_key(self.config.run_items)
+            else:
+                items = self.library.get_all()
             total_items = len(items)
             self._prefetch_mdblist(items)
 
@@ -1627,18 +1632,18 @@ class Operations:
 
             logger.info("")
 
-        if self.library.radarr_remove_by_tag:
+        if self.library.radarr_remove_by_tag and not self.config.run_items:
             logger.info("")
             logger.separator(f"Radarr Remove {len(self.library.radarr_remove_by_tag)} Movies with Tags: {', '.join(self.library.radarr_remove_by_tag)}", space=False, border=False)
             logger.info("")
             self.library.Radarr.remove_all_with_tags(self.library.radarr_remove_by_tag)
-        if self.library.sonarr_remove_by_tag:
+        if self.library.sonarr_remove_by_tag and not self.config.run_items:
             logger.info("")
             logger.separator(f"Sonarr Remove {len(self.library.sonarr_remove_by_tag)} Shows with Tags: {', '.join(self.library.sonarr_remove_by_tag)}", space=False, border=False)
             logger.info("")
             self.library.Sonarr.remove_all_with_tags(self.library.sonarr_remove_by_tag)
 
-        if self.library.delete_collections or self.library.show_unmanaged or self.library.show_unconfigured or self.library.assets_for_all or self.library.mass_collection_mode:
+        if not self.config.run_items and (self.library.delete_collections or self.library.show_unmanaged or self.library.show_unconfigured or self.library.assets_for_all or self.library.mass_collection_mode):
             logger.info("")
             logger.separator("Collection Operations", space=False, border=False)
             logger.info("")
@@ -1737,7 +1742,7 @@ class Operations:
                         self.library.collection_mode_query(col, self.library.mass_collection_mode)
                         logger.info(f"{col.title} Collection Mode Updated")
 
-        if self.library.metadata_backup:
+        if self.library.metadata_backup and not self.config.run_items:
             logger.info("")
             logger.separator(f"Metadata Backup for {self.library.name} Library", space=False, border=False)
             logger.info("")

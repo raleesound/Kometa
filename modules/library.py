@@ -249,7 +249,11 @@ class Library(ABC):
                 logger.debug(f"Configured collection names failed to load from {metadata_file}: {e}")
 
     def scan_files(self, operations_only, overlays_only, collection_only, metadata_only):
-        self.scan_configured_collection_names()
+        # Naming every configured collection means parsing every collection file, which dominates
+        # startup (~63s here). Its only consumers are the whole-library collection passes in
+        # run_operations(), and --run-items skips those, so a per-item run must not pay for it.
+        if not self.config.run_items:
+            self.scan_configured_collection_names()
         if not operations_only and not overlays_only and not metadata_only:
             for file_type, metadata_file, temp_vars, asset_directory in self.scanned_collection_files:
                 try:
