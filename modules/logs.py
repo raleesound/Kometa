@@ -12,6 +12,7 @@ COLLECTION_DIR = "collections"
 PLAYLIST_DIR = "playlists"
 MAIN_LOG = "meta.log"
 VALIDATE_LOG = "validate.log"
+ITEMS_LOG = "items.log"  # --run-items writes here so a per-item run never rotates a sweep's meta.log
 LIBRARY_LOG = "library.log"
 COLLECTION_LOG = "collection.log"
 PLAYLIST_LOG = "playlist.log"

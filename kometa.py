@@ -7,6 +7,12 @@ import sys
 import sysconfig
 import time
 import uuid
+
+try:
+    import fcntl  # POSIX only; on Windows the run lock is unavailable and runs are unguarded.
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
@@ -381,7 +387,36 @@ if run_args["low-priority"]:
         logger.critical(f"Failed to set priority: {e}")
 
 
+def run_lock_path():
+    return os.path.join(default_dir, ".kometa.run.lock")
+
+
 def process(attrs):
+    # Two Kometa runs sharing one config directory contend over config.cache and can issue
+    # duplicate edits to the same Plex items. An item-scoped run that arrives during a sweep
+    # has nothing to add — the sweep will reach that item anyway — so it steps aside.
+    lock_file = None
+    if fcntl is not None:
+        try:
+            lock_file = open(run_lock_path(), "a+")
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if lock_file is not None:
+                lock_file.close()
+            if run_args["run-items"]:
+                logger.info("Another Kometa run holds the lock; the running sweep will cover these items")
+                return 0
+            logger.error("Another Kometa run holds the lock; refusing to start a second one")
+            return 1
+    try:
+        return _process(attrs)
+    finally:
+        if lock_file is not None:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
+
+
+def _process(attrs):
     with ProcessPoolExecutor(max_workers=1) as executor:
         future = executor.submit(start, *[attrs])
         try:
@@ -459,6 +494,10 @@ def start(attrs):
             from modules.logs import VALIDATE_LOG
 
             logger.main_log = os.path.join(logger.log_dir, VALIDATE_LOG)
+        elif run_args["run-items"]:
+            from modules.logs import ITEMS_LOG
+
+            logger.main_log = os.path.join(logger.log_dir, ITEMS_LOG)
         logger.add_main_handler()
         logger.separator()
         logger.info("")
