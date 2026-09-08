@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 from plexapi.exceptions import BadRequest, NotFound
@@ -209,6 +209,73 @@ class TestImageUpdate:
         plex.edit_tags.assert_called_once_with("label", item, remove_tags="Overlay", do_print=False)
         assert plex.cached_items == {}
         assert plex.filter_attr_cache == {(7, "labels"): ["Keep"]}
+
+
+class TestDeferredImageLocks:
+    def _plex(self, **attrs):
+        plex = make_plex(mass_poster_update={"source": "tmdb", "language": None}, **attrs)
+        plex.upload_poster = MagicMock()
+        plex.item_labels = MagicMock(return_value=[])
+        plex.query = MagicMock()
+        plex.image_lock_queue = {}
+        plex.plex_bulk_edit_batch_size = 2
+        return plex
+
+    def test_lock_is_sent_immediately_when_deferral_is_off(self):
+        plex = self._plex()
+        item = make_plex_item()
+
+        plex.image_update(item, None, tmdb=("tmdb", "https://image.tmdb.org/poster.jpg"))
+
+        plex.query.assert_called_once_with(item.lockPoster)
+        assert plex.image_lock_queue == {}
+
+    def test_lock_is_queued_by_field_when_deferral_is_on(self):
+        plex = self._plex()
+        plex.defer_image_locks = True
+        poster_item = make_plex_item(rating_key=1)
+        background_item = make_plex_item(rating_key=2)
+
+        plex.image_update(poster_item, None, tmdb=("tmdb", "https://image.tmdb.org/poster.jpg"))
+        plex.mass_background_update = {"source": "tmdb", "language": None}
+        plex.upload_background = MagicMock()
+        plex.image_update(background_item, None, tmdb=("tmdb", "https://image.tmdb.org/art.jpg"), poster=False)
+
+        plex.query.assert_not_called()
+        assert plex.image_lock_queue == {"thumb": [poster_item], "art": [background_item]}
+
+    def test_flush_batches_locks_per_field_and_chunks(self):
+        plex = self._plex()
+        items = [make_plex_item(rating_key=k) for k in range(3)]
+        plex.image_lock_queue = {"thumb": items}
+
+        plex.flush_image_locks()
+
+        # batch size 2 over 3 same-typed items -> two calls, and the queue is emptied.
+        assert plex.Plex.batchMultiEdits.call_count == 2
+        assert [list(c.args[0]) for c in plex.Plex.batchMultiEdits.call_args_list] == [items[:2], items[2:]]
+        # Lock-only: never editField, which would also send thumb.value and clobber the upload.
+        plex.Plex.editField.assert_not_called()
+        assert plex.Plex._edit.call_args_list == [call(**{"thumb.locked": 1}), call(**{"thumb.locked": 1})]
+        assert plex.image_lock_queue == {}
+
+    def test_flush_groups_mixed_item_types_into_separate_batches(self):
+        plex = self._plex()
+        show = make_plex_item(rating_key=1, type="show")
+        episode = make_plex_item(rating_key=2, type="episode")
+        plex.image_lock_queue = {"thumb": [show, episode]}
+
+        plex.flush_image_locks()
+
+        # batchMultiEdits rejects mixed types in one call, so each type gets its own.
+        assert [list(c.args[0]) for c in plex.Plex.batchMultiEdits.call_args_list] == [[show], [episode]]
+
+    def test_flush_on_empty_queue_sends_nothing(self):
+        plex = self._plex()
+
+        plex.flush_image_locks()
+
+        plex.Plex.batchMultiEdits.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════

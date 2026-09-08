@@ -241,6 +241,11 @@ class Operations:
                     source = {"tmdb": "TMDb", "trakt": "Trakt", "tvdb": "TVDb", "plex": "Plex", "assets": "Assets"}.get(str(source).lower(), str(source))
                     image_operation_counts[(operation, source, image_type, level, status)] += 1
 
+            # image_update() locks every image it resets. Per item that is one HTTP PUT each; on a full
+            # first pass over a show library that is tens of thousands of pipelined PUTs. Collect them
+            # and flush in batches of 100 once the walk is done. Only image_update() reads this flag and
+            # it is only reachable from this loop, so a mid-loop failure cannot leak it anywhere else.
+            self.library.defer_image_locks = True
             for i, item in enumerate(items, 1):
                 logger.info("")
                 logger.info(f"({i}/{total_items}) {item.title}")
@@ -1182,6 +1187,27 @@ class Operations:
                     def _field_locked(field_name):
                         return any(f.name == field_name and f.locked for f in item.fields)
 
+                    def _sub_field_locked(sub_item, field_name):
+                        return any(f.name == field_name and f.locked for f in sub_item.fields)
+
+                    def _skip_show_level_image(image_config, sub_item, asset_image, resolved_source, resolved_url, field_name):
+                        # The season/episode image path had no ignore_locked check, unlike the item-level
+                        # path below. Kometa locks every image it resets (plex.py image_update), so without
+                        # this it re-uploads an image it locked itself on the previous run — for every
+                        # season and every episode, on every run, and it can never converge.
+                        if image_config["source"] in ["unlock", "lock"] and len(_image_sources(image_config)) == 1:
+                            return False
+                        if image_config.get("ignore_locked") and _sub_field_locked(sub_item, field_name):
+                            return True
+                        if image_config.get("ignore_overlays") and "Overlay" in [la.tag for la in self.library.item_labels(sub_item)]:
+                            return True
+                        # Nothing left to apply: no asset file on disk, and every configured source came
+                        # back empty. "plex" resolves its image inside image_update, so it never counts as
+                        # empty here. Skipping saves a round trip whose only outcome is a Missing warning.
+                        if not asset_image and not resolved_url and resolved_source not in ["plex"]:
+                            return True
+                        return False
+
                     if self.library.mass_poster_update:
                         source = self.library.mass_poster_update["source"]
                         ignore_locked = self.library.mass_poster_update["ignore_locked"]
@@ -1286,12 +1312,18 @@ class Operations:
                                     tmdb_poster = tmdb_season.poster_url if tmdb_season else None
                                     if _show_level_image_update_enabled(self.library.mass_poster_update, "seasons"):
                                         resolved_source, resolved_url = _get_show_level_external_image(self.library.mass_poster_update, tmdb_url=tmdb_poster, is_poster=True, season=season.seasonNumber)
-                                        result = self.library.poster_update(season, season_poster, tmdb=(resolved_source, resolved_url), title=season_title if season else None)
-                                        record_image_operation(result, "Poster", "Season")
+                                        if _skip_show_level_image(self.library.mass_poster_update, season, season_poster, resolved_source, resolved_url, "thumb"):
+                                            record_image_operation(("Reset", resolved_source, "Skipped"), "Poster", "Season")
+                                        else:
+                                            result = self.library.poster_update(season, season_poster, tmdb=(resolved_source, resolved_url), title=season_title if season else None)
+                                            record_image_operation(result, "Poster", "Season")
                                     if _show_level_image_update_enabled(self.library.mass_background_update, "seasons"):
                                         resolved_source, resolved_url = _get_show_level_external_image(self.library.mass_background_update, is_poster=False, season=season.seasonNumber)
-                                        result = self.library.background_update(season, season_background, tmdb=(resolved_source, resolved_url), title=season_title if season else None)
-                                        record_image_operation(result, "Background", "Season")
+                                        if _skip_show_level_image(self.library.mass_background_update, season, season_background, resolved_source, resolved_url, "art"):
+                                            record_image_operation(("Reset", resolved_source, "Skipped"), "Background", "Season")
+                                        else:
+                                            result = self.library.background_update(season, season_background, tmdb=(resolved_source, resolved_url), title=season_title if season else None)
+                                            record_image_operation(result, "Background", "Season")
 
                                 if _show_level_image_update_enabled(self.library.mass_poster_update, "episodes") or _show_level_image_update_enabled(self.library.mass_background_update, "episodes"):
                                     tmdb_episodes = {}
@@ -1321,12 +1353,18 @@ class Operations:
                                         tmdb_poster = tmdb_episodes[episode.episodeNumber].still_url if episode.episodeNumber in tmdb_episodes else None
                                         if _show_level_image_update_enabled(self.library.mass_poster_update, "episodes"):
                                             resolved_source, resolved_url = _get_show_level_external_image(self.library.mass_poster_update, tmdb_url=tmdb_poster, is_poster=True, season=season.seasonNumber, episode=episode.episodeNumber)
-                                            result = self.library.poster_update(episode, episode_poster, tmdb=(resolved_source, resolved_url), title=episode_title if episode else None)
-                                            record_image_operation(result, "Poster", "Episode")
+                                            if _skip_show_level_image(self.library.mass_poster_update, episode, episode_poster, resolved_source, resolved_url, "thumb"):
+                                                record_image_operation(("Reset", resolved_source, "Skipped"), "Poster", "Episode")
+                                            else:
+                                                result = self.library.poster_update(episode, episode_poster, tmdb=(resolved_source, resolved_url), title=episode_title if episode else None)
+                                                record_image_operation(result, "Poster", "Episode")
                                         if _show_level_image_update_enabled(self.library.mass_background_update, "episodes"):
                                             resolved_source, resolved_url = _get_show_level_external_image(self.library.mass_background_update, is_poster=False, season=season.seasonNumber, episode=episode.episodeNumber)
-                                            result = self.library.background_update(episode, episode_background, tmdb=(resolved_source, resolved_url), title=episode_title if episode else None)
-                                            record_image_operation(result, "Background", "Episode")
+                                            if _skip_show_level_image(self.library.mass_background_update, episode, episode_background, resolved_source, resolved_url, "art"):
+                                                record_image_operation(("Reset", resolved_source, "Skipped"), "Background", "Episode")
+                                            else:
+                                                result = self.library.background_update(episode, episode_background, tmdb=(resolved_source, resolved_url), title=episode_title if episode else None)
+                                                record_image_operation(result, "Background", "Episode")
                         finally:
                             if _image_lang:
                                 self.config.TMDb.language = _orig_lang
@@ -1439,6 +1477,9 @@ class Operations:
 
                         if len(item_edits) > 0:
                             logger.info(f"{item_edits[1:]}")
+
+            self.library.defer_image_locks = False
+            self.library.flush_image_locks()
 
             if image_operation_counts:
                 logger.info("")

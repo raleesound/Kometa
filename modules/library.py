@@ -14,6 +14,10 @@ logger = util.logger
 
 
 class Library(ABC):
+    # Class-level default so image_update() can read it on any Library, including the partially
+    # constructed instances the test suite builds without running __init__.
+    defer_image_locks = False
+
     def __init__(self, config, params):
         self.session = None
         self.Radarr = None
@@ -49,6 +53,10 @@ class Library(ABC):
         self.cached_items = {}
         # Per-run memo for check_filter's plain item attribute reads, keyed by (ratingKey, attr) - cleared per-item in reload() whenever a real reload happens, so it never outlives cached_items' own freshness guarantee.
         self.filter_attr_cache = {}
+        # Image-field locks pending a batched flush, keyed by Plex field name (thumb/art/clearLogo/squareArt).
+        # Only populated while defer_image_locks is on; see Plex.queue_image_lock/flush_image_locks.
+        self.image_lock_queue = {}
+        self.defer_image_locks = False
         self.run_again = []
         self.type = ""
         self.config = config

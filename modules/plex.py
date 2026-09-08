@@ -304,6 +304,9 @@ method_alias = {
     "overlay_level": "builder_level",
 }
 modifier_alias = {".greater": ".gt", ".less": ".lt"}
+# Kometa's image_type -> the Plex field name whose `.locked` flag lockPoster()/lockArt()/lockLogo()/
+# lockSquareArt() set. Plex names the logo field "clearLogo", not "logo".
+IMAGE_LOCK_FIELDS = {"poster": "thumb", "background": "art", "logo": "clearLogo", "square_art": "squareArt"}
 date_sub_mods = {"s": "Seconds", "m": "Minutes", "h": "Hours", "d": "Days", "w": "Weeks", "o": "Months", "y": "Years"}
 album_sorting_options = {"default": -1, "newest": 0, "oldest": 1, "name": 2}
 episode_sorting_options = {"default": -1, "oldest": 0, "newest": 1}
@@ -1575,6 +1578,40 @@ class Plex(Library):
                 total_sent += len(chunk)
         logger.exorcise()
 
+    def batch_lock_field(self, items, field, locked=True):
+        # Lock-only sibling of batch_edit_field. editField() always sends `<field>.value` alongside
+        # `<field>.locked`, which would overwrite the image we just uploaded, so this pushes the bare
+        # locked flag into the batch instead. Used to coalesce the per-item lock that image_update()
+        # otherwise fires as one HTTP PUT per item.
+        if not items:
+            return
+        batch_size = self.plex_bulk_edit_batch_size if self.plex_bulk_edit_batch_size else 100
+        total_sent = 0
+        for group in self._group_items_by_type(items):
+            for i in range(0, len(group), batch_size):
+                chunk = group[i : i + batch_size]
+                logger.ghost(f"Batch {'locking' if locked else 'unlocking'} '{field}' for {len(chunk)} items [{total_sent} so far]")
+                self.Plex.batchMultiEdits(chunk)
+                self.Plex._edit(**{f"{field}.locked": 1 if locked else 0})
+                self._save_multi_edits_with_retry()
+                total_sent += len(chunk)
+        logger.exorcise()
+
+    def queue_image_lock(self, item, image_type):
+        # image_update() locks every image it resets. Done per item that is one PUT each — 15k of them
+        # on a first full pass, which is the request pattern that deadlocked Plex on 2026-09-03. When
+        # deferral is on, collect them here and flush_image_locks() sends ~1 request per 100 items.
+        self.image_lock_queue.setdefault(IMAGE_LOCK_FIELDS[image_type], []).append(item)
+
+    def flush_image_locks(self):
+        if not self.image_lock_queue:
+            return
+        queued = self.image_lock_queue
+        self.image_lock_queue = {}
+        for field, items in queued.items():
+            logger.info(f"Locking {field} on {len(items)} items")
+            self.batch_lock_field(items, field)
+
     def move_item(self, collection, item, after=None):
         key = f"{collection.key}/items/{item}/move"
         if after:
@@ -2095,7 +2132,10 @@ class Plex(Library):
                     logger.info(f"{text} | Reset from {location}")
                     lock_method = {"poster": "lockPoster", "background": "lockArt", "logo": "lockLogo", "square_art": "lockSquareArt"}[image_type]  # lock the field so it isn't reset again next run
                     if hasattr(item, lock_method):
-                        self.query(getattr(item, lock_method))
+                        if self.defer_image_locks:
+                            self.queue_image_lock(item, image_type)
+                        else:
+                            self.query(getattr(item, lock_method))
                 if poster and "Overlay" in [la.tag for la in self.item_labels(item)]:
                     logger.info(self.edit_tags("label", item, remove_tags="Overlay", do_print=False))
                     self.cached_items.pop(item.ratingKey, None)
