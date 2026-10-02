@@ -1,3 +1,4 @@
+import copy
 import math
 import os
 import re
@@ -39,10 +40,32 @@ tmdb_release_types = {
     "tmdb_tv": 6,
 }
 
+# Library operations do not inspect these potentially large show-level elements. Excluding
+# them keeps Plex from serializing an aggregated cast/crew/media payload before operations
+# such as show and season poster updates. Limited reloads are not cached as full objects.
+SHOW_OPERATION_RELOAD_EXCLUDE_ELEMENTS = "Media,Role,Director,Writer,Producer,Similar,Style,Mood,Format"
+
 
 def _item_batches(items_iterable, batch_size):
     for batch_num in range(0, math.ceil(len(items_iterable) / batch_size)):
         yield items_iterable[batch_num * batch_size : (batch_num + 1) * batch_size]
+
+
+def _format_plex_rating(value, source, rating_name):
+    if not util.is_valid_rating(value):
+        logger.warning(f"{source} {rating_name} value {value} is invalid for Plex; expected a finite number from 0 to 10; skipping")
+        raise Failed
+    rating = float(value)
+    return f"{rating:.1f}"
+
+
+def _scale_provider_rating(value, source, rating_name, maximum, factor):
+    if util.is_missing_rating(value):
+        return None
+    if not util.is_valid_rating(value, maximum=maximum):
+        logger.warning(f"{source} {rating_name} value {value} is invalid for the provider's 0 to {maximum} scale; expected a finite number; skipping")
+        raise Failed
+    return float(value) * factor
 
 
 def _image_operation_summary_rows(counts):
@@ -55,29 +78,109 @@ def _image_operation_summary_rows(counts):
     return [(*key, *(results[result] for result in ("Updated", "Skipped", "Missing", "Failed"))) for key, results in sorted(rows.items())]
 
 
-def _find_collection_trans_key(col_data):
-    # Return the translation_key string from collection YAML data, or None if absent.
-    if isinstance(col_data, dict):
-        if "translation_key" in col_data:
-            val = col_data["translation_key"]
-            if isinstance(val, str) and "<<" not in val:
-                return val
-        for v in col_data.values():
-            result = _find_collection_trans_key(v)
-            if result:
-                return result
-    elif isinstance(col_data, list):
-        for item in col_data:
-            result = _find_collection_trans_key(item)
-            if result:
-                return result
-    return None
+def _apply_collection_name_vars(value, variables, key_name=None, limit=None):
+    if value is None:
+        return None
+    output = str(value)
+    if "<<library_type>>" in output:
+        output = output.replace("<<library_type>>", "<<library_translation>>")
+    if "<<library_typeU>>" in output:
+        output = output.replace("<<library_typeU>>", "<<library_translationU>>")
+    for variable, variable_value in variables.items():
+        output = output.replace(f"<<{variable}>>", str(variable_value))
+        output = output.replace(f"<<{variable}U>>", str(variable_value).capitalize())
+    if key_name is not None:
+        output = output.replace("<<key_name>>", str(key_name))
+    if limit is not None:
+        output = output.replace("<<limit>>", str(limit))
+    return output
+
+
+def _configured_collection_name_aliases(config, library, metadata_file, mapping_name, collection_data):
+    """Resolve names which may identify one configured collection in Plex."""
+    aliases = {str(mapping_name)}
+    if not isinstance(collection_data, dict):
+        return aliases
+
+    data = copy.deepcopy(collection_data)
+    methods = {method.lower(): method for method in data}
+    if "collection_name" in methods and data[methods["collection_name"]]:
+        data["name"] = data[methods["collection_name"]]
+        methods["name"] = "name"
+
+    if "template" in methods:
+        variables = data[methods["variables"]] if "variables" in methods and isinstance(data[methods["variables"]], dict) else {}
+        explicit_name = data[methods["name"]] if "name" in methods else None
+        expanded = metadata_file.apply_template(explicit_name, mapping_name, data, data[methods["template"]], variables)
+        for attribute, value in expanded.items():
+            if attribute.lower() not in methods:
+                data[attribute] = value
+                methods[attribute.lower()] = attribute
+
+    language = metadata_file.language
+    if "language" in methods and data[methods["language"]]:
+        requested_language = str(data[methods["language"]]).lower()
+        if requested_language in config.GitHub.translation_keys:
+            language = requested_language
+
+    explicit_name = str(data[methods["name"]]) if "name" in methods and data[methods["name"]] else None
+    translation_key = str(data[methods["translation_key"]]) if "translation_key" in methods and data[methods["translation_key"]] else None
+    key_name = str(data[methods["key_name"]]) if "key_name" in methods and data[methods["key_name"]] else None
+    limit = data[methods["limit"]] if "limit" in methods and data[methods["limit"]] is not None else None
+    translation_prefix = str(data[methods["translation_prefix"]]) if "translation_prefix" in methods and data[methods["translation_prefix"]] else ""
+
+    if not any([explicit_name, translation_key]):
+        return aliases
+
+    english = config.GitHub.translation_yaml("en")
+    translations = config.GitHub.translation_yaml(language)
+    library_type = library.type.lower()
+    english_variables = {key: value[library_type] for key, value in english.get("variables", {}).items() if library_type in value and value[library_type]}
+    translated_variables = {key: value[library_type] for key, value in translations.get("variables", {}).items() if library_type in value and value[library_type]}
+    for key, value in english_variables.items():
+        translated_variables.setdefault(key, value)
+
+    english_key_name = key_name
+    translated_key_name = key_name
+    if key_name and language != "en":
+        key_name_key = next((key for key, value in english.get("key_names", {}).items() if value == key_name), None)
+        if key_name_key:
+            translated_key_name = translations.get("key_names", {}).get(key_name_key, key_name)
+
+    english_name = None
+    translated_name = None
+    if translation_key and translation_key in english.get("collections", {}):
+        english_name = english["collections"][translation_key].get("name")
+        translated_name = translations.get("collections", {}).get(translation_key, {}).get("name")
+        if english_name:
+            english_name = f"{translation_prefix}{english_name}"
+        if translated_name:
+            translated_name = f"{translation_prefix}{translated_name}"
+
+    for resolved_name in [
+        _apply_collection_name_vars(explicit_name, translated_variables, translated_key_name, limit),
+        _apply_collection_name_vars(english_name, english_variables, english_key_name, limit),
+        _apply_collection_name_vars(translated_name, translated_variables, translated_key_name, limit),
+    ]:
+        if resolved_name:
+            aliases.add(resolved_name)
+    return aliases
 
 
 class Operations:
     def __init__(self, config, library):
         self.config = config
         self.library = library
+
+    def _configured_collection_names(self):
+        configured_names = set(self.library.collection_names)
+        for metadata_file in self.library.configured_collection_metadata_files:
+            for mapping_name, collection_data in (metadata_file.collections or {}).items():
+                try:
+                    configured_names.update(_configured_collection_name_aliases(self.config, self.library, metadata_file, mapping_name, collection_data))
+                except Exception as e:
+                    logger.debug(f"Configured name resolution failed for {mapping_name}: {e}")
+        return configured_names
 
     def _uses_mdblist(self):
         sources = [
@@ -189,11 +292,14 @@ class Operations:
         def should_be_deleted(col_in, labels_in, configured_in, managed_in, less_in):
             return self._should_be_deleted(col_in, labels_in, configured_in, managed_in, less_in, configured_names=configured_names)
 
+        refreshed_items = None
         if self.library.split_duplicates and not self.config.run_items:
-            items = self.library.search(**{"duplicate": True})
-            for item in items:
+            duplicate_items = self.library.search(**{"duplicate": True})
+            for item in duplicate_items:
                 item.split()
                 logger.info(f"{item.title[:25]:<25} | Splitting")
+            if duplicate_items:
+                refreshed_items = self.library.refresh_item_cache_and_mappings()
 
         if self.library.update_blank_track_titles and not self.config.run_items:
             tracks = self.library.get_all(builder_level="track")
@@ -215,7 +321,7 @@ class Operations:
             if self.config.run_items:
                 items = self.library.get_items_by_rating_key(self.config.run_items)
             else:
-                items = self.library.get_all()
+                items = refreshed_items if refreshed_items is not None else self.library.get_all()
             total_items = len(items)
             self._prefetch_mdblist(items)
 
@@ -246,6 +352,8 @@ class Operations:
                     source = {"tmdb": "TMDb", "trakt": "Trakt", "tvdb": "TVDb", "plex": "Plex", "assets": "Assets"}.get(str(source).lower(), str(source))
                     image_operation_counts[(operation, source, image_type, level, status)] += 1
 
+            # Pre-warms reload data for the whole library in batched requests instead of one per item - see plex.py's bulk_reload().
+            self.library.bulk_reload(items)
             # image_update() locks every image it resets. Per item that is one HTTP PUT each; on a full
             # first pass over a show library that is tens of thousands of pipelined PUTs. Collect them
             # and flush in batches of 100 once the walk is done. Only image_update() reads this flag and
@@ -255,7 +363,8 @@ class Operations:
                 logger.info("")
                 logger.info(f"({i}/{total_items}) {item.title}")
                 try:
-                    item = self.library.reload(item)
+                    reload_options = {"exclude_elements": SHOW_OPERATION_RELOAD_EXCLUDE_ELEMENTS} if self.library.is_show else {}
+                    item = self.library.reload(item, **reload_options)
                 except Failed as e:
                     logger.error(e)
                     continue
@@ -323,6 +432,26 @@ class Operations:
                     if not _trakt_ratings:
                         raise Failed
                     return _trakt_ratings
+
+                _flicklist_ratings = None
+
+                def flicklist_ratings():
+                    nonlocal _flicklist_ratings
+                    if _flicklist_ratings is None:
+                        _flicklist_ratings = self.config.FlickList.user_ratings(self.library.is_movie)
+                    if not _flicklist_ratings:
+                        raise Failed
+                    return _flicklist_ratings
+
+                _wetrakr_ratings = None
+
+                def wetrakr_ratings():
+                    nonlocal _wetrakr_ratings
+                    if _wetrakr_ratings is None:
+                        _wetrakr_ratings = self.config.WeTrakr.user_ratings(self.library.is_movie)
+                    if not _wetrakr_ratings:
+                        raise Failed
+                    return _wetrakr_ratings
 
                 _tmdb_obj = None
 
@@ -593,6 +722,24 @@ class Operations:
                                             found_rating = _ratings[_id]
                                         else:
                                             raise Failed
+                                    elif option == "flicklist_user":
+                                        if not self.config.FlickList:
+                                            raise Failed
+                                        _ratings = flicklist_ratings()
+                                        _id = tmdb_id if self.library.is_movie else tvdb_id
+                                        if _id in _ratings:
+                                            found_rating = _ratings[_id]
+                                        else:
+                                            raise Failed
+                                    elif option == "wetrakr_user":
+                                        if not self.config.WeTrakr:
+                                            raise Failed
+                                        _ratings = wetrakr_ratings()
+                                        _id = tmdb_id if self.library.is_movie else tvdb_id
+                                        if _id in _ratings:
+                                            found_rating = _ratings[_id]
+                                        else:
+                                            raise Failed
                                     elif option == "serializd":
                                         if self.library.is_movie:
                                             logger.info(f"Serializd Ratings are only available for Shows: {item.title}")
@@ -622,35 +769,35 @@ class Operations:
                                     elif str(option).startswith("omdb"):
                                         omdb_item = omdb_obj()
                                         if option == "omdb_metascore":
-                                            found_rating = omdb_item.metacritic_rating / 10 if omdb_item.metacritic_rating else None  # noqa
+                                            found_rating = _scale_provider_rating(omdb_item.metacritic_rating, option, name_display[item_attr], 100, 0.1)  # noqa
                                         elif option == "omdb_tomatoes":
-                                            found_rating = omdb_item.rotten_tomatoes / 10 if omdb_item.rotten_tomatoes else None  # noqa
+                                            found_rating = _scale_provider_rating(omdb_item.rotten_tomatoes, option, name_display[item_attr], 100, 0.1)  # noqa
                                         else:
                                             found_rating = omdb_item.imdb_rating  # noqa
                                     elif str(option).startswith("mdb"):
                                         mdb_item = mdb_obj()
                                         if option == "mdb_average":
-                                            found_rating = mdb_item.average / 10 if mdb_item.average else None  # noqa
+                                            found_rating = _scale_provider_rating(mdb_item.average, option, name_display[item_attr], 100, 0.1)  # noqa
                                         elif option == "mdb_imdb":
                                             found_rating = mdb_item.imdb_rating if mdb_item.imdb_rating else None  # noqa
                                         elif option == "mdb_metacritic":
-                                            found_rating = mdb_item.metacritic_rating / 10 if mdb_item.metacritic_rating else None  # noqa
+                                            found_rating = _scale_provider_rating(mdb_item.metacritic_rating, option, name_display[item_attr], 100, 0.1)  # noqa
                                         elif option == "mdb_metacriticuser":
                                             found_rating = mdb_item.metacriticuser_rating if mdb_item.metacriticuser_rating else None  # noqa
                                         elif option == "mdb_trakt":
-                                            found_rating = mdb_item.trakt_rating / 10 if mdb_item.trakt_rating else None  # noqa
+                                            found_rating = _scale_provider_rating(mdb_item.trakt_rating, option, name_display[item_attr], 100, 0.1)  # noqa
                                         elif option == "mdb_tomatoes":
-                                            found_rating = mdb_item.tomatoes_rating / 10 if mdb_item.tomatoes_rating else None  # noqa
+                                            found_rating = _scale_provider_rating(mdb_item.tomatoes_rating, option, name_display[item_attr], 100, 0.1)  # noqa
                                         elif option == "mdb_tomatoesaudience":
-                                            found_rating = mdb_item.tomatoesaudience_rating / 10 if mdb_item.tomatoesaudience_rating else None  # noqa
+                                            found_rating = _scale_provider_rating(mdb_item.tomatoesaudience_rating, option, name_display[item_attr], 100, 0.1)  # noqa
                                         elif option == "mdb_tmdb":
-                                            found_rating = mdb_item.tmdb_rating / 10 if mdb_item.tmdb_rating else None  # noqa
+                                            found_rating = _scale_provider_rating(mdb_item.tmdb_rating, option, name_display[item_attr], 100, 0.1)  # noqa
                                         elif option == "mdb_letterboxd":
-                                            found_rating = mdb_item.letterboxd_rating * 2 if mdb_item.letterboxd_rating else None  # noqa
+                                            found_rating = _scale_provider_rating(mdb_item.letterboxd_rating, option, name_display[item_attr], 5, 2)  # noqa
                                         elif option == "mdb_myanimelist":
                                             found_rating = mdb_item.myanimelist_rating if mdb_item.myanimelist_rating else None  # noqa
                                         else:
-                                            found_rating = mdb_item.score / 10 if mdb_item.score else None  # noqa
+                                            found_rating = _scale_provider_rating(mdb_item.score, option, name_display[item_attr], 100, 0.1)  # noqa
                                     elif option == "anidb_rating":
                                         found_rating = anidb_obj().rating  # noqa
                                     elif option == "anidb_average":
@@ -664,7 +811,7 @@ class Operations:
                                     if found_rating is None:
                                         logger.info(f"No {option} {name_display[item_attr]} Found")
                                         raise Failed
-                                    found_rating = f"{float(found_rating):.1f}"
+                                    found_rating = _format_plex_rating(found_rating, option, name_display[item_attr])
                                     if str(current) != found_rating:
                                         if found_rating not in rating_edits[item_attr]:
                                             rating_edits[item_attr][found_rating] = []
@@ -1470,7 +1617,7 @@ class Operations:
                                             if found_rating is None:
                                                 logger.info(f"  No {option} {name_display[item_attr]} Found")
                                                 raise Failed
-                                            found_rating = f"{float(found_rating):.1f}"
+                                            found_rating = _format_plex_rating(found_rating, option, name_display[item_attr])
                                             if str(current) != found_rating:
                                                 if found_rating not in ep_rating_edits[item_attr]:
                                                     ep_rating_edits[item_attr][found_rating] = []
@@ -1482,6 +1629,8 @@ class Operations:
 
                         if len(item_edits) > 0:
                             logger.info(f"{item_edits[1:]}")
+                        else:
+                            logger.info("No Item Edits")
 
             self.library.defer_image_locks = False
             self.library.flush_image_locks()
@@ -1657,21 +1806,9 @@ class Operations:
             managed = self.library.delete_collections["managed"] if self.library.delete_collections else None
             configured = self.library.delete_collections["configured"] if self.library.delete_collections else None
             ignore_smart = self.library.delete_collections["ignore_empty_smart_collections"] if self.library.delete_collections else True
-            # Build configured_names: YAML keys + English-translated titles for default collections (#3168)
             configured_names = set(self.library.collection_names)
             if configured is not None:
-                try:
-                    en_colls = self.config.GitHub.translation_yaml("en").get("collections", {})
-                    for mf in self.library.collection_files:
-                        if mf.collections:
-                            for col_data in mf.collections.values():
-                                trans_key = _find_collection_trans_key(col_data)
-                                if trans_key and trans_key in en_colls:
-                                    en_name = en_colls[trans_key].get("name")
-                                    if en_name:
-                                        configured_names.add(en_name)
-                except Exception as e:
-                    logger.debug(f"Translation name resolution for configured check failed: {e}")
+                configured_names = self._configured_collection_names()
 
             unmanaged_collections = []
             unconfigured_collections = []

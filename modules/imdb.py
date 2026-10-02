@@ -7,8 +7,10 @@ import re
 import shutil
 from typing import Literal, overload
 
+from lxml.etree import ParserError
+
 from modules import util
-from modules.util import Failed
+from modules.util import Failed, ServiceError
 
 logger = util.logger
 
@@ -216,7 +218,11 @@ genre_options = {
         "Game-Show",
     ]
 }
-interest_options = {
+# Fallback snapshot of IMDb's interest catalog (name -> in-id). Kometa prefers a live copy fetched
+# from interests_url at runtime (auto-refreshed by a scheduled Action in the IMDb-Interests repo); this
+# hardcoded map is only used when that fetch fails. Regenerate with the generator staged at
+# .github/imdb-interests-repo-files/generate_interests.py (which also produces the repo's INTERESTS.json).
+interest_options_fallback = {
     "action": "in0000001",
     "action_epic": "in0000002",
     "b_action": "in0000003",
@@ -428,6 +434,108 @@ interest_options = {
     "telenovela": "in0000210",
     "news": "in0000211",
     "short": "in0000212",
+    "arabic": "in0000213",
+    "bengali": "in0000214",
+    "cantonese": "in0000215",
+    "dutch": "in0000216",
+    "filipino": "in0000217",
+    "finnish": "in0000218",
+    "french": "in0000219",
+    "german": "in0000220",
+    "greek": "in0000221",
+    "hindi": "in0000222",
+    "italian": "in0000223",
+    "japanese": "in0000224",
+    "korean": "in0000225",
+    "mandarin": "in0000226",
+    "marathi": "in0000227",
+    "norwegian": "in0000228",
+    "persian": "in0000229",
+    "portuguese": "in0000230",
+    "punjabi": "in0000231",
+    "russian": "in0000232",
+    "spanish": "in0000233",
+    "swedish": "in0000234",
+    "tamil": "in0000235",
+    "telugu": "in0000236",
+    "thai": "in0000237",
+    "turkish": "in0000238",
+    "urdu": "in0000239",
+    "malayalam": "in0000240",
+    "kannada": "in0000241",
+    "danish": "in0000242",
+    "star_wars": "in0000243",
+    "dc": "in0000244",
+    "transformers": "in0000245",
+    "power_rangers": "in0000246",
+    "star_trek": "in0000247",
+    "marvel": "in0000248",
+    "lego": "in0000249",
+    "dragon_ball": "in0000250",
+    "one_piece": "in0000251",
+    "pokémon": "in0000252",
+    "rupaul's_drag_race": "in0000253",
+    "love_island": "in0000254",
+    "evangelion": "in0000255",
+    "gundam": "in0000256",
+    "kamen_rider": "in0000257",
+    "naruto": "in0000258",
+    "yu_gi_oh!": "in0000259",
+    "love_is_blind": "in0000261",
+    "90_day_fiancé": "in0000262",
+    "big_brother": "in0000263",
+    "degrassi": "in0000264",
+    "alien": "in0000265",
+    "james_bond": "in0000266",
+    "despicable_me": "in0000267",
+    "shrek": "in0000268",
+    "the_real_housewives": "in0000269",
+    "doctor_who": "in0000270",
+    "teenage_mutant_ninja_turtles": "in0000271",
+    "toy_story": "in0000272",
+    "fast_&_furious": "in0000273",
+    "breaking_bad": "in0000274",
+    "planet_of_the_apes": "in0000275",
+    "predator": "in0000276",
+    "saw": "in0000277",
+    "battlestar_galactica": "in0000278",
+    "the_lord_of_the_rings": "in0000279",
+    "masters_of_the_universe": "in0000280",
+    "harry_potter": "in0000281",
+    "the_walking_dead": "in0000282",
+    "jurassic_park": "in0000283",
+    "mission:_impossible": "in0000284",
+    "godzilla": "in0000285",
+    "terminator": "in0000286",
+    "the_conjuring_universe": "in0000287",
+    "spongebob_squarepants": "in0000288",
+    "the_chronicles_of_narnia": "in0000289",
+    "evil_dead": "in0000290",
+    "john_wick": "in0000291",
+    "scream": "in0000292",
+    "frozen": "in0000293",
+    "kung_fu_panda": "in0000294",
+    "stargate": "in0000295",
+    "blade_runner": "in0000296",
+    "dune": "in0000297",
+    "indiana_jones": "in0000298",
+    "super_mario_bros": "in0000299",
+    "the_witcher": "in0000300",
+    "spy_universe_yash_raj_films": "in0000301",
+    "pitch_perfect": "in0000302",
+    "the_hunger_games": "in0000303",
+    "the_matrix": "in0000304",
+    "maddock_horror_comedy_universe": "in0000305",
+    "golmaal": "in0000306",
+    "rohit_shetty_cop_universe": "in0000307",
+    "housefull": "in0000308",
+    "scooby_doo": "in0000309",
+    "micro_drama": "in0000310",
+    "buffyverse": "in0000311",
+    "avatar:_the_last_airbender": "in0000312",
+    "the_addams_family": "in0000313",
+    "resident_evil": "in0000314",
+    "jason_statham_action": "in0000315",
 }
 topic_options = {
     "alternate_version": "ALTERNATE_VERSION",
@@ -467,10 +575,12 @@ event_options = {
     "razzie": {"eventId": "ev0000558"},
 }
 base_url = "https://www.imdb.com"
+service_url = "https://utilities.kometa.wiki/imdb-service"
 git_base = "https://raw.githubusercontent.com/Kometa-Team/IMDb-Awards/master"
 search_hash_url = "https://raw.githubusercontent.com/Kometa-Team/IMDb-Hash/master/HASH"
 list_hash_url = "https://raw.githubusercontent.com/Kometa-Team/IMDb-Hash/master/LIST_HASH"
 watchlist_hash_url = "https://raw.githubusercontent.com/Kometa-Team/IMDb-Hash/master/WATCHLIST_HASH"
+interests_url = "https://raw.githubusercontent.com/Kometa-Team/IMDb-Interests/main/INTERESTS.json"
 graphql_url = "https://api.graphql.imdb.com/"
 list_url = f"{base_url}/list/ls"
 
@@ -480,6 +590,9 @@ class IMDb:
         self.requests = requests
         self.cache = cache
         self.default_dir = default_dir
+        self._service_available = True
+        self._title_cache = {}
+        self._episode_ratings_cache = {}
         self._ratings = None
         self._genres = None
         self._episode_ratings = None
@@ -490,13 +603,17 @@ class IMDb:
         self._search_hash = None
         self._list_hash = None
         self._watchlist_hash = None
+        self._interest_options = None
 
     def _request(self, url, language=None, xpath=None, params=None, page_props=False):
-        logger.trace(f"URL: {url}")
-        if params:
+        if logger:
+            logger.trace(f"URL: {url}")
+        if params and logger:
             logger.trace(f"Params: {params}")
         try:
             response = self.requests.get_cloudscrape_html(url, params=params, language=language)
+        except ParserError as e:
+            raise ServiceError(f"IMDb Error: Empty or unreadable page returned by {url}. Retry later; if this persists, check that IMDb is accessible from the Kometa host.") from e
         except Exception as e:
             raise Failed(e)
         if page_props:
@@ -519,6 +636,23 @@ class IMDb:
         except ValueError as e:
             raise Failed("IMDb Error: GraphQL request returned a non-JSON response") from e
 
+    def _service_request(self, endpoint, not_found_ok=False):
+        url = f"{service_url}/{endpoint}"
+        try:
+            response = self.requests.get(url)
+        except Exception as e:
+            raise Failed(f"IMDb Service Error: {e}")
+        if response.status_code == 404 and not_found_ok:
+            return None
+        if response.status_code >= 400:
+            raise Failed(f"IMDb Service Error: {response.status_code} - {response.text}")
+        try:
+            return response.json()
+        except ValueError:
+            if logger:
+                logger.error(str(response.content))
+            raise Failed("IMDb Service Error: invalid JSON response")
+
     @property
     def search_hash(self):
         if self._search_hash is None:
@@ -536,6 +670,24 @@ class IMDb:
         if self._watchlist_hash is None:
             self._watchlist_hash = self.requests.get(watchlist_hash_url).text.strip()
         return self._watchlist_hash
+
+    @property
+    def interest_options(self):
+        """IMDb interest catalog (name -> in-id). Prefers a live copy fetched from interests_url
+        (auto-refreshed in the IMDb-Interests repo) and falls back to the bundled snapshot on any failure,
+        so a network/rate-limit hiccup can never break interest validation or search building."""
+        if self._interest_options is None:
+            try:
+                data = self.requests.get_json(interests_url)
+                if isinstance(data, dict) and data:
+                    self._interest_options = {str(k): str(v) for k, v in data.items()}
+                else:
+                    raise Failed("IMDb Error: interests catalog response was empty or malformed")
+            except Exception as e:
+                if logger:
+                    logger.debug(f"IMDb: Falling back to bundled interest catalog: {e}")
+                self._interest_options = dict(interest_options_fallback)
+        return self._interest_options
 
     def validate_imdb(self, err_type, method, imdb_dicts):
         valid_lists = []
@@ -653,7 +805,7 @@ class IMDb:
             check_constraint("title", [("", "searchTerm")], "titleTextConstraint")
             check_constraint(["rating", "votes"], [("gte", "min"), ("lte", "max")], "userRatingsConstraint", range_name=["aggregateRatingRange", "ratingsCountRange"])
             check_constraint("genre", [("", "all"), ("any", "any"), ("not", "exclude")], "genreConstraint", lower="GenreIds", translation=genre_options)
-            check_constraint("interests", [("", "all"), ("any", "any"), ("not", "exclude")], "interestConstraint", lower="InterestIds", translation=interest_options)
+            check_constraint("interests", [("", "all"), ("any", "any"), ("not", "exclude")], "interestConstraint", lower="InterestIds", translation=self.interest_options)
             check_constraint("topic", [("", "all"), ("any", "any"), ("not", "no")], "withTitleDataConstraint", lower="DataAvailable", translation=topic_options)
             check_constraint("alternate_version", [("", "all"), ("any", "any")], "alternateVersionMatchingConstraint", lower="AlternateVersionTextTerms")
             check_constraint("crazy_credit", [("", "all"), ("any", "any")], "crazyCreditMatchingConstraint", lower="CrazyCreditTextTerms")
@@ -791,13 +943,17 @@ class IMDb:
             raise Failed("IMDb Error: No IMDb IDs Found")
         return imdb_ids
 
-    def keywords(self, imdb_id, language, ignore_cache=False):
+    def _service_keywords(self, imdb_id):
+        """Fetch keyword relevance data from the Kometa IMDb Service."""
+        data = self._service_request(f"keywords/{imdb_id}", not_found_ok=True)
+        if not data:
+            return {}
+        keywords = data.get("keywords") or {}
+        return {k: tuple(v) if isinstance(v, list) else (0, 0) for k, v in keywords.items()}
+
+    def _scrape_keywords(self, imdb_id, language):
+        """Fallback: scrape keyword relevance data from IMDb's keywords page."""
         imdb_keywords = {}
-        expired = None
-        if self.cache and not ignore_cache:
-            imdb_keywords, expired = self.cache.query_imdb_keywords(imdb_id, self.cache.expiration)
-            if imdb_keywords and expired is False:
-                return imdb_keywords
         keywords = self._request(f"{base_url}/title/{imdb_id}/keywords", language=language, xpath="//td[@class='soda sodavote']")
         if not keywords:
             raise Failed(f"IMDb Error: No Item Found for IMDb ID: {imdb_id}")
@@ -812,9 +968,64 @@ class IMDb:
                     imdb_keywords[name] = (0, 0)
             else:
                 imdb_keywords[name] = (0, 0)
+        return imdb_keywords
+
+    def keywords(self, imdb_id, language, ignore_cache=False):
+        imdb_keywords = {}
+        expired = None
+        if self.cache and not ignore_cache:
+            imdb_keywords, expired = self.cache.query_imdb_keywords(imdb_id, self.cache.expiration)
+            if imdb_keywords and expired is False:
+                return imdb_keywords
+
+        if self._service_available:
+            try:
+                imdb_keywords = self._service_keywords(imdb_id)
+                if imdb_keywords and logger:
+                    logger.debug(f"IMDb keywords for {imdb_id} retrieved from Kometa IMDb Service")
+            except Failed as e:
+                self._service_unavailable(e)
+
+        if not imdb_keywords:
+            if logger:
+                logger.debug(f"IMDb keywords for {imdb_id} falling back to scraping")
+            imdb_keywords = self._scrape_keywords(imdb_id, language)
+
         if self.cache and not ignore_cache:
             self.cache.update_imdb_keywords(expired, imdb_id, imdb_keywords, self.cache.expiration)
         return imdb_keywords
+
+    def _service_parental(self, imdb_id):
+        data = self._service_request(f"parental/{imdb_id}", not_found_ok=True)
+        if not data:
+            return {}
+        guide = data.get("parental_guide") or {}
+        if not guide:
+            return {}
+        return {k: v for k, v in guide.items() if k in util.parental_types.values() and v}
+
+    def _graphql_parental(self, imdb_id):
+        gql = f'{{ title(id: "{imdb_id}") {{ parentsGuide {{ categories {{ category {{ text }} severity {{ text }} }} }} }} }}'
+        response = self._graph_request({"query": gql}) or {}
+        data = response.get("data") or {}
+        title = data.get("title") or {}
+        parents_guide = title.get("parentsGuide") or {}
+        categories = parents_guide.get("categories") or []
+        parental_dict = {}
+        for cat in categories:
+            cat_text = ((cat or {}).get("category") or {}).get("text", "")
+            sev_text = ((cat or {}).get("severity") or {}).get("text", "")
+            if cat_text in util.parental_types and sev_text:
+                parental_dict[util.parental_types[cat_text]] = sev_text
+        return parental_dict
+
+    def _normalize_parental(self, parental_dict, imdb_id):
+        if parental_dict:
+            for _, v in util.parental_types.items():
+                if v not in parental_dict:
+                    parental_dict[v] = None
+            return parental_dict
+        raise Failed(f"IMDb Error: No Parental Guide Found for IMDb ID: {imdb_id}")
 
     def parental_guide(self, imdb_id, ignore_cache=False):
         parental_dict = {}
@@ -823,26 +1034,34 @@ class IMDb:
             parental_dict, expired = self.cache.query_imdb_parental(imdb_id, self.cache.expiration)
             if parental_dict and expired is False:
                 return parental_dict
-        gql = f'{{ title(id: "{imdb_id}") {{ parentsGuide {{ categories {{ category {{ text }} severity {{ text }} }} }} }} }}'
-        response = self._graph_request({"query": gql}) or {}
-        data = response.get("data") or {}
-        title = data.get("title") or {}
-        parents_guide = title.get("parentsGuide") or {}
-        categories = parents_guide.get("categories") or []
-        for cat in categories:
-            cat_text = ((cat or {}).get("category") or {}).get("text", "")
-            sev_text = ((cat or {}).get("severity") or {}).get("text", "")
-            if cat_text in util.parental_types and sev_text:
-                parental_dict[util.parental_types[cat_text]] = sev_text
-        if parental_dict:
-            for _, v in util.parental_types.items():
-                if v not in parental_dict:
-                    parental_dict[v] = None
-        else:
-            raise Failed(f"IMDb Error: No Parental Guide Found for IMDb ID: {imdb_id}")
+
+        if self._service_available:
+            try:
+                parental_dict = self._service_parental(imdb_id)
+                if parental_dict and logger:
+                    logger.debug(f"IMDb parental guide for {imdb_id} retrieved from Kometa IMDb Service")
+            except Failed as e:
+                self._service_unavailable(e)
+
+        if not parental_dict:
+            if logger:
+                logger.debug(f"IMDb parental guide for {imdb_id} falling back to GraphQL")
+            parental_dict = self._graphql_parental(imdb_id)
+
+        parental_dict = self._normalize_parental(parental_dict, imdb_id)
         if self.cache and not ignore_cache:
             self.cache.update_imdb_parental(expired, imdb_id, parental_dict, self.cache.expiration)
         return parental_dict
+
+    def _service_chart(self, chart, limit=None):
+        """Fetch chart IMDb IDs from the Kometa IMDb Service."""
+        params = {}
+        if limit:
+            params["limit"] = limit
+        data = self._service_request(f"chart/{chart}", not_found_ok=True)
+        if not data:
+            return []
+        return [item["tconst"] for item in data.get("results", []) if item.get("tconst")]
 
     def _chart_graphql(self, chart):
         """Fetch chart IMDb IDs directly via the GraphQL API (no HTML scraping needed)."""
@@ -869,20 +1088,38 @@ class IMDb:
     def _ids_from_chart(self, chart, language):
         if chart not in chart_urls:
             raise Failed(f"IMDb Error: chart: {chart} not ")
-        # Primary: use direct GraphQL API (bypasses HTML scraping issues)
+        # Primary: Kometa IMDb Service
+        if self._service_available:
+            try:
+                ids = self._service_chart(chart)
+                if ids:
+                    if logger:
+                        logger.debug(f"IMDb Service chart query returned {len(ids)} IDs for {chart}")
+                    return ids
+            except Failed as e:
+                self._service_unavailable(e)
+            except Exception as e:
+                if logger:
+                    logger.debug(f"IMDb Service chart query error for {chart}: {e}")
+        # Fallback: direct GraphQL API
         graphql_error: str | None = None
         if chart in chart_graphql_map:
             try:
                 ids = self._chart_graphql(chart)
                 if ids:
-                    logger.debug(f"GraphQL chart query returned {len(ids)} IDs for {chart}")
+                    if logger:
+                        logger.debug(f"GraphQL chart query returned {len(ids)} IDs for {chart}")
                     return ids
                 graphql_error = "returned no IMDb IDs"
             except Exception as e:
                 graphql_error = str(e)
-                logger.debug(f"GraphQL chart query error for {chart}: {e}")
-        # Fallback: HTML scraping via original xpath method
-        script_results = self._request(f"{base_url}/{chart_urls[chart]}", language=language, xpath="//script[@id='__NEXT_DATA__']/text()")
+                if logger:
+                    logger.debug(f"GraphQL chart query error for {chart}: {e}")
+        # Final fallback: HTML scraping via original xpath method
+        try:
+            script_results = self._request(f"{base_url}/{chart_urls[chart]}", language=language, xpath="//script[@id='__NEXT_DATA__']/text()")
+        except ServiceError as e:
+            raise ServiceError(f"IMDb Chart '{charts[chart]}' could not be loaded. {e}") from e
         if not script_results:
             message = f"IMDb Error: HTML fallback returned no chart data for {charts[chart]}"
             if graphql_error:
@@ -925,6 +1162,59 @@ class IMDb:
         else:
             raise Failed(f"IMDb Error: Method {method} not supported")
 
+    def _service_title(self, imdb_id):
+        if imdb_id not in self._title_cache:
+            self._title_cache[imdb_id] = self._service_request(f"title/{imdb_id}", not_found_ok=True)
+        return self._title_cache[imdb_id]
+
+    def _service_unavailable(self, error):
+        self._service_available = False
+        if logger:
+            logger.warning(f"IMDb Service unavailable, falling back to TSV dataset: {error}")
+
+    def get_rating(self, imdb_id):
+        if not imdb_id:
+            return None
+        if self._service_available:
+            try:
+                data = self._service_title(imdb_id)
+                return data.get("averageRating") if data else None
+            except Failed as e:
+                self._service_unavailable(e)
+        return self.ratings.get(imdb_id) if self.ratings else None
+
+    def get_genres(self, imdb_id):
+        if not imdb_id:
+            return []
+        if self._service_available:
+            try:
+                data = self._service_title(imdb_id)
+                genres = data.get("genres") if data else None
+                return genres.split(",") if genres else []
+            except Failed as e:
+                self._service_unavailable(e)
+        return self.genres.get(imdb_id, []) if self.genres else []
+
+    def get_episode_rating(self, imdb_id, season_num, episode_num):
+        if not imdb_id:
+            return None
+        season_num = str(season_num)
+        episode_num = str(episode_num)
+        if self._service_available:
+            try:
+                if imdb_id not in self._episode_ratings_cache:
+                    self._episode_ratings_cache[imdb_id] = self._service_request(f"episode-ratings/{imdb_id}", not_found_ok=True)
+                data = self._episode_ratings_cache[imdb_id]
+                seasons = data.get("seasons", {}) if data else {}
+                season = seasons.get(season_num, {})
+                episode = season.get(episode_num, {})
+                return episode.get("averageRating")
+            except Failed as e:
+                self._service_unavailable(e)
+        if imdb_id not in self.episode_ratings or season_num not in self.episode_ratings[imdb_id] or episode_num not in self.episode_ratings[imdb_id][season_num]:
+            return None
+        return self.episode_ratings[imdb_id][season_num][episode_num]
+
     @overload
     def _interface(self, interface: Literal["ratings"]) -> dict[str, str]: ...
     @overload
@@ -941,6 +1231,7 @@ class IMDb:
         if os.path.exists(tsv):
             os.remove(tsv)
 
+        logger.info(f"Downloading IMDb {interface} dataset...")
         self.requests.get_stream(f"https://datasets.imdbws.com/title.{interface}.tsv.gz", gz, "IMDb Interface")
 
         with open(tsv, "wb") as f_out:
@@ -991,19 +1282,6 @@ class IMDb:
                 logger.ghost(f"Processing IMDb rating for episodes: {i / len(all_eps) * 100:6.2f}%")
             logger.exorcise()
         return self._episode_ratings
-
-    def get_rating(self, imdb_id):
-        return self.ratings[imdb_id] if imdb_id in self.ratings else None
-
-    def get_genres(self, imdb_id):
-        return self.genres[imdb_id] if imdb_id in self.genres else []
-
-    def get_episode_rating(self, imdb_id, season_num, episode_num):
-        season_num = str(season_num)
-        episode_num = str(episode_num)
-        if imdb_id not in self.episode_ratings or season_num not in self.episode_ratings[imdb_id] or episode_num not in self.episode_ratings[imdb_id][season_num]:
-            return None
-        return self.episode_ratings[imdb_id][season_num][episode_num]
 
     def item_filter(self, imdb_info, filter_attr, modifier, filter_final, filter_data):
         if filter_attr == "imdb_keyword":

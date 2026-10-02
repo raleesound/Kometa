@@ -99,6 +99,34 @@ def test_tracearr_in_progress_playlist_schema(playlist_schema):
     )
 
 
+def test_tracearr_watched_media_collection_and_playlist_schema(collection_schema, playlist_schema):
+    value = {"user": "Anthony", "min_state": "partial", "list_days": 30, "list_size": 100}
+
+    validate(_collection_with_builder("tracearr_watched_media", value), collection_schema)
+    validate({"playlists": {"Watched Media": {"tracearr_watched_media": value}}}, playlist_schema)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["tt0079945", 174, "tt0079945\n174\ntmdb:154", ["tt0079945", 174, "tmdb:154"]],
+)
+def test_inline_text_builder_passes_collection_and_playlist_schemas(collection_schema, playlist_schema, value):
+    validate(_collection_with_builder("text", value), collection_schema)
+    validate({"playlists": {"Test": {"text": value}}}, playlist_schema)
+
+
+@pytest.mark.parametrize("value", [None, True, 1.5, {}, [], [["tt0079945"]]])
+def test_inline_text_builder_rejects_invalid_structures(collection_schema, playlist_schema, value):
+    with pytest.raises(ValidationError):
+        validate(_collection_with_builder("text", value), collection_schema)
+    with pytest.raises(ValidationError):
+        validate({"playlists": {"Test": {"text": value}}}, playlist_schema)
+
+
+def test_text_file_builder_passes_playlist_schema(playlist_schema):
+    validate({"playlists": {"Test": {"text_file": ["priority.txt", "overflow.txt"]}}}, playlist_schema)
+
+
 # ── Property validation ────────────────────────────────────────────────────────
 
 

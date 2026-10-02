@@ -13,11 +13,14 @@ fetch_overlay_value lives in modules/plex.py. It:
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 import modules.builder  # noqa: F401 -- pre-import to break plex<->builder circular import
 import modules.plex as plex_module
+import modules.tmdb as tmdb_module
 from modules.overlay import vars_by_type
 from modules.plex import Plex
-from modules.util import Failed
+from modules.util import Failed, MappingConvertError
 
 
 def _make_plex(cache=None, get_ids=None, get_ratings=None):
@@ -174,6 +177,22 @@ def test_floppy_rating_fetches_direct_decimal_value():
     floppy.get_overlay_rating.assert_called_once_with("movie", tmdb_id=550, tvdb_id=None, imdb_id="tt0137523", season=None, episode=None)
 
 
+def test_tmdb_rating_notfound_keeps_cause_at_error_level(monkeypatch):
+    logger = MagicMock()
+    monkeypatch.setattr(tmdb_module, "logger", logger)
+    plx = _make_plex(cache=None, get_ids=MagicMock(return_value=(1450305, None, None)))
+    tmdb_client = tmdb_module.TMDb.__new__(tmdb_module.TMDb)
+    tmdb_client.config = SimpleNamespace(Convert=MagicMock())
+    tmdb_client.get_movie = MagicMock(side_effect=tmdb_module.NotFound("TMDb Error: No Movie found for TMDb ID: 1450305"))
+    plx.config.TMDb = tmdb_client
+
+    with pytest.raises(MappingConvertError, match="No TMDb ID for Test Movie"):
+        plx.fetch_overlay_value(_item(), "tmdb_rating")
+
+    logger.error.assert_called_once_with("TMDb Error: No Movie found for TMDb ID: 1450305")
+    logger.debug.assert_not_called()
+
+
 # ── Float normalization ────────────────────────────────────────────────────────
 
 
@@ -196,6 +215,49 @@ def test_non_numeric_string_returns_none():
     result = plx.fetch_overlay_value(_item(), "plex_imdb_rating")
 
     assert result is None
+    cache.update_overlay_value_cache.assert_not_called()
+
+
+def test_out_of_range_cached_rating_is_rejected_and_reported(monkeypatch):
+    logger = MagicMock()
+    monkeypatch.setattr(plex_module, "logger", logger)
+    cache = MagicMock()
+    cache.query_overlay_value_cache.return_value = (10.2, False)
+    plx = _make_plex(cache=cache, get_ratings=MagicMock(return_value={}))
+
+    result = plx.fetch_overlay_value(_item(), "plex_imdb_rating")
+
+    assert result is None
+    assert any("value 10.2 is invalid" in call.args[0] for call in logger.warning.call_args_list)
+    cache.update_overlay_value_cache.assert_not_called()
+
+
+def test_out_of_range_letterboxd_rating_is_not_rendered_or_cached(monkeypatch):
+    logger = MagicMock()
+    monkeypatch.setattr(plex_module, "logger", logger)
+    cache = MagicMock()
+    cache.query_overlay_value_cache.return_value = (None, None)
+    plx = _make_plex(cache=cache, get_ids=MagicMock(return_value=(550, None, None)))
+    plx.config.MDBList = MagicMock(limit=False)
+    plx.config.MDBList.get_movie.return_value = SimpleNamespace(letterboxd_rating=5.1, ratings_valid=False)
+
+    result = plx.fetch_overlay_value(_item(), "mdb_letterboxd_rating")
+
+    assert result is None
+    assert any("provider's 0 to 5 scale" in call.args[0] for call in logger.warning.call_args_list)
+    cache.update_overlay_value_cache.assert_not_called()
+
+
+def test_valid_rating_from_tainted_provider_response_is_not_overlay_cached():
+    cache = MagicMock()
+    cache.query_overlay_value_cache.return_value = (None, None)
+    plx = _make_plex(cache=cache, get_ids=MagicMock(return_value=(550, None, None)))
+    plx.config.MDBList = MagicMock(limit=False)
+    plx.config.MDBList.get_movie.return_value = SimpleNamespace(imdb_rating=8.2, ratings_valid=False)
+
+    result = plx.fetch_overlay_value(_item(), "mdb_imdb_rating")
+
+    assert result == 8.2
     cache.update_overlay_value_cache.assert_not_called()
 
 

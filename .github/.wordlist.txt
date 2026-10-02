@@ -40,9 +40,11 @@ bitrate
 bitrateH
 bitrateL
 BOING
+booleans
 BoxOfficeMojo
 boxofficemojo
 BPjM
+BritBox
 Bullmoose
 bullmoose
 bw
@@ -79,6 +81,8 @@ customizable
 customizations
 d'Or
 Deathday
+deduplicate
+deduplication
 desc
 Dev
 dev
@@ -109,14 +113,20 @@ Fi
 fi
 Filepath
 filepath
+filesystem
 filetype
 Filmin
 filmin
 filmography
 FLAC
+fldb
+FlickList
+flicklist
+FlickList's
 FlixPatrol
 fontawesome
 FSK
+fuboTV
 Galician
 generalizable
 GID
@@ -152,6 +162,8 @@ Jinja
 JPG
 JSON
 json
+JustWatch
+Kanopy
 keepachangelog
 Kenobi
 kesleyalfa
@@ -171,6 +183,7 @@ Letterboxd
 letterboxd
 Letterboxd's
 LGBTQ
+lifecycle
 Limburgish
 Lingala
 LinuxServer
@@ -178,6 +191,7 @@ Linuxserver
 linuxserver
 linuxserver's
 localhost
+lookups
 Looper
 Lossy
 LSIO
@@ -213,6 +227,8 @@ Mojo's
 Mossi
 Movistar
 MPAA
+MUBI
+multiline
 MyAnimeList
 myanimelist
 MyAnimeList's
@@ -250,6 +266,8 @@ plex
 Plex's
 plex's
 Plex’s
+PlexAPI
+PlexAPI's
 PNG
 png
 Pokémon
@@ -257,6 +275,7 @@ Portainer
 Powershell
 Pre
 pre
+precommit
 prepended
 Preroll
 preroll
@@ -300,6 +319,7 @@ Schemas
 schemas
 SciFi
 SDTV
+selectable
 Serializd
 serializd
 Serializd's
@@ -317,7 +337,9 @@ sonarr
 Springland
 SSL
 ssl
+Starz
 stdlib
+stealthgyro
 StevenLu
 StevenLu's
 stonecutter
@@ -360,6 +382,7 @@ transcoded
 transcoding
 TrueHD
 TrueNAS
+tsv
 tt
 ttf
 Tubi
@@ -386,6 +409,7 @@ URI
 UserList
 userlist
 UUID
+validator
 venv
 VSCode
 VSCodium
@@ -401,6 +425,9 @@ Webhooks
 webhooks
 WEBP
 webserver
+WeTrakr
+wetrakr
+WeTrakr's
 whitespace
 wildcarded
 Wizarding
@@ -410,6 +437,7 @@ xmen
 XYZ
 YAML
 yaml
+YAML's
 YamTrack
 YML
 yml

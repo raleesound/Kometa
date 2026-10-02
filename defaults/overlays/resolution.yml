@@ -175,15 +175,21 @@ templates:
             value: '(?i)Criterion|\[CC\]'
           - key: openmatte
             value: '(?i)\b(Open[ ._-]?Matte)\b'
+      require_resolution:
+        conditions:
+          - type: edition_dovetail
+            value: <<use_resolution>>
     optional:
       - search
       - use_<<key>>
       - use_edition
+      - use_resolution
       - allowed_libraries
     run_definition:
       - <<use_<<key>>>>
       - <<use_edition>>
       - <<allowed_libraries>>
+      - <<require_resolution>>
     ignore_blank_results: true
     plex_all: true
     filters:
@@ -253,7 +259,7 @@ templates:
 overlays:
 
   4K-DV-HDR-Plus-Dovetail:
-    variables: {key: 4k, alt: dvhdrplus, weight: 160, type: resolution_dovetail, allowed_libraries: movie}
+    variables: {key: 4k, alt: dvhdrplus, weight: 159, type: resolution_dovetail, allowed_libraries: movie}
     template: [name: resolution, name: standard]
   4K-DV-HDR-Dovetail:
     variables: {key: 4k, alt: dvhdr, weight: 158, type: resolution_dovetail, allowed_libraries: movie}
@@ -274,7 +280,7 @@ overlays:
     variables: {key: 4k, alt: "", weight: 130, type: resolution_dovetail, allowed_libraries: movie}
     template: [name: resolution, name: standard]
   1080P-DV-HDR-Plus-Dovetail:
-    variables: {key: 1080p, alt: dvhdrplus, weight: 130, type: resolution_dovetail, allowed_libraries: movie}
+    variables: {key: 1080p, alt: dvhdrplus, weight: 129, type: resolution_dovetail, allowed_libraries: movie}
     template: [name: resolution, name: standard]
   1080P-DV-HDR-Dovetail:
     variables: {key: 1080p, alt: dvhdr, weight: 128, type: resolution_dovetail, allowed_libraries: movie}

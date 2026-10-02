@@ -9,6 +9,42 @@ import pytest
 
 
 class TestMyLogger:
+    @pytest.mark.parametrize(
+        ("is_debug", "expected_level"),
+        [(False, logging.INFO), (True, logging.DEBUG)],
+    )
+    def test_command_handler_uses_debug_setting(self, tmp_path, is_debug, expected_level):
+        from modules.logs import MyLogger
+
+        log = MyLogger(f"kometa-test-{is_debug}", str(tmp_path), 100, "=", True, is_debug, False, False)
+        try:
+            assert log._logger.handlers[-1].level == expected_level
+        finally:
+            for handler in list(log._logger.handlers):
+                log._logger.removeHandler(handler)
+                handler.close()
+
+    def test_disabled_console_debug_remains_in_detailed_log(self, tmp_path, capsys):
+        from modules.logs import MyLogger
+
+        log = MyLogger("kometa-test-file-debug", str(tmp_path), 100, "=", True, False, False, False)
+        try:
+            log.add_main_handler()
+            log.debug("detailed diagnostic")
+            log.info("console information")
+            log.remove_main_handler()
+
+            captured = capsys.readouterr()
+            assert "detailed diagnostic" not in captured.err
+            assert "console information" in captured.err
+            assert "detailed diagnostic" in (tmp_path / "logs" / "meta.log").read_text(encoding="utf-8")
+        finally:
+            if log.main_handler is not None:
+                log.main_handler.close()
+            for handler in list(log._logger.handlers):
+                log._logger.removeHandler(handler)
+                handler.close()
+
     @pytest.fixture
     def logger(self):
         from modules.logs import MyLogger
@@ -40,6 +76,22 @@ class TestMyLogger:
         # ``info_center`` is a method on real MyLogger; ensure ghost didn't
         # somehow pollute it by tripping over a recorded value.
         assert logger.info_center not in ["x"]
+
+    def test_ghost_writes_when_stdout_is_a_tty(self, logger, monkeypatch, capsys):
+        monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+        logger.ghost("progress")
+        assert capsys.readouterr().out.endswith("\r")
+
+    def test_ghost_silent_when_stdout_is_not_a_tty(self, logger, monkeypatch, capsys):
+        # Regression test for #3542: non-TTY stdout must never get \r-only output.
+        monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+        logger.ghost("progress")
+        assert capsys.readouterr().out == ""
+
+    def test_exorcise_silent_when_stdout_is_not_a_tty(self, logger, monkeypatch, capsys):
+        monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+        logger.exorcise()
+        assert capsys.readouterr().out == ""
 
 
 class TestSecretRedaction:

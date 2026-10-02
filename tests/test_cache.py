@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -171,6 +172,17 @@ class TestTMDbEpisodeCache:
             count = connection.execute("SELECT COUNT(*) FROM tmdb_episode_data2 WHERE episode_id = ? AND language = ?", (6855841, "en")).fetchone()[0]
 
         assert count == 1
+
+    @pytest.mark.parametrize("value", [-0.1, 10.1, float("nan"), float("inf"), "bad", True])
+    def test_invalid_rating_is_not_written(self, tmp_path, value):
+        from modules import cache as cache_module
+
+        cache = make_cache(tmp_path)
+
+        cache.update_tmdb_episode(False, make_tmdb_episode(vote_average=value), "en", 30)
+
+        assert cache.query_tmdb_episode_by_id(6855841, "en", 30) == ({}, None)
+        assert any(f"TMDb Warning: vote_average rating value {value}" in message for message in cache_module.logger.warning_messages)
 
     def test_partial_season_write_preserves_richer_external_ids(self, tmp_path):
         cache = make_cache(tmp_path)
@@ -402,6 +414,27 @@ class TestMdbCache:
         result, expired = cache.query_mdb("no-such-key", expiration=30)
         assert result == {}
         assert expired is None
+
+    def test_invalid_rating_is_not_written(self, tmp_path):
+        cache = make_cache(tmp_path)
+
+        cache.update_mdb(False, "invalid", _make_mdb_obj(letterboxd_rating=5.1), expiration=30)
+
+        assert cache.query_mdb("invalid", expiration=30) == ({}, None)
+
+    def test_stale_invalid_rating_is_evicted(self, tmp_path):
+        from modules import cache as cache_module
+
+        cache = make_cache(tmp_path)
+        cache.update_mdb(False, "stale", _make_mdb_obj(), expiration=30)
+        with sqlite3.connect(cache.cache_path) as connection:
+            connection.execute("UPDATE mdb_data5 SET letterboxd_rating = ? WHERE key_id = ?", (5.1, "stale"))
+
+        assert cache.query_mdb("stale", expiration=30) == ({}, None)
+        with sqlite3.connect(cache.cache_path) as connection:
+            count = connection.execute("SELECT COUNT(*) FROM mdb_data5 WHERE key_id = ?", ("stale",)).fetchone()[0]
+        assert count == 0
+        assert any("MDBList Warning: letterboxd rating value 5.1" in message and "cached value will be evicted" in message for message in cache_module.logger.warning_messages)
 
 
 def _make_anidb_obj(**overrides):
@@ -869,6 +902,29 @@ class TestOverlayValueCache:
         assert cache.query_overlay_value_cache(5173, "plex_imdb_rating")[0] == "7.3"
         assert cache.query_overlay_value_cache(5173, "mdb_tomatoes_rating")[0] == "8.1"
 
+    @pytest.mark.parametrize("value", [-0.1, 10.1, "bad", "nan", "inf"])
+    def test_invalid_rating_is_not_written(self, tmp_path, value):
+        from modules import cache as cache_module
+
+        cache = make_cache(tmp_path)
+
+        cache.update_overlay_value_cache(False, 5173, "mdb_letterboxd_rating", value)
+
+        assert cache.query_overlay_value_cache(5173, "mdb_letterboxd_rating") == (None, None)
+        assert any("value will not be cached" in message for message in cache_module.logger.warning_messages)
+
+    def test_legacy_invalid_rating_is_reported_and_evicted(self, tmp_path):
+        from modules import cache as cache_module
+
+        cache = make_cache(tmp_path)
+        cache.update_overlay_value_cache(False, 5173, "title", "placeholder")
+        with sqlite3.connect(cache.cache_path) as connection:
+            connection.execute("UPDATE overlay_value_cache SET type = ?, value = ? WHERE rating_key = ?", ("mdb_letterboxd_rating", "10.2", "5173"))
+
+        assert cache.query_overlay_value_cache(5173, "mdb_letterboxd_rating") == (None, None)
+        assert _ovc_row_count(cache, 5173, "mdb_letterboxd_rating") == 0
+        assert any("cached value will be evicted" in message for message in cache_module.logger.warning_messages)
+
     def test_miss_returns_none(self, tmp_path):
         cache = make_cache(tmp_path)
         assert cache.query_overlay_value_cache(123, "missing") == (None, None)
@@ -1105,6 +1161,49 @@ class TestConnectionReuse:
 # ═══════════════════════════════════════════════════════════════════════
 # SQL identifier validation
 # ═══════════════════════════════════════════════════════════════════════
+
+
+class TestLockedConnection:
+    """Experiment A1 - the RLock wrapper around the shared connection."""
+
+    @staticmethod
+    def _other_thread_can_acquire(cache) -> bool:
+        # RLock has no public .locked() - probe from a different thread instead, since RLock is only reentrant for its owning thread.
+        def try_acquire():
+            got = cache._lock.acquire(blocking=False)
+            if got:
+                cache._lock.release()
+            return got
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(try_acquire).result()
+
+    def test_lock_is_held_for_the_duration_of_a_transaction(self, tmp_path):
+        cache = make_cache(tmp_path)
+        assert self._other_thread_can_acquire(cache) is True
+        with cache.connection:
+            assert self._other_thread_can_acquire(cache) is False
+        assert self._other_thread_can_acquire(cache) is True
+
+    def test_nested_entry_from_same_thread_does_not_deadlock(self, tmp_path):
+        """RLock, not Lock - migrate_overlay_value_cache-style nesting must re-enter cleanly from the owning thread."""
+        cache = make_cache(tmp_path)
+        with cache.connection as outer:
+            with closing(outer.cursor()) as cursor:
+                cursor.execute("SELECT 1")
+                with cache.connection as inner:
+                    with closing(inner.cursor()) as inner_cursor:
+                        inner_cursor.execute("SELECT 2")
+        # Reaching here without a hang/exception is the assertion - a plain Lock would deadlock on the inner `with`.
+        assert self._other_thread_can_acquire(cache) is True
+
+    def test_underlying_connection_object_identity_is_stable(self, tmp_path):
+        """Same real sqlite3 connection every access, not a fresh wrapper - callers like set_trace_callback need this."""
+        cache = make_cache(tmp_path)
+        first = cache.connection
+        second = cache.connection
+        assert first is second
+        assert first._connection is second._connection
 
 
 class TestSqlIdentifierValidation:

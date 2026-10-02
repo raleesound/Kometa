@@ -31,7 +31,6 @@ SUPPRESS_STACKTRACE_PATTERNS = [
     r"Plex Error: .* not found",
     r"No matches found with regex pattern",
     r"No Items found in Plex",
-    r"Trakt Error: .*requires Trakt authentication",
 ]
 
 
@@ -121,7 +120,7 @@ class MyLogger:
         self._logger.setLevel(logging.DEBUG)
 
         cmd_handler = logging.StreamHandler()
-        cmd_handler.setLevel(logging.DEBUG if self.debug else logging.INFO)
+        cmd_handler.setLevel(logging.DEBUG if self.is_debug else logging.INFO)
 
         self._logger.addHandler(cmd_handler)
 
@@ -281,7 +280,6 @@ class MyLogger:
             r"Plex Error: .* not found",
             r"No matches found with regex pattern",
             r"Plex Error: No Items found in Plex",
-            r"Trakt Error: .*requires Trakt authentication",
         ]
 
         if any(re.search(pattern, stack) for pattern in suppress_stacktrace_patterns):
@@ -297,7 +295,7 @@ class MyLogger:
         return display_title
 
     def ghost(self, text):
-        if not self.ignore_ghost:
+        if not self.ignore_ghost and sys.stdout.isatty():
             try:
                 print(self._space(f"| {text}"), end="\r")
             except UnicodeEncodeError:
@@ -306,7 +304,7 @@ class MyLogger:
             self.spacing = len(text) + 2
 
     def exorcise(self):
-        if not self.ignore_ghost:
+        if not self.ignore_ghost and sys.stdout.isatty():
             print(self._space(" "), end="\r")
             self.spacing = 0
 

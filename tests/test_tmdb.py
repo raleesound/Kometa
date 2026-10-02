@@ -37,6 +37,51 @@ def test_notfound_is_failed_subclass():
     assert issubclass(tmdb.NotFound, Failed)
 
 
+def test_get_item_treats_notfound_as_debug_miss_when_requested(monkeypatch):
+    from tests.conftest import FakeLogger
+
+    logger = FakeLogger()
+    monkeypatch.setattr(tmdb, "logger", logger)
+    t = tmdb.TMDb.__new__(tmdb.TMDb)
+    t.config = SimpleNamespace(Convert=MagicMock())
+    t.get_movie = MagicMock(side_effect=tmdb.NotFound("TMDb movie is gone"))
+    item = SimpleNamespace(title="Deleted Movie", guid="plex://movie/deleted")
+
+    assert t.get_item(item, 1450305, None, None, ignore_not_found=True) is None
+    assert logger.debug_messages == ["TMDb movie is gone"]
+    assert logger.error_messages == []
+
+
+def test_get_item_keeps_notfound_as_error_by_default(monkeypatch):
+    from tests.conftest import FakeLogger
+
+    logger = FakeLogger()
+    monkeypatch.setattr(tmdb, "logger", logger)
+    t = tmdb.TMDb.__new__(tmdb.TMDb)
+    t.config = SimpleNamespace(Convert=MagicMock())
+    t.get_movie = MagicMock(side_effect=tmdb.NotFound("TMDb movie is gone"))
+    item = SimpleNamespace(title="Deleted Movie", guid="plex://movie/deleted")
+
+    assert t.get_item(item, 1450305, None, None) is None
+    assert logger.debug_messages == []
+    assert logger.error_messages == ["TMDb movie is gone"]
+
+
+def test_get_item_keeps_other_plex_discovered_failures_as_errors(monkeypatch):
+    from tests.conftest import FakeLogger
+
+    logger = FakeLogger()
+    monkeypatch.setattr(tmdb, "logger", logger)
+    t = tmdb.TMDb.__new__(tmdb.TMDb)
+    t.config = SimpleNamespace(Convert=MagicMock())
+    t.get_movie = MagicMock(side_effect=Failed("TMDb service failed"))
+    item = SimpleNamespace(title="Unavailable Movie", guid="plex://movie/unavailable")
+
+    assert t.get_item(item, 550, None, None) is None
+    assert logger.debug_messages == []
+    assert logger.error_messages == ["TMDb service failed"]
+
+
 def test_unavailable_is_service_error_subclass():
     assert issubclass(tmdb.Unavailable, ServiceError)
 
@@ -186,6 +231,69 @@ def test_show_hydration_retries_lazy_transient_502(monkeypatch):
     assert data.vote_count_calls == 2
     logger.warning.assert_called_once()
     logger.stacktrace.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("value_type", "aggregate_key"),
+    [
+        ("agg_tv_cast", "roles"),
+        ("agg_tv_crew", "jobs"),
+    ],
+)
+def test_aggregate_credits_silently_skip_malformed_entries(monkeypatch, value_type, aggregate_key):
+    logger = MagicMock()
+    monkeypatch.setattr(tmdb, "logger", logger)
+    captured = {}
+
+    def parent_parse(self, **kwargs):
+        captured.update(kwargs)
+        return "parsed"
+
+    monkeypatch.setattr(tmdb.TMDbAPIs, "_parse", parent_parse)
+    api = tmdb.KometaTMDbAPIs.__new__(tmdb.KometaTMDbAPIs)
+    valid_entry = {"character" if aggregate_key == "roles" else "job": "Presenter"}
+    original = {"id": 10, "name": "Example Person", aggregate_key: [valid_entry, ["malformed"], None]}
+
+    assert api._parse(data=original, value_type=value_type) == "parsed"
+    assert captured["data"][aggregate_key] == [valid_entry]
+    assert original[aggregate_key] == [valid_entry, ["malformed"], None]
+    assert logger.mock_calls == []
+
+
+def test_show_hydration_wraps_unexpected_parser_errors(monkeypatch):
+    logger = MagicMock()
+    monkeypatch.setattr(tmdb, "logger", logger)
+    show = tmdb.TMDbShow.__new__(tmdb.TMDbShow)
+    show.tmdb_id = 500
+
+    class MalformedShow:
+        @property
+        def title(self):
+            raise AttributeError("'list' object has no attribute 'items'")
+
+    with pytest.raises(Failed, match=r"Failed to parse Show with TMDb ID 500.*list.*items"):
+        show._load_data(MalformedShow())
+
+    logger.stacktrace.assert_called_once_with()
+
+
+def test_episode_hydration_wraps_unexpected_parser_errors(monkeypatch):
+    logger = MagicMock()
+    monkeypatch.setattr(tmdb, "logger", logger)
+    episode = tmdb.TMDbEpisode.__new__(tmdb.TMDbEpisode)
+    episode.tmdb_id = 500
+    episode.season_number = 2
+    episode.episode_number = 3
+
+    class MalformedEpisode:
+        @property
+        def id(self):
+            raise AttributeError("'list' object has no attribute 'items'")
+
+    with pytest.raises(Failed, match=r"Failed to parse Episode with TMDb ID 500 Season 2 Episode 3.*list.*items"):
+        episode._load_data(MalformedEpisode())
+
+    logger.stacktrace.assert_called_once_with()
 
 
 def test_get_collection_raises_notfound_for_deleted_collection(monkeypatch):
@@ -445,3 +553,35 @@ class TestTMDBObj:
         t.validate_tmdb = MagicMock(side_effect=tmdb.NotFound("gone"))
         with pytest.raises(tmdb.NotFound):
             t.validate_tmdb_ids("99999", "tmdb_movie")
+
+
+def test_show_missing_lazy_season_is_handled_without_traceback_or_cache_write(monkeypatch):
+    t = _bare_tmdb(monkeypatch)
+    logger = MagicMock()
+    monkeypatch.setattr(tmdb, "logger", logger)
+    t.cache = MagicMock()
+    t.cache.query_tmdb_show.return_value = (None, True)
+    t.language = "en"
+    t.expiration = 30
+
+    class MissingSeason:
+        season_number = 2
+        name = "Season 2"
+
+        @property
+        def vote_average(self):
+            raise TMDbApiNotFound("(404 [Not Found]) Requested Item Not Found")
+
+    data = MagicMock()
+    data.title = "Example Show"
+    data.origin_countries = []
+    data.seasons = [MissingSeason()]
+    t.TMDb = SimpleNamespace(tv_show=MagicMock(return_value=data))
+
+    with pytest.raises(Failed, match=r"Season 2 not found \(404\) for Example Show \(TMDb ID: 500\)"):
+        tmdb.TMDbShow(t, 500)
+
+    t.TMDb.tv_show.assert_called_once()
+    t.cache.update_tmdb_show.assert_not_called()
+    logger.stacktrace.assert_not_called()
+    logger.warning.assert_not_called()
