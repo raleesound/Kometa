@@ -42,7 +42,6 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
-  issues: write
   # Required by claude-code-action for its default GitHub App authentication.
   id-token: write
 
@@ -168,14 +167,19 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # Upstream's own locked-environment action, read from the merged tree, so this job
+      # installs exactly what upstream's CI does even when upstream changes how.
+      - name: Install the merged tree's locked environment
+        id: env
+        if: steps.merge.outputs.conflict == 'false' || steps.agent_commit.outputs.resolved == 'true'
+        uses: ./.github/actions/setup-env
+
       # Independent of anything the agent believes about its own work.
       - name: Test the merge result
         id: tests
         if: steps.merge.outputs.conflict == 'false' || steps.agent_commit.outputs.resolved == 'true'
         continue-on-error: true
-        run: |
-          pip install -q -r requirements.txt -r dev-requirements.txt pytest
-          python -m pytest tests/ -q
+        run: python -m pytest tests/ -q
 
       - name: Push a clean merge
         if: steps.merge.outputs.conflict == 'false' && steps.tests.outcome == 'success'
@@ -183,7 +187,6 @@ jobs:
           git push origin "HEAD:$BRANCH"
           echo "Merged ${{ steps.fetch.outputs.behind }} upstream commit(s) into ${BRANCH}."
 
-      # An agent touched this one, so a human reviews it even though it is green.
       # An agent touched this one, so a human reviews it even though it is green.
       - name: Open a PR for the agent's resolution
         if: steps.agent_commit.outputs.resolved == 'true' && steps.tests.outcome == 'success'
@@ -214,57 +217,48 @@ jobs:
             --label upstream-sync \
             --body-file /tmp/pr-body.md
 
+      # Issues are disabled on this fork, so the alert goes to Discord. It must reach a
+      # human: this job's whole failure mode is going quiet while the fork drifts.
       - name: Report a sync that needs a human
         if: |
-          (steps.merge.outputs.conflict == 'false' && steps.tests.outcome == 'failure') ||
-          (steps.merge.outputs.conflict == 'true' && (steps.agent_commit.outputs.resolved != 'true' || steps.tests.outcome != 'success'))
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const conflict = '${{ steps.merge.outputs.conflict }}' === 'true';
-            const agentRan = '${{ steps.agent.outcome }}' !== '';
-            const agentResolved = '${{ steps.agent_commit.outputs.resolved }}' === 'true';
-            const behind = '${{ steps.fetch.outputs.behind }}';
-            const title = conflict
-              ? `Upstream sync: merge conflict against ${process.env.BRANCH}`
-              : `Upstream sync: tests fail after merging ${process.env.BRANCH}`;
-            const cause = !conflict
-              ? `\`upstream/${process.env.BRANCH}\` merges cleanly but the test suite fails on the result. Nothing was pushed.`
-              : !agentRan
-                ? `Merging \`upstream/${process.env.BRANCH}\` conflicts with our diff, and no CLAUDE_CODE_OAUTH_TOKEN secret is set, so it could not be resolved automatically. The merge was aborted; the branch is untouched.`
-                : !agentResolved
-                  ? `Merging \`upstream/${process.env.BRANCH}\` conflicts with our diff and Claude Code could not resolve it. The merge was aborted; the branch is untouched.`
-                  : `Claude Code resolved the conflicts but the test suite still fails. Nothing was pushed. Check tests/test_fork_invariants.py first — a failure there means the resolution dropped one of our features.`;
-            const body = [
-              cause,
-              ``,
-              `Behind upstream by **${behind}** commit(s).`,
-              ``,
-              `Resolve locally:`,
-              '```',
-              `git fetch upstream ${process.env.BRANCH}`,
-              `git checkout ${process.env.BRANCH}`,
-              `git merge upstream/${process.env.BRANCH}`,
-              '```',
-              ``,
-              `[Run log](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
-            ].join('\n');
-            const existing = await github.rest.issues.listForRepo({
-              owner: context.repo.owner, repo: context.repo.repo,
-              state: 'open', labels: 'upstream-sync',
-            });
-            // One open issue per failure mode; a nightly job must not file a new
-            // one every night for the same stuck merge.
-            const match = existing.data.find(i => i.title === title);
-            if (match) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner, repo: context.repo.repo,
-                issue_number: match.number,
-                body: `Still stuck as of ${new Date().toISOString().slice(0, 10)} — behind by ${behind} commit(s).`,
-              });
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner, repo: context.repo.repo,
-                title, body, labels: ['upstream-sync'],
-              });
-            }
+          always() && (
+          (steps.merge.outputs.conflict == 'false' && steps.tests.outcome != 'success') ||
+          (steps.merge.outputs.conflict == 'true' && (steps.agent_commit.outputs.resolved != 'true' || steps.tests.outcome != 'success')))
+        env:
+          WEBHOOK: ${{ secrets.SYNC_ALERT_WEBHOOK }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+          AGENT_OUTCOME: ${{ steps.agent.outcome }}
+          AGENT_RESOLVED: ${{ steps.agent_commit.outputs.resolved }}
+          ENV_OUTCOME: ${{ steps.env.outcome }}
+          BEHIND: ${{ steps.fetch.outputs.behind }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$CONFLICT" != "true" ]; then
+            if [ "$ENV_OUTCOME" != "success" ]; then
+              cause="upstream/$BRANCH merges cleanly but its locked environment failed to install. Nothing was pushed."
+            else
+              cause="upstream/$BRANCH merges cleanly but the test suite fails on the result. Nothing was pushed."
+            fi
+          elif [ "$HAVE_AGENT_TOKEN" != "true" ]; then
+            cause="Merging upstream/$BRANCH conflicts with our diff and no CLAUDE_CODE_OAUTH_TOKEN secret is set, so nothing tried to resolve it. The branch is untouched."
+          elif [ "$AGENT_RESOLVED" != "true" ]; then
+            cause="Merging upstream/$BRANCH conflicts with our diff and Claude Code could not resolve it (agent step: ${AGENT_OUTCOME:-skipped}). The branch is untouched."
+          else
+            cause="Claude Code resolved the conflicts but the tests still fail. Nothing was pushed. Check tests/test_fork_invariants.py first: a failure there means the resolution dropped one of our features."
+          fi
+          msg="**Kometa fork upstream sync needs a human.** $cause Behind upstream by **$BEHIND** commit(s). <$RUN_URL>"
+          echo "$msg"
+          if [ -z "$WEBHOOK" ]; then
+            echo "::error::SYNC_ALERT_WEBHOOK is not set, so this alert reached nobody"
+            exit 1
+          fi
+          jq -n --arg c "$msg" '{content: $c, allowed_mentions: {parse: []}}' \
+            | curl -fsS -H 'Content-Type: application/json' --data-binary @- "$WEBHOOK"
+
+      # A sync that needs a human ends red, so the run list never shows a stuck fork as green.
+      - name: Fail the run
+        if: |
+          always() && (
+          (steps.merge.outputs.conflict == 'false' && steps.tests.outcome != 'success') ||
+          (steps.merge.outputs.conflict == 'true' && (steps.agent_commit.outputs.resolved != 'true' || steps.tests.outcome != 'success')))
+        run: exit 1
