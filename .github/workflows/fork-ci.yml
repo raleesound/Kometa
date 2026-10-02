@@ -1,0 +1,51 @@
+# The fork's own CI, on the in-cluster `kometa-ci` ARC pool.
+#
+# Nothing in this fork runs on GitHub-hosted runners. Upstream's workflows
+# (ci.yml, test.yml, lint.yml, pyright.yml, ...) stay in the tree untouched, so
+# merging upstream never conflicts on them, but they are disabled; upstream-sync.yml
+# disables any new one upstream adds. This file and upstream-sync.yml are the only
+# workflows that run, and tests/test_fork_invariants.py fails if either names a
+# runner other than the fork's pools.
+#
+# The gates are the ones upstream's CI enforces on Linux: black, isort, flake8,
+# the full pytest suite and the pyright ratchet. Upstream's Windows legs are not
+# reproduced; this fork only ever runs on the media host's Linux.
+
+name: Fork CI
+
+on:
+  pull_request:
+  push:
+    branches: [nightly]
+  workflow_dispatch:
+
+concurrency:
+  group: fork-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: kometa-ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the locked environment
+        uses: ./.github/actions/fork-env
+
+      - name: black
+        run: black --check --diff modules/ tests/ *.py
+
+      - name: isort
+        run: isort --check-only --diff modules/ tests/ *.py
+
+      - name: flake8
+        run: flake8 modules/ tests/ *.py --max-line-length=256 --extend-ignore=E203,W503
+
+      - name: pytest
+        run: python -m pytest tests/ -q
+
+      - name: pyright ratchet
+        run: python scripts/pyright_baseline.py --check

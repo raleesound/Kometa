@@ -4,20 +4,23 @@
 # latent config break into a five-week surprise during the 2026-08-22 cutover, so
 # the merge happens nightly and small rather than rarely and large.
 #
-# The merge is gated on the full test suite running here, not on branch
-# protection, so a green run means the tests actually passed rather than that no
-# checks were configured.
+# Everything runs in-cluster on the `kometa-sync` ARC pool; nothing in this fork
+# runs on GitHub-hosted runners. Pushes use a short-lived ai-app-factory-agent App
+# token scoped to this repository: it has the `workflows` permission that
+# GITHUB_TOKEN lacks, and upstream changes .github/workflows about weekly.
 #
-# A conflict is handed to Claude Code to resolve, because the alternative is an
-# issue nobody reads and a fork that quietly stops tracking upstream. The agent's
-# word is never taken for it: whatever it produces is re-tested from scratch by
-# this job, including tests/test_fork_invariants.py, which pins every feature
-# this fork owns. Resolving a conflict in upstream's favour deletes our work
-# silently and is the single most likely way for this to go wrong, so that check
-# is what actually guards the merge.
+# A merge reaches `nightly` only through this job, and only after the same gates
+# fork-ci.yml runs (black, isort, flake8, pytest, the pyright ratchet) pass here,
+# including tests/test_fork_invariants.py, which pins every feature this fork
+# owns. Resolving a conflict in upstream's favour deletes our work silently and
+# is the single most likely way for a sync to go wrong; that file is what
+# actually guards against it.
 #
-# An agent-resolved merge always goes to a pull request, never straight to the
-# branch, so a human sees the resolution even when everything is green.
+# A conflict, or a clean merge that fails a gate, is handed to necro's
+# `cicd-medic` Thesean. It resolves the merge on a branch and re-dispatches this
+# workflow with `resolved_branch`, so its result is re-gated here from scratch
+# rather than taken on its word. If that run fails too, or the handoff itself
+# fails, the alert goes to Rob on Discord.
 #
 # Nothing here deploys. The media host pins an explicit SHA in KOMETA_REF, so
 # upstream code reaches Plex only when someone bumps that and runs deploy.sh.
@@ -30,40 +33,48 @@ on:
     # host's Kometa run windows.
     #
     # GitHub runs scheduled workflows ONLY from the repository's default branch,
-    # so this file has to live on the default branch to fire at all. It checks
-    # out and merges `nightly` regardless of where it runs from.
+    # so this file has to live on the default branch to fire at all.
     - cron: "20 5 * * *"
   workflow_dispatch:
+    inputs:
+      resolved_branch:
+        description: Branch holding an already-resolved merge of upstream/nightly to gate and land
+        required: false
+        default: ""
 
 concurrency:
   group: upstream-sync
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  pull-requests: write
-  # Required by claude-code-action for its default GitHub App authentication.
-  id-token: write
+  contents: read
 
 env:
   UPSTREAM: https://github.com/Kometa-Team/Kometa.git
   BRANCH: nightly
-  # Matches PYTHON_VERSION in test.yml so the gate runs on the same interpreter CI does.
-  PYTHON_VERSION: "3.12"
+  RESOLVED: ${{ inputs.resolved_branch }}
+  # In-cluster address of necronomicode; the ARC pod reaches it directly.
+  NECRO_URL: http://necronomicode.necronomicode.svc.cluster.local
+  THESEAN: cicd-medic
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
-    env:
-      # `secrets` cannot be read from a step-level `if:`, but job env can be, and job
-      # env may read secrets. Without the token the agent steps skip and a conflict
-      # falls through to the issue path.
-      HAVE_AGENT_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+    runs-on: kometa-sync
     steps:
+      - name: Mint a token scoped to this repository
+        id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.BRANCH }}
           fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
 
       - name: Fetch upstream
         id: fetch
@@ -74,199 +85,158 @@ jobs:
           echo "behind=$behind" >> "$GITHUB_OUTPUT"
           echo "Behind upstream/$BRANCH by $behind commit(s)."
 
-      - name: Merge upstream
+      - name: Merge upstream, or take the resolved branch
         id: merge
-        if: steps.fetch.outputs.behind != '0'
+        env:
+          BEHIND: ${{ steps.fetch.outputs.behind }}
+          BOT: ${{ steps.app.outputs.app-slug }}[bot]
         run: |
-          git config user.name "kometa-sync[bot]"
-          git config user.email "kometa-sync[bot]@users.noreply.github.com"
-          if git merge --no-edit "upstream/$BRANCH"; then
-            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          git config user.name "$BOT"
+          git config user.email "$BOT@users.noreply.github.com"
+          if [ -n "$RESOLVED" ]; then
+            git fetch --no-tags origin "$RESOLVED"
+            # A resolution must build on what nightly is now, or landing it would
+            # silently discard whatever reached nightly after it was made.
+            if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+              echo "::error::$RESOLVED does not contain the current $BRANCH; it must be redone on top of it"
+              exit 1
+            fi
+            git checkout -q --detach FETCH_HEAD
+            echo "work=true" >> "$GITHUB_OUTPUT"
+          elif [ "$BEHIND" = "0" ]; then
+            echo "Already up to date."
+            echo "work=false" >> "$GITHUB_OUTPUT"
+          elif git merge --no-edit "upstream/$BRANCH"; then
+            echo "work=true" >> "$GITHUB_OUTPUT"
           else
-            # Leave nothing half-merged for the next run to trip over.
-            git merge --abort || true
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicted.txt"
+            git merge --abort
+            echo "work=false" >> "$GITHUB_OUTPUT"
             echo "conflict=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Re-merge, leaving the conflicts in the tree for the agent
-        id: remerge
-        if: steps.merge.outputs.conflict == 'true' && env.HAVE_AGENT_TOKEN == 'true'
+      - name: Install the locked environment
+        if: steps.merge.outputs.work == 'true'
+        uses: ./.github/actions/fork-env
+
+      # The same gates fork-ci.yml runs, all of them, recording which failed.
+      - name: Gate the result
+        id: gates
+        if: steps.merge.outputs.work == 'true'
         run: |
-          git merge --no-commit --no-ff "upstream/$BRANCH" || true
-          {
-            echo "files<<EOF"
-            git diff --name-only --diff-filter=U
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "Conflicted files:"
-          git diff --name-only --diff-filter=U
-
-      - name: Resolve conflicts with Claude Code
-        id: agent
-        if: steps.remerge.outcome == 'success'
-        continue-on-error: true
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          claude_args: --max-turns 40
-          # claude-code-action refuses to run for a bot actor. GitHub attributes a
-          # scheduled run to whoever last changed the cron line, which here is the
-          # commit bot, so the run would be rejected without this. Named explicitly
-          # rather than "*", which would let any external app trigger it on a public repo.
-          allowed_bots: "ai-app-factory-agent[bot]"
-          prompt: |
-            This repository is a fork of Kometa-Team/Kometa. An automated merge of
-            upstream's `nightly` branch into ours has stopped with conflicts, and the
-            conflicted working tree is in front of you right now.
-
-            Resolve every conflict, then make the test suite pass.
-
-            Conflicted files:
-            ${{ steps.remerge.outputs.files }}
-
-            What matters here:
-
-            - Keep BOTH sides' intent. Upstream's change is there for a reason and so is
-              ours. Taking one side wholesale is almost always wrong, and taking
-              upstream's side silently deletes features this fork exists to provide.
-            - `tests/test_fork_invariants.py` lists everything this fork owns and why.
-              Read it first. It is the specification for what must still work when you
-              are done. Do not edit or weaken it to make a failure go away — if one of
-              its assertions fails, the resolution is wrong, not the test.
-            - Where upstream has restructured code we changed, reapply our change in the
-              new structure rather than reverting to the old one.
-            - Run `python -m pytest tests/ -q` and iterate until it passes. Fix the
-              resolution, not the tests.
-            - Leave no conflict markers anywhere, including in YAML and Markdown, where
-              they parse happily and would ship.
-            - Do not commit, push, or open a pull request. Leave the resolved files in
-              the working tree; the workflow handles the rest.
-
-            If a conflict genuinely cannot be resolved without a decision only a human
-            can make, stop and explain which file and what the competing intents are,
-            rather than guessing.
-
-      - name: Commit the agent's resolution
-        id: agent_commit
-        if: steps.agent.outcome == 'success'
-        run: |
-          # The agent is told not to commit, so its edits are still unstaged and every
-          # file it fixed still reads as unmerged. Stage first, then judge the content:
-          # a leftover marker is what an unresolved conflict actually looks like.
-          git add -A
-          # (A bare "=======" is also a Markdown heading underline, so only the
-          # opening and closing markers count.)
-          if git diff --cached -U0 | grep -qE '^\+(<<<<<<<|>>>>>>>)( |$)'; then
-            echo "Conflict markers remain:"
-            git diff --cached -U0 | grep -nE '^\+(<<<<<<<|>>>>>>>)( |$)' | head -20
-            git merge --abort || true
-            echo "resolved=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          failed=""
+          gate() { local name=$1; shift; echo "::group::$name"; "$@" || failed="$failed $name"; echo "::endgroup::"; }
+          gate black black --check modules/ tests/ *.py
+          gate isort isort --check-only modules/ tests/ *.py
+          gate flake8 flake8 modules/ tests/ *.py --max-line-length=256 --extend-ignore=E203,W503
+          gate pytest python -m pytest tests/ -q
+          gate pyright python scripts/pyright_baseline.py --check
+          echo "failed=${failed# }" >> "$GITHUB_OUTPUT"
+          if [ -n "$failed" ]; then
+            echo "::error::Gates failed:$failed"
           fi
-          git commit --no-edit || git commit -m "Merge upstream/${BRANCH} (conflicts resolved by Claude Code)"
-          echo "resolved=true" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-python@v7
-        if: steps.merge.outputs.conflict == 'false' || steps.agent_commit.outputs.resolved == 'true'
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      # Upstream's own locked-environment action, read from the merged tree, so this job
-      # installs exactly what upstream's CI does even when upstream changes how.
-      - name: Install the merged tree's locked environment
-        id: env
-        if: steps.merge.outputs.conflict == 'false' || steps.agent_commit.outputs.resolved == 'true'
-        uses: ./.github/actions/setup-env
-
-      # Independent of anything the agent believes about its own work.
-      - name: Test the merge result
-        id: tests
-        if: steps.merge.outputs.conflict == 'false' || steps.agent_commit.outputs.resolved == 'true'
-        continue-on-error: true
-        run: python -m pytest tests/ -q
-
-      - name: Push a clean merge
-        if: steps.merge.outputs.conflict == 'false' && steps.tests.outcome == 'success'
+      - name: Push to nightly
+        if: steps.merge.outputs.work == 'true' && steps.gates.outputs.failed == ''
         run: |
+          # [skip ci]: a workflow upstream just added would otherwise fire on this
+          # push before the next step disables it. Everything fork-ci.yml checks
+          # has already passed above.
+          git commit --amend -m "$(git log -1 --format=%B)" -m "[skip ci]"
           git push origin "HEAD:$BRANCH"
-          echo "Merged ${{ steps.fetch.outputs.behind }} upstream commit(s) into ${BRANCH}."
+          if [ -n "$RESOLVED" ]; then
+            git push origin --delete "$RESOLVED"
+          fi
+          echo "Landed on $BRANCH: $(git log -1 --format=%h)."
 
-      # An agent touched this one, so a human reviews it even though it is green.
-      - name: Open a PR for the agent's resolution
-        if: steps.agent_commit.outputs.resolved == 'true' && steps.tests.outcome == 'success'
+      # Runs every time, so a workflow upstream adds is off before its first trigger.
+      - name: Disable workflows this fork does not run
+        if: always() && steps.app.outcome == 'success'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CONFLICTED: ${{ steps.remerge.outputs.files }}
-          BEHIND: ${{ steps.fetch.outputs.behind }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
-          pr_branch="upstream-sync/agent-$(date -u +%Y%m%d-%H%M)"
-          git push origin "HEAD:$pr_branch"
-          {
-            echo "Merging \`upstream/$BRANCH\` conflicted. Claude Code resolved it and the full"
-            echo "test suite passes on the result, including \`tests/test_fork_invariants.py\`,"
-            echo "which pins every feature this fork owns."
-            echo
-            echo "Review the resolution before merging. The thing to check is whether our change"
-            echo "and upstream's change both survived — a resolution that quietly drops one side"
-            echo "passes every test upstream wrote."
-            echo
-            echo "Behind upstream by $BEHIND commit(s). Conflicted files:"
-            echo
-            echo '```'
-            echo "$CONFLICTED"
-            echo '```'
-          } > /tmp/pr-body.md
-          gh pr create --base "$BRANCH" --head "$pr_branch" \
-            --title "Upstream sync: $BEHIND commit(s), conflicts resolved by Claude Code" \
-            --label upstream-sync \
-            --body-file /tmp/pr-body.md
+          own=" fork-ci.yml upstream-sync.yml "
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows" --paginate \
+            -q '.workflows[] | select(.state == "active") | [.id, .path] | @tsv' > "$RUNNER_TEMP/active.tsv"
+          while IFS=$'\t' read -r id path; do
+            case "$own" in *" $(basename "$path") "*) continue ;; esac
+            gh api --silent -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable"
+            echo "Disabled $path"
+            for run in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$id/runs?per_page=20" \
+                -q '.workflow_runs[] | select(.status != "completed") | .id'); do
+              gh api --silent -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/cancel"
+              echo "Cancelled run $run"
+            done
+          done < "$RUNNER_TEMP/active.tsv"
+
+      - name: Hand the merge to necro
+        id: handoff
+        if: |
+          env.RESOLVED == '' && (steps.merge.outputs.conflict == 'true' ||
+          (steps.merge.outputs.work == 'true' && steps.gates.outputs.failed != ''))
+        env:
+          TOKEN: ${{ secrets.NECRONOMICODE_INTERNAL_TOKEN }}
+          FAILED: ${{ steps.gates.outputs.failed }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+          BEHIND: ${{ steps.fetch.outputs.behind }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$CONFLICT" = "true" ]; then
+            problem="Merging upstream/$BRANCH conflicts in: $(paste -sd, "$RUNNER_TEMP/conflicted.txt")."
+          else
+            problem="upstream/$BRANCH merges cleanly, but these gates fail on the result: $FAILED."
+          fi
+          branch="upstream-sync/resolved-$(date -u +%Y%m%d)"
+          content=$(cat <<MSG
+          Kometa fork upstream sync needs a fix. $problem Behind upstream by $BEHIND commit(s). Run: $RUN_URL
+
+          Repository: https://github.com/$GITHUB_REPOSITORY (a fork of Kometa-Team/Kometa).
+
+          1. Clone it, check out \`$BRANCH\`, add upstream $UPSTREAM and merge \`upstream/$BRANCH\`.
+          2. Keep BOTH sides' intent. Read tests/test_fork_invariants.py first: it lists every feature this fork owns and is the spec for what must still work. Never edit or weaken it to make a failure go away. Where upstream restructured code we changed, reapply our change in the new structure.
+          3. Make these pass: black --check, isort --check-only, flake8 (--max-line-length=256 --extend-ignore=E203,W503) over modules/ tests/ *.py; python -m pytest tests/ -q; python scripts/pyright_baseline.py --check. Leave no conflict markers anywhere.
+          4. Push the result to the branch \`$branch\` (never push $BRANCH itself), then run: gh workflow run upstream-sync.yml -R $GITHUB_REPOSITORY -f resolved_branch=$branch
+          That run re-gates your branch and lands it. If a conflict needs a decision only Rob can make, stop and report which file and what the competing intents are instead of guessing.
+          MSG
+          )
+          jq -n --arg c "$content" '{content: $c}' |
+            curl -fsS -X POST -H 'Content-Type: application/json' \
+              -H "x-necronomicode-internal-token: $TOKEN" \
+              --data-binary @- "$NECRO_URL/api/theseans/$THESEAN/messages"
+          echo
+          echo "Handed to necro's $THESEAN."
 
       # Issues are disabled on this fork, so the alert goes to Discord. It must reach a
       # human: this job's whole failure mode is going quiet while the fork drifts.
       - name: Report a sync that needs a human
-        # failure() catches every step with no case of its own: checkout, fetch, the
-        # push of a clean merge, and the agent PR's push or creation.
-        if: |
-          always() && (failure() ||
-          (steps.merge.outputs.conflict == 'false' && steps.tests.outcome != 'success') ||
-          (steps.merge.outputs.conflict == 'true' && (steps.agent_commit.outputs.resolved != 'true' || steps.tests.outcome != 'success')))
+        # failure() covers every step without its own case, the handoff included. A
+        # resolved branch that still fails a gate is not handed back to the agent
+        # that produced it.
+        if: always() && (failure() || (env.RESOLVED != '' && steps.gates.outputs.failed != ''))
         env:
-          NEEDS_HUMAN: ${{ (steps.merge.outputs.conflict == 'false' && steps.tests.outcome != 'success') || (steps.merge.outputs.conflict == 'true' && (steps.agent_commit.outputs.resolved != 'true' || steps.tests.outcome != 'success')) }}
           WEBHOOK: ${{ secrets.SYNC_ALERT_WEBHOOK }}
-          CONFLICT: ${{ steps.merge.outputs.conflict }}
-          AGENT_OUTCOME: ${{ steps.agent.outcome }}
-          AGENT_RESOLVED: ${{ steps.agent_commit.outputs.resolved }}
-          ENV_OUTCOME: ${{ steps.env.outcome }}
+          FAILED: ${{ steps.gates.outputs.failed }}
           BEHIND: ${{ steps.fetch.outputs.behind }}
+          HANDOFF: ${{ steps.handoff.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ "$NEEDS_HUMAN" != "true" ]; then
-            cause="A workflow step failed outside the merge-and-test path (checkout, fetch, pushing the merge, or opening the agent's PR). See the run log for which."
-          elif [ "$CONFLICT" = "true" ] && [ "$HAVE_AGENT_TOKEN" != "true" ]; then
-            cause="Merging upstream/$BRANCH conflicts with our diff and no CLAUDE_CODE_OAUTH_TOKEN secret is set, so nothing tried to resolve it. The branch is untouched."
-          elif [ "$CONFLICT" = "true" ] && [ "$AGENT_RESOLVED" != "true" ]; then
-            cause="Merging upstream/$BRANCH conflicts with our diff and Claude Code could not resolve it (agent step: ${AGENT_OUTCOME:-skipped}). The branch is untouched."
-          elif [ "$ENV_OUTCOME" != "success" ]; then
-            cause="The merge result's locked environment failed to install, so nothing was tested. Nothing was pushed."
-          elif [ "$CONFLICT" != "true" ]; then
-            cause="upstream/$BRANCH merges cleanly but the test suite fails on the result. Nothing was pushed."
+          if [ -n "$RESOLVED" ] && [ -n "$FAILED" ]; then
+            cause="necro's resolution on \`$RESOLVED\` still fails: $FAILED. Nothing was pushed."
+          elif [ "$HANDOFF" = "failure" ]; then
+            cause="The merge needs fixing and handing it to necro's $THESEAN failed. Nothing was pushed."
           else
-            cause="Claude Code resolved the conflicts but the tests still fail. Nothing was pushed. Check tests/test_fork_invariants.py first: a failure there means the resolution dropped one of our features."
+            cause="A workflow step failed (token, checkout, fetch, environment, push or workflow disabling). See the run log."
           fi
-          msg="**Kometa fork upstream sync needs a human.** $cause Behind upstream by **$BEHIND** commit(s). <$RUN_URL>"
+          msg="**Kometa fork upstream sync needs a human.** $cause Behind upstream by **${BEHIND:-?}** commit(s). <$RUN_URL>"
           echo "$msg"
           if [ -z "$WEBHOOK" ]; then
             echo "::error::SYNC_ALERT_WEBHOOK is not set, so this alert reached nobody"
             exit 1
           fi
-          jq -n --arg c "$msg" '{content: $c, allowed_mentions: {parse: []}}' \
-            | curl -fsS -H 'Content-Type: application/json' --data-binary @- "$WEBHOOK"
+          jq -n --arg c "$msg" '{content: $c, allowed_mentions: {parse: []}}' |
+            curl -fsS -H 'Content-Type: application/json' --data-binary @- "$WEBHOOK"
 
-      # A sync that needs a human ends red, so the run list never shows a stuck fork as green.
+      # A merge that did not land ends red, so the run list never shows a stuck fork as green.
       - name: Fail the run
-        if: |
-          always() && (
-          (steps.merge.outputs.conflict == 'false' && steps.tests.outcome != 'success') ||
-          (steps.merge.outputs.conflict == 'true' && (steps.agent_commit.outputs.resolved != 'true' || steps.tests.outcome != 'success')))
+        if: always() && (steps.merge.outputs.conflict == 'true' || steps.gates.outputs.failed != '')
         run: exit 1
