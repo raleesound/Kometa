@@ -151,14 +151,19 @@ jobs:
         id: agent_commit
         if: steps.agent.outcome == 'success'
         run: |
-          if git diff --name-only --diff-filter=U | grep -q .; then
-            echo "Conflicts remain unresolved:"
-            git diff --name-only --diff-filter=U
+          # The agent is told not to commit, so its edits are still unstaged and every
+          # file it fixed still reads as unmerged. Stage first, then judge the content:
+          # a leftover marker is what an unresolved conflict actually looks like.
+          git add -A
+          # (A bare "=======" is also a Markdown heading underline, so only the
+          # opening and closing markers count.)
+          if git diff --cached -U0 | grep -qE '^\+(<<<<<<<|>>>>>>>)( |$)'; then
+            echo "Conflict markers remain:"
+            git diff --cached -U0 | grep -nE '^\+(<<<<<<<|>>>>>>>)( |$)' | head -20
             git merge --abort || true
             echo "resolved=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git add -A
           git commit --no-edit || git commit -m "Merge upstream/${BRANCH} (conflicts resolved by Claude Code)"
           echo "resolved=true" >> "$GITHUB_OUTPUT"
 
@@ -220,11 +225,14 @@ jobs:
       # Issues are disabled on this fork, so the alert goes to Discord. It must reach a
       # human: this job's whole failure mode is going quiet while the fork drifts.
       - name: Report a sync that needs a human
+        # failure() catches every step with no case of its own: checkout, fetch, the
+        # push of a clean merge, and the agent PR's push or creation.
         if: |
-          always() && (
+          always() && (failure() ||
           (steps.merge.outputs.conflict == 'false' && steps.tests.outcome != 'success') ||
           (steps.merge.outputs.conflict == 'true' && (steps.agent_commit.outputs.resolved != 'true' || steps.tests.outcome != 'success')))
         env:
+          NEEDS_HUMAN: ${{ (steps.merge.outputs.conflict == 'false' && steps.tests.outcome != 'success') || (steps.merge.outputs.conflict == 'true' && (steps.agent_commit.outputs.resolved != 'true' || steps.tests.outcome != 'success')) }}
           WEBHOOK: ${{ secrets.SYNC_ALERT_WEBHOOK }}
           CONFLICT: ${{ steps.merge.outputs.conflict }}
           AGENT_OUTCOME: ${{ steps.agent.outcome }}
@@ -233,16 +241,16 @@ jobs:
           BEHIND: ${{ steps.fetch.outputs.behind }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ "$CONFLICT" != "true" ]; then
-            if [ "$ENV_OUTCOME" != "success" ]; then
-              cause="upstream/$BRANCH merges cleanly but its locked environment failed to install. Nothing was pushed."
-            else
-              cause="upstream/$BRANCH merges cleanly but the test suite fails on the result. Nothing was pushed."
-            fi
-          elif [ "$HAVE_AGENT_TOKEN" != "true" ]; then
+          if [ "$NEEDS_HUMAN" != "true" ]; then
+            cause="A workflow step failed outside the merge-and-test path (checkout, fetch, pushing the merge, or opening the agent's PR). See the run log for which."
+          elif [ "$CONFLICT" = "true" ] && [ "$HAVE_AGENT_TOKEN" != "true" ]; then
             cause="Merging upstream/$BRANCH conflicts with our diff and no CLAUDE_CODE_OAUTH_TOKEN secret is set, so nothing tried to resolve it. The branch is untouched."
-          elif [ "$AGENT_RESOLVED" != "true" ]; then
+          elif [ "$CONFLICT" = "true" ] && [ "$AGENT_RESOLVED" != "true" ]; then
             cause="Merging upstream/$BRANCH conflicts with our diff and Claude Code could not resolve it (agent step: ${AGENT_OUTCOME:-skipped}). The branch is untouched."
+          elif [ "$ENV_OUTCOME" != "success" ]; then
+            cause="The merge result's locked environment failed to install, so nothing was tested. Nothing was pushed."
+          elif [ "$CONFLICT" != "true" ]; then
+            cause="upstream/$BRANCH merges cleanly but the test suite fails on the result. Nothing was pushed."
           else
             cause="Claude Code resolved the conflicts but the tests still fail. Nothing was pushed. Check tests/test_fork_invariants.py first: a failure there means the resolution dropped one of our features."
           fi
