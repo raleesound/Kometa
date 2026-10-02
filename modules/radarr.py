@@ -274,3 +274,16 @@ class Radarr:
             if append:
                 ids.append((movie.tmdbId, "tmdb"))
         return ids
+
+    def budget_state(self, ledger_tag, candidates, ignore_cache):
+        """Ledger snapshot for an add_missing budget: ({tmdb_id: title} tagged with ledger_tag, tmdb ids add_tmdb would skip anyway)."""
+        tagged = {}
+        in_radarr = set()
+        for movie in self.api.all_movies():
+            in_radarr.add(movie.tmdbId)
+            if any(_t.label.lower() == ledger_tag for _t in movie.tags):
+                tagged[movie.tmdbId] = movie.title
+        unaddable = {c for c in candidates if c in in_radarr}
+        if self.cache and not ignore_cache:
+            unaddable.update(c for c in candidates if self.cache.query_radarr_adds(c, self.library.original_mapping_name))
+        return tagged, unaddable
