@@ -1343,23 +1343,7 @@ def run_collection(config, library, metadata, requested_collections):
                     logger.debug("")
                     logger.debug(f"Builder: {method}: {value}")
                     logger.info("")
-                    try:
-                        builder.filter_and_save_items(builder.gather_ids(method, value))
-                    except BuilderValidationError:
-                        raise
-                    except OverlayError:
-                        raise
-                    except MappingConvertError:
-                        raise
-                    except ServiceError:
-                        raise
-                    except Failed as e:
-                        if builder.ignore_blank_results:
-                            logger.warning(e)
-                        elif builder.obj:
-                            logger.warning(e)
-                        else:
-                            raise Failed(e)
+                    builder.gather_and_save_items(method, value)
 
                 builder.display_filters()
 
@@ -1577,6 +1561,7 @@ def run_playlists(config):
                             if builder.validate_builders:
                                 raise
                             else:
+                                builder.add_budget_blocker(f"Builder {method} failed: {e}")
                                 logger.error(e)
                 elif "tautulli" in method:
                     ids = []
@@ -1587,9 +1572,12 @@ def run_playlists(config):
                             if builder.validate_builders:
                                 raise
                             else:
+                                builder.add_budget_blocker(f"Builder {method} failed: {e}")
                                 logger.error(e)
                 else:
                     ids = builder.gather_ids(method, value)
+                if not ids:
+                    builder.add_budget_blocker(f"Builder {method} returned no items")
 
                 builder.display_filters()
                 builder.filter_and_save_items(ids)
