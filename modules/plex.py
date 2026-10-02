@@ -995,6 +995,9 @@ class Plex(Library):
             except (BadRequest, NotFound) as e:
                 logger.error(f"Plex Error: No item found in {self.name} for rating key {rating_key}: {e}")
                 continue
+            if item is None:
+                logger.error(f"Plex Error: No item found in {self.name} for rating key {rating_key}")
+                continue
             if str(getattr(item, "librarySectionID", "")) != str(self.Plex.key):
                 logger.warning(f"Plex Warning: Rating key {rating_key} ({item.title}) is not in the {self.name} library, skipping")
                 continue

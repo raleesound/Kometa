@@ -438,7 +438,7 @@ def process(attrs):
     try:
         return _process(attrs)
     finally:
-        if lock_file is not None:
+        if lock_file is not None and fcntl is not None:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
             lock_file.close()
 
