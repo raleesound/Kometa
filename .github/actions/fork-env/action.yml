@@ -1,0 +1,43 @@
+name: Set up the fork's locked environment
+description: |
+  Fork-owned counterpart to upstream's setup-env, for the in-cluster ARC runners
+  (kometa-ci, kometa-sync). actions/setup-python does not work there: its
+  prebuilt interpreters expect /opt/hostedtoolcache and fail elsewhere with
+  "libpython3.x.so.1.0: cannot open shared object file". So this installs a
+  pinned, checksum-verified uv binary, lets uv provide a relocatable Python, syncs
+  uv.lock with the dev group and puts the virtualenv first on PATH.
+
+inputs:
+  python-version:
+    description: Interpreter uv installs and syncs against.
+    default: "3.12"
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      shell: bash
+      env:
+        # Same version docker/uv-bootstrap.txt pins. The sha256 is for
+        # uv-x86_64-unknown-linux-gnu.tar.gz, from the release's .sha256 file.
+        # Bump both together.
+        UV_VERSION: "0.12.16"
+        UV_SHA256: 8e5c6e5523dffc2dcf615bd995554c84c9feb4e577808a3fb8698a639d3f8d9c
+      run: |
+        set -euo pipefail
+        tarball="${RUNNER_TEMP}/uv.tar.gz"
+        curl -fsSL -o "${tarball}" \
+          "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz"
+        echo "${UV_SHA256}  ${tarball}" | sha256sum -c -
+        mkdir -p "${RUNNER_TEMP}/uv-bin"
+        tar xzf "${tarball}" -C "${RUNNER_TEMP}/uv-bin" --strip-components=1
+        echo "${RUNNER_TEMP}/uv-bin" >> "${GITHUB_PATH}"
+        "${RUNNER_TEMP}/uv-bin/uv" --version
+
+    - name: Sync the locked dev environment
+      shell: bash
+      run: uv sync --locked --group dev --python "${{ inputs.python-version }}"
+
+    - name: Put the virtualenv first on PATH
+      shell: bash
+      run: echo "${{ github.workspace }}/.venv/bin" >> "${GITHUB_PATH}"
