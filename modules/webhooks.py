@@ -72,6 +72,10 @@ def get_message(json):
                 message += f"{new_line if message else ''}{len(json['radarr_adds'])} Radarr Additions:"
             if json["sonarr_adds"]:
                 message += f"{new_line if message else ''}{len(json['sonarr_adds'])} Sonarr Additions:"
+            if json.get("radarr_held_back"):
+                message += f"{new_line if message else ''}{len(json['radarr_held_back'])} Held Back From Radarr (add_missing budget)"
+            if json.get("sonarr_held_back"):
+                message += f"{new_line if message else ''}{len(json['sonarr_held_back'])} Held Back From Sonarr (add_missing budget)"
             message += f"{new_line if message else ''}{len(json['additions'])} Additions:"
             for add_dict in json["additions"]:
                 message += f"\n{add_dict['title']}"
@@ -246,7 +250,7 @@ class Webhooks:
                 json["library_name"] = str(library)
             self._request(self.delete_webhooks, json)
 
-    def collection_hooks(self, webhooks, collection, poster_url=None, background_url=None, created=False, additions=None, removals=None, radarr=None, sonarr=None, playlist=False):
+    def collection_hooks(self, webhooks, collection, poster_url=None, background_url=None, created=False, additions=None, removals=None, radarr=None, sonarr=None, playlist=False, radarr_held_back=None, sonarr_held_back=None):
         if self.library:
             thumb = None
             if not poster_url and collection.thumb and next((f for f in collection.fields if f.name == "thumb"), None):
@@ -270,6 +274,8 @@ class Webhooks:
                     "removals": removals if removals else [],
                     "radarr_adds": radarr if radarr else [],
                     "sonarr_adds": sonarr if sonarr else [],
+                    "radarr_held_back": radarr_held_back if radarr_held_back else [],
+                    "sonarr_held_back": sonarr_held_back if sonarr_held_back else [],
                 },
             )
 
