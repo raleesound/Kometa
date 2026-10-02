@@ -159,6 +159,7 @@ def _builder(monkeypatch, arr, plex_tmdb_by_key=None, found_keys=(), filtered_ke
     b.missing_shows = [] if is_movie else list(missing)
     b.held_back_radarr = []
     b.held_back_sonarr = []
+    b.budget_blockers = []
     b.do_report = True
     return b, library
 
@@ -285,3 +286,161 @@ class TestAttributeParsing:
 
         with pytest.raises(BuilderValidationError):
             self._builder()._radarr("radarr_add_missing_ledger_tag", "bad tag!")
+
+
+class TestFailClosed:
+    """If the list may be incomplete, a budgeted collection adds nothing: a fetch failure must never free up budget."""
+
+    def test_blocker_skips_budgeted_add_even_when_orphans_would_free_budget(self, monkeypatch):
+        r = _radarr(monkeypatch, [_movie(1, "Looks Orphaned", LEDGER), _movie(2, "Also Orphaned", LEDGER)])
+        r.budget_state = MagicMock()
+        b, lib = _builder(monkeypatch, r, missing=[10, 11])
+        b.budget_blockers = []
+        b.add_budget_blocker("Builder letterboxd_list failed: boom")
+        ids, _ = b._apply_add_budget(r, _details(add_missing_budget=2, add_missing_ledger_tag=LEDGER), [("A", 10), ("B", 11)], True)
+        assert ids == []
+        r.budget_state.assert_not_called()
+        assert [h["id"] for h in b.held_back_radarr] == [10, 11]
+        lib.add_budget_held_back.assert_called_once_with("Picks", [("A", 10), ("B", 11)], True)
+        assert any("may be incomplete" in m for m in modules.builder.logger.warning_messages)
+        assert any("boom" in m for m in modules.builder.logger.warning_messages)
+
+    def test_blocker_does_not_affect_unbudgeted_adds(self, monkeypatch):
+        r = _radarr(monkeypatch, [])
+        b, _ = _builder(monkeypatch, r, missing=[10])
+        b.budget_blockers = ["whatever"]
+        details = _details()
+        ids, options = b._apply_add_budget(r, details, [("A", 10)], True)
+        assert ids == [10]
+        assert options is details
+
+    def test_sonarr_blocker_skips_and_reports_sonarr(self, monkeypatch):
+        s = _sonarr(monkeypatch, [])
+        b, lib = _builder(monkeypatch, s, missing=[10], is_movie=False)
+        b.budget_blockers = ["x"]
+        ids, _ = b._apply_add_budget(s, _details(add_missing_budget=5, add_missing_ledger_tag=LEDGER), [("A", 10)], False)
+        assert ids == []
+        assert b.held_back_sonarr == [{"title": "A", "id": 10}]
+        lib.add_budget_held_back.assert_called_once_with("Picks", [("A", 10)], False)
+
+    def test_blocker_recorded_once(self, monkeypatch):
+        b, _ = _builder(monkeypatch, _radarr(monkeypatch, []))
+        b.budget_blockers = []
+        b.add_budget_blocker("same")
+        b.add_budget_blocker("same")
+        assert b.budget_blockers == ["same"]
+
+    def _two_list_builder(self, monkeypatch, outcomes, ignore_blank_results=True, obj=None):
+        r = _radarr(monkeypatch, [_movie(1, "Tagged From List 2", LEDGER)])
+        b, lib = _builder(monkeypatch, r, missing=[10])
+        b.budget_blockers = []
+        b.ignore_blank_results = ignore_blank_results
+        b.obj = obj
+        b.gather_ids = lambda method, value: outcomes[value]() if callable(outcomes[value]) else outcomes[value]
+        b.filter_and_save_items = MagicMock()
+        return b, r, lib
+
+    def test_one_of_several_lists_fails_adds_nothing(self, monkeypatch):
+        from modules.util import Failed
+
+        def boom():
+            raise Failed("Letterboxd Error: list unavailable")
+
+        b, r, lib = self._two_list_builder(monkeypatch, {"one": [(1, "tmdb")], "two": boom})
+        b.gather_and_save_items("letterboxd_list", "one")
+        b.gather_and_save_items("letterboxd_list", "two")  # swallowed by ignore_blank_results, exactly the hole being closed
+        assert len(b.budget_blockers) == 1
+        ids, _ = b._apply_add_budget(r, _details(add_missing_budget=1, add_missing_ledger_tag=LEDGER), [("A", 10)], True)
+        assert ids == []
+        assert b.held_back_radarr == [{"title": "A", "id": 10}]
+
+    def test_failure_swallowed_because_collection_exists_also_blocks(self, monkeypatch):
+        from modules.util import Failed
+
+        def boom():
+            raise Failed("nope")
+
+        b, _, _ = self._two_list_builder(monkeypatch, {"two": boom}, ignore_blank_results=False, obj=object())
+        b.gather_and_save_items("letterboxd_list", "two")
+        assert b.budget_blockers
+
+    def test_failure_that_raises_still_records_blocker_and_propagates(self, monkeypatch):
+        from modules.util import Failed
+
+        def boom():
+            raise Failed("nope")
+
+        b, _, _ = self._two_list_builder(monkeypatch, {"two": boom}, ignore_blank_results=False)
+        with pytest.raises(Failed):
+            b.gather_and_save_items("letterboxd_list", "two")
+
+    def test_list_returning_nothing_blocks(self, monkeypatch):
+        b, _, _ = self._two_list_builder(monkeypatch, {"one": [(1, "tmdb")], "two": []})
+        b.gather_and_save_items("letterboxd_list", "one")
+        assert b.budget_blockers == []
+        b.gather_and_save_items("letterboxd_list", "two")
+        assert b.budget_blockers == ["Builder letterboxd_list returned no items"]
+
+    def test_healthy_lists_leave_budget_usable(self, monkeypatch):
+        b, r, _ = self._two_list_builder(monkeypatch, {"one": [(1, "tmdb")], "two": [(2, "tmdb")]})
+        b.gather_and_save_items("letterboxd_list", "one")
+        b.gather_and_save_items("letterboxd_list", "two")
+        assert b.budget_blockers == []
+
+    def test_unresolvable_id_blocks(self, monkeypatch):
+        r = _radarr(monkeypatch, [])
+        b, _ = _builder(monkeypatch, r)
+        b.budget_blockers = []
+        b.libraries = []
+        b._find_plex_keys = lambda input_id: []
+        b._log_episode_count = MagicMock()
+        b.playlist = False
+        b.filter_and_save_items([(123, "plex")])
+        assert b.budget_blockers == ["ID (123, 'plex') could not be resolved"]
+
+
+class TestValidateAddBudgets:
+    def _builder(self, monkeypatch, radarr_details, sonarr_details=None):
+        from modules.builder import CollectionBuilder
+
+        monkeypatch.setattr("modules.builder.logger", FakeLogger())
+        b = CollectionBuilder.__new__(CollectionBuilder)
+        b.Type = "Collection"
+        b.name = "Member Picks"
+        b.radarr_details = radarr_details
+        b.sonarr_details = sonarr_details or {"add_missing": False}
+        return b
+
+    def test_default_ledger_tag_derived_from_name(self, monkeypatch):
+        b = self._builder(monkeypatch, {"add_missing": True, "add_missing_budget": 5})
+        b._validate_add_budgets()
+        assert b.radarr_details["add_missing_ledger_tag"] == "kl-member-picks"
+        assert modules.builder.logger.warning_messages == []
+
+    def test_explicit_ledger_tag_kept(self, monkeypatch):
+        b = self._builder(monkeypatch, {"add_missing": True, "add_missing_budget": 5, "add_missing_ledger_tag": "kl-mine"})
+        b._validate_add_budgets()
+        assert b.radarr_details["add_missing_ledger_tag"] == "kl-mine"
+
+    def test_warns_when_budget_set_but_add_missing_off(self, monkeypatch):
+        b = self._builder(monkeypatch, {"add_missing": False, "add_missing_budget": 5})
+        b._validate_add_budgets()
+        assert any("radarr_add_missing_budget has no effect" in m for m in modules.builder.logger.warning_messages)
+
+    def test_warns_for_sonarr(self, monkeypatch):
+        b = self._builder(monkeypatch, {"add_missing": True}, {"add_missing": False, "add_missing_budget": 1})
+        b._validate_add_budgets()
+        assert any("sonarr_add_missing_budget has no effect" in m for m in modules.builder.logger.warning_messages)
+
+    def test_no_budget_no_warning_no_ledger(self, monkeypatch):
+        b = self._builder(monkeypatch, {"add_missing": False})
+        b._validate_add_budgets()
+        assert modules.builder.logger.warning_messages == []
+        assert "add_missing_ledger_tag" not in b.radarr_details
+
+    def test_ledger_tag_without_budget_rejected(self, monkeypatch):
+        from modules.util import BuilderValidationError
+
+        b = self._builder(monkeypatch, {"add_missing": True, "add_missing_ledger_tag": "kl-x"})
+        with pytest.raises(BuilderValidationError):
+            b._validate_add_budgets()

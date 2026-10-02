@@ -112,7 +112,8 @@ If your Radarr/Sonarr has different file system mappings from your Plex use `rad
 
 * The ledger is a tag in Radarr/Sonarr. Everything a budgeted collection adds is tagged with the ledger tag (in addition to any `radarr_tag`/`sonarr_tag`). It defaults to `kl-` plus the collection name in lowercase with runs of other characters turned into `-`, so renaming a collection starts a new ledger unless you pin `radarr_add_missing_ledger_tag`/`sonarr_add_missing_ledger_tag`.
 * Each run counts the items carrying the ledger tag that are still on the list, and adds at most `budget - count` of the missing items, in list order. Items already in Radarr/Sonarr, or already in Kometa's add cache, do not use budget.
-* Items that carry the ledger tag but are no longer on the list are **orphans**: they do not count against the budget. Kometa never deletes or untags anything in Radarr/Sonarr; orphans are only logged and written to the missing report.
+* Items that carry the ledger tag but are no longer on the list are **orphans**: they do not count against the budget. Kometa never deletes anything or removes tags in Radarr/Sonarr; orphans are only logged and written to the missing report.
+* **Fail closed:** if any builder for the collection fails or returns nothing, or any list entry cannot be resolved, Kometa cannot trust that it sees the whole list, so it adds nothing for that collection that run (a missing entry would otherwise look like an orphan and free budget). The reason is logged, and everything that would have been added is reported as held back.
 * Items held back by the budget are logged, written to the missing report under `Held Back by Add Missing Budget`, and included in the collection changes webhook as `radarr_held_back`/`sonarr_held_back`.
 * To bring items that were added before the budget existed under it, give them the ledger tag in Radarr/Sonarr.
 

@@ -16,7 +16,7 @@ from modules import add_budget, anidb, anilist, flicklist, floppy, icheckmovies,
 from modules.overlay import Overlay, rating_sources
 from modules.poster import KometaImage
 from modules.request import quote
-from modules.util import BuilderValidationError, Deleted, Failed, FilterFailed, MappingConvertError, NonExisting, NotScheduled, NotScheduledRange, ServiceError
+from modules.util import BuilderValidationError, Deleted, Failed, FilterFailed, MappingConvertError, NonExisting, NotScheduled, NotScheduledRange, OverlayError, ServiceError
 
 logger = util.logger
 
@@ -1233,6 +1233,7 @@ class CollectionBuilder:
         self.added_to_sonarr = []
         self.held_back_radarr = []
         self.held_back_sonarr = []
+        self.budget_blockers = []
         self.builders = []
         self.filters = []
         self.value_filters = []
@@ -1844,17 +1845,13 @@ class CollectionBuilder:
         if "monitor_existing" not in self.sonarr_details:
             self.sonarr_details["monitor_existing"] = self.library.Sonarr.monitor_existing if self.library.Sonarr else False
 
-        for arr_name, arr_details in (("radarr", self.radarr_details), ("sonarr", self.sonarr_details)):
-            if "add_missing_ledger_tag" in arr_details and "add_missing_budget" not in arr_details:
-                raise BuilderValidationError(f"{self.Type} Error: {arr_name}_add_missing_ledger_tag requires {arr_name}_add_missing_budget")
-            if "add_missing_budget" in arr_details and "add_missing_ledger_tag" not in arr_details:
-                arr_details["add_missing_ledger_tag"] = add_budget.default_ledger_tag(self.name)
-
         if self.smart_url or self.collectionless or self.library.is_music:
             self.radarr_details["add_missing"] = False
             self.radarr_details["add_existing"] = False
             self.sonarr_details["add_missing"] = False
             self.sonarr_details["add_existing"] = False
+
+        self._validate_add_budgets()
 
         if (self.radarr_details["add_existing"] or self.sonarr_details["add_existing"]) and not self.parts_collection:
             self.item_details["add_existing"] = True
@@ -4062,6 +4059,7 @@ class CollectionBuilder:
                                                     raise Failed(f" and OMDb metadata lookup Failed for IMDb ID: {input_id}")
                                             except Failed as ee:
                                                 logger.error(f"{e}{ee}")
+                                                self.add_budget_blocker(f"ID {input_data} could not be resolved")
                                                 continue
                                         for pl_library in self.libraries:
                                             if tvdb_id in pl_library.show_map:
@@ -4094,6 +4092,7 @@ class CollectionBuilder:
                                                 self.missing_shows.append(tvdb_id)
                                 except Failed as e:
                                     logger.warning(e)
+                                    self.add_budget_blocker(f"ID {input_data} could not be resolved")
                                     continue
                     elif id_type == "plex":
                         found_keys = self._find_plex_keys(input_id)
@@ -4101,6 +4100,7 @@ class CollectionBuilder:
                             rating_keys = found_keys
                         else:
                             logger.warning(f"{self.Type} Warning: Plex ID: {input_id} not found in the defined libraries")
+                            self.add_budget_blocker(f"ID {input_data} could not be resolved")
                             continue
                     elif id_type == "tmdb" and not self.parts_collection:
                         if not isinstance(input_id, list):
@@ -4131,9 +4131,11 @@ class CollectionBuilder:
                             rating_keys = show_keys
                         elif movie_keys and show_keys:
                             logger.warning(f"{self.Type} Warning: Numeric ID: {input_id} is ambiguous across movie and show libraries")
+                            self.add_budget_blocker(f"ID {input_data} could not be resolved")
                             continue
                         else:
                             logger.warning(f"{self.Type} Warning: Numeric ID: {input_id} not found in the defined libraries")
+                            self.add_budget_blocker(f"ID {input_data} could not be resolved")
                             continue
                     elif id_type == "tvdb_season" and (self.builder_level in ["season", "episode"] or self.playlist):
                         tvdb_id, season_num = input_id.split("_")
@@ -4193,6 +4195,7 @@ class CollectionBuilder:
                                 tvdb_id = self.config.Convert.tmdb_to_tvdb(input_id, fail=True)
                             except Failed as e:
                                 logger.warning(e)
+                                self.add_budget_blocker(f"ID {input_data} could not be resolved")
                                 continue
                         elif id_type == "tvdb_season":
                             tvdb_id, tvdb_season = input_id.split("_")
@@ -4224,6 +4227,7 @@ class CollectionBuilder:
                                             elif self.builder_level == "season" and isinstance(item, Show):
                                                 rating_keys.extend([k.ratingKey for k in self.library.cached_item_subitems(item, "seasons")])
                                         except Failed as e:
+                                            self.add_budget_blocker(f"ID {input_data} could not be resolved")
                                             logger.error(e)
                                 else:
                                     rating_keys = found_keys
@@ -4255,9 +4259,11 @@ class CollectionBuilder:
                             else:
                                 items.append(item)
                         except Failed as e:
+                            self.add_budget_blocker(f"ID {input_data} could not be resolved")
                             logger.error(e)
                 except Exception as e:
                     logger.stacktrace()
+                    self.add_budget_blocker(f"ID {input_data} could not be resolved")
                     logger.error(e)
                     logger.info(input_data)
             logger.exorcise()
@@ -5201,6 +5207,38 @@ class CollectionBuilder:
                 self.library.add_missing(self.name, self.missing_parts, False)
         return added_to_radarr, added_to_sonarr
 
+    def _validate_add_budgets(self):
+        for arr_name, arr_details in (("radarr", self.radarr_details), ("sonarr", self.sonarr_details)):
+            if "add_missing_ledger_tag" in arr_details and "add_missing_budget" not in arr_details:
+                raise BuilderValidationError(f"{self.Type} Error: {arr_name}_add_missing_ledger_tag requires {arr_name}_add_missing_budget")
+            if "add_missing_budget" in arr_details:
+                if "add_missing_ledger_tag" not in arr_details:
+                    arr_details["add_missing_ledger_tag"] = add_budget.default_ledger_tag(self.name)
+                if not arr_details["add_missing"]:
+                    logger.warning(f"{self.Type} Warning: {arr_name}_add_missing_budget has no effect because {arr_name}_add_missing is not enabled for {self.name}")
+
+    def gather_and_save_items(self, method, value, pending=None):
+        # pending: a future from the threading prefetch; its result() raises inside this try,
+        # so a builder that failed in the background still blocks the add_missing budget.
+        try:
+            ids = pending.result() if pending is not None else self.gather_ids(method, value)
+            if not ids:
+                self.add_budget_blocker(f"Builder {method} returned no items")
+            self.filter_and_save_items(ids)
+        except (BuilderValidationError, OverlayError, MappingConvertError, ServiceError):
+            raise
+        except Failed as e:
+            self.add_budget_blocker(f"Builder {method} failed: {e}")
+            if self.ignore_blank_results or self.obj:
+                logger.warning(e)
+            else:
+                raise Failed(e)
+
+    def add_budget_blocker(self, reason):
+        """Record that this run's view of the list may be incomplete, which makes any add_missing budget fail closed."""
+        if reason not in self.budget_blockers:
+            self.budget_blockers.append(reason)
+
     def _list_ids(self, is_movie):
         """TMDb (movie) / TVDb (show) IDs of everything currently on the list: missing, in Plex, and filtered out."""
         ids = set(self.missing_movies if is_movie else self.missing_shows)
@@ -5217,6 +5255,17 @@ class CollectionBuilder:
             return candidates, details
         arr_name = "Radarr" if is_movie else "Sonarr"
         ledger_tag = details["add_missing_ledger_tag"]
+        if self.budget_blockers:
+            # The list may be incomplete, so tagged items could look like orphans and free budget that was never freed. Add nothing.
+            logger.info("")
+            logger.warning(f"{arr_name} Add Missing Budget ({ledger_tag}): skipping all adds this run because the list may be incomplete")
+            for reason in self.budget_blockers:
+                logger.warning(f"{arr_name} Budget Blocker | {reason}")
+            held = [{"title": title, "id": missing_id} for title, missing_id in missing_with_names]
+            (self.held_back_radarr if is_movie else self.held_back_sonarr).extend(held)
+            if self.do_report and missing_with_names:
+                self.library.add_budget_held_back(self.name, list(missing_with_names), is_movie)
+            return [], details
         titles = {missing_id: title for title, missing_id in missing_with_names}
         tagged, unaddable = arr.budget_state(ledger_tag, candidates, details.get("ignore_cache", arr.ignore_cache))
         plan = add_budget.plan_adds(candidates, details["add_missing_budget"], ledger_tag, tagged, self._list_ids(is_movie), unaddable)
