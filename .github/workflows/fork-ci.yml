@@ -28,6 +28,7 @@ permissions:
 
 jobs:
   gates:
+    if: github.repository == 'raleesound/Kometa'
     runs-on: kometa-ci
     steps:
       - uses: actions/checkout@v4

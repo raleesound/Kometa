@@ -4,12 +4,19 @@
 # latent config break into a five-week surprise during the 2026-08-22 cutover, so
 # the merge happens nightly and small rather than rarely and large.
 #
-# Everything runs in-cluster on the `kometa-sync` ARC pool; nothing in this fork
-# runs on GitHub-hosted runners. Pushes use a short-lived ai-app-factory-agent App
-# token scoped to this repository: it has the `workflows` permission that
-# GITHUB_TOKEN lacks, and upstream changes .github/workflows about weekly.
+# Everything runs in-cluster; nothing in this fork runs on GitHub-hosted runners.
+# The work is split by trust:
+#   gate   (kometa-ci)   executes repo code: trial merge, then the test and lint
+#                        suite. It holds no secrets and no write token.
+#   land   (kometa-sync) holds the write token and never executes repo code. It
+#                        only runs git: it merges the exact commit the gate
+#                        tested and pushes. The token is a short-lived
+#                        ai-app-factory-agent App token scoped to this repository
+#                        (it has the `workflows` permission GITHUB_TOKEN lacks,
+#                        and upstream changes .github/workflows about weekly).
+#   handoff / alert / housekeeping (kometa-sync) only call APIs.
 #
-# A merge reaches `nightly` only through this job, and only after the same gates
+# A merge reaches `nightly` only through `land`, and only after the same gates
 # fork-ci.yml runs (black, isort, flake8, pytest, the pyright ratchet) pass here,
 # including tests/test_fork_invariants.py, which pins every feature this fork
 # owns. Resolving a conflict in upstream's favour deletes our work silently and
@@ -29,7 +36,7 @@ name: Upstream Sync
 
 on:
   schedule:
-    # 05:20 UTC — after upstream's own nightly build, and outside the media
+    # 05:20 UTC: after upstream's own nightly build, and outside the media
     # host's Kometa run windows.
     #
     # GitHub runs scheduled workflows ONLY from the repository's default branch,
@@ -53,12 +60,101 @@ env:
   UPSTREAM: https://github.com/Kometa-Team/Kometa.git
   BRANCH: nightly
   RESOLVED: ${{ inputs.resolved_branch }}
-  # In-cluster address of necronomicode; the ARC pod reaches it directly.
+  # In-cluster address of necronomicode; the kometa-sync pod reaches it directly.
   NECRO_URL: http://necronomicode.necronomicode.svc.cluster.local
   THESEAN: cicd-medic
 
 jobs:
-  sync:
+  # Untrusted: runs the repository's own code, so it gets no secrets and a
+  # read-only token. Ends green whether or not the merge is landable; `state`
+  # says which, and the jobs below act on it.
+  gate:
+    if: github.repository == 'raleesound/Kometa'
+    runs-on: kometa-ci
+    outputs:
+      state: ${{ steps.merge.outputs.state }}
+      base: ${{ steps.merge.outputs.base }}
+      target: ${{ steps.merge.outputs.target }}
+      behind: ${{ steps.fetch.outputs.behind }}
+      conflicted: ${{ steps.merge.outputs.conflicted }}
+      failed: ${{ steps.gates.outputs.failed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream "$BRANCH"
+          behind=$(git rev-list --count "HEAD..upstream/$BRANCH")
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "Behind upstream/$BRANCH by $behind commit(s)."
+
+      - name: Trial-merge upstream, or take the resolved branch
+        id: merge
+        env:
+          BEHIND: ${{ steps.fetch.outputs.behind }}
+        run: |
+          git config user.name "kometa-sync-gate"
+          git config user.email "kometa-sync-gate@users.noreply.github.com"
+          base=$(git rev-parse HEAD)
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          if [ -n "$RESOLVED" ]; then
+            git fetch --no-tags origin "$RESOLVED"
+            # A resolution must build on what nightly is now, or landing it would
+            # silently discard whatever reached nightly after it was made.
+            if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+              echo "::error::$RESOLVED does not contain the current $BRANCH; it must be redone on top of it"
+              exit 1
+            fi
+            git checkout -q --detach FETCH_HEAD
+            echo "target=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            echo "state=ready" >> "$GITHUB_OUTPUT"
+          elif [ "$BEHIND" = "0" ]; then
+            echo "Already up to date."
+            echo "state=uptodate" >> "$GITHUB_OUTPUT"
+          else
+            echo "target=$(git rev-parse "upstream/$BRANCH")" >> "$GITHUB_OUTPUT"
+            if git merge --no-edit "upstream/$BRANCH"; then
+              echo "state=ready" >> "$GITHUB_OUTPUT"
+            else
+              echo "conflicted=$(git diff --name-only --diff-filter=U | paste -sd, -)" >> "$GITHUB_OUTPUT"
+              git merge --abort
+              echo "state=conflict" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Install the locked environment
+        if: steps.merge.outputs.state == 'ready'
+        uses: ./.github/actions/fork-env
+
+      # The same gates fork-ci.yml runs, all of them, recording which failed.
+      - name: Gate the result
+        id: gates
+        if: steps.merge.outputs.state == 'ready'
+        run: |
+          failed=""
+          gate() { local name=$1; shift; echo "::group::$name"; "$@" || failed="$failed $name"; echo "::endgroup::"; }
+          gate black black --check modules/ tests/ *.py
+          gate isort isort --check-only modules/ tests/ *.py
+          gate flake8 flake8 modules/ tests/ *.py --max-line-length=256 --extend-ignore=E203,W503
+          gate pytest python -m pytest tests/ -q
+          gate pyright python scripts/pyright_baseline.py --check
+          echo "failed=${failed# }" >> "$GITHUB_OUTPUT"
+          if [ -n "$failed" ]; then
+            echo "::warning::Gates failed:$failed"
+          fi
+
+  # Trusted: holds the write token and never executes repo code. A fresh pod, so
+  # nothing the gate's code left behind is here. It lands the commit the gate
+  # tested, identified by SHA.
+  land:
+    if: github.repository == 'raleesound/Kometa' && needs.gate.outputs.state == 'ready' && needs.gate.outputs.failed == ''
+    needs: gate
     runs-on: kometa-sync
     steps:
       - name: Mint a token scoped to this repository
@@ -76,113 +172,56 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app.outputs.token }}
 
-      - name: Fetch upstream
-        id: fetch
-        run: |
-          git remote add upstream "$UPSTREAM"
-          git fetch --no-tags upstream "$BRANCH"
-          behind=$(git rev-list --count "HEAD..upstream/$BRANCH")
-          echo "behind=$behind" >> "$GITHUB_OUTPUT"
-          echo "Behind upstream/$BRANCH by $behind commit(s)."
-
-      - name: Merge upstream, or take the resolved branch
-        id: merge
+      - name: Merge the tested commit and push
         env:
-          BEHIND: ${{ steps.fetch.outputs.behind }}
+          BASE: ${{ needs.gate.outputs.base }}
+          TARGET: ${{ needs.gate.outputs.target }}
           BOT: ${{ steps.app.outputs.app-slug }}[bot]
         run: |
           git config user.name "$BOT"
           git config user.email "$BOT@users.noreply.github.com"
+          # Landing anything but the base the gate tested would ship an untested tree.
+          if [ "$(git rev-parse HEAD)" != "$BASE" ]; then
+            echo "::error::$BRANCH moved from $BASE to $(git rev-parse HEAD) during the run; nothing was pushed"
+            exit 1
+          fi
           if [ -n "$RESOLVED" ]; then
             git fetch --no-tags origin "$RESOLVED"
-            # A resolution must build on what nightly is now, or landing it would
-            # silently discard whatever reached nightly after it was made.
-            if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
-              echo "::error::$RESOLVED does not contain the current $BRANCH; it must be redone on top of it"
-              exit 1
-            fi
-            git checkout -q --detach FETCH_HEAD
-            echo "work=true" >> "$GITHUB_OUTPUT"
-          elif [ "$BEHIND" = "0" ]; then
-            echo "Already up to date."
-            echo "work=false" >> "$GITHUB_OUTPUT"
-          elif git merge --no-edit "upstream/$BRANCH"; then
-            echo "work=true" >> "$GITHUB_OUTPUT"
           else
-            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicted.txt"
-            git merge --abort
-            echo "work=false" >> "$GITHUB_OUTPUT"
-            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git remote add upstream "$UPSTREAM"
+            git fetch --no-tags upstream "$BRANCH"
           fi
-
-      - name: Install the locked environment
-        if: steps.merge.outputs.work == 'true'
-        uses: ./.github/actions/fork-env
-
-      # The same gates fork-ci.yml runs, all of them, recording which failed.
-      - name: Gate the result
-        id: gates
-        if: steps.merge.outputs.work == 'true'
-        run: |
-          failed=""
-          gate() { local name=$1; shift; echo "::group::$name"; "$@" || failed="$failed $name"; echo "::endgroup::"; }
-          gate black black --check modules/ tests/ *.py
-          gate isort isort --check-only modules/ tests/ *.py
-          gate flake8 flake8 modules/ tests/ *.py --max-line-length=256 --extend-ignore=E203,W503
-          gate pytest python -m pytest tests/ -q
-          gate pyright python scripts/pyright_baseline.py --check
-          echo "failed=${failed# }" >> "$GITHUB_OUTPUT"
-          if [ -n "$failed" ]; then
-            echo "::error::Gates failed:$failed"
-          fi
-
-      - name: Push to nightly
-        if: steps.merge.outputs.work == 'true' && steps.gates.outputs.failed == ''
-        run: |
+          git cat-file -e "$TARGET^{commit}"
           # [skip ci]: a workflow upstream just added would otherwise fire on this
-          # push before the next step disables it. Everything fork-ci.yml checks
-          # has already passed above.
-          git commit --amend -m "$(git log -1 --format=%B)" -m "[skip ci]"
+          # push before housekeeping disables it. Everything fork-ci.yml checks
+          # already passed in the gate.
+          git merge --no-ff -m "Merge upstream/$BRANCH into $BRANCH" -m "[skip ci]" "$TARGET"
           git push origin "HEAD:$BRANCH"
           if [ -n "$RESOLVED" ]; then
             git push origin --delete "$RESOLVED"
           fi
           echo "Landed on $BRANCH: $(git log -1 --format=%h)."
 
-      # Runs every time, so a workflow upstream adds is off before its first trigger.
-      - name: Disable workflows this fork does not run
-        if: always() && steps.app.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          own=" fork-ci.yml upstream-sync.yml "
-          gh api "repos/$GITHUB_REPOSITORY/actions/workflows" --paginate \
-            -q '.workflows[] | select(.state == "active") | [.id, .path] | @tsv' > "$RUNNER_TEMP/active.tsv"
-          while IFS=$'\t' read -r id path; do
-            case "$own" in *" $(basename "$path") "*) continue ;; esac
-            gh api --silent -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable"
-            echo "Disabled $path"
-            for run in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$id/runs?per_page=20" \
-                -q '.workflow_runs[] | select(.status != "completed") | .id'); do
-              gh api --silent -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/cancel"
-              echo "Cancelled run $run"
-            done
-          done < "$RUNNER_TEMP/active.tsv"
-
+  # Hands a conflict, or a clean merge that fails a gate, to necro's `cicd-medic`
+  # Thesean. It resolves the merge on a branch and re-dispatches this workflow
+  # with `resolved_branch`, so its result is re-gated from scratch rather than
+  # taken on its word. A resolved branch that still fails is not handed back.
+  handoff:
+    if: github.repository == 'raleesound/Kometa' && inputs.resolved_branch == '' && (needs.gate.outputs.state == 'conflict' || (needs.gate.outputs.state == 'ready' && needs.gate.outputs.failed != ''))
+    needs: gate
+    runs-on: kometa-sync
+    steps:
       - name: Hand the merge to necro
-        id: handoff
-        if: |
-          env.RESOLVED == '' && (steps.merge.outputs.conflict == 'true' ||
-          (steps.merge.outputs.work == 'true' && steps.gates.outputs.failed != ''))
         env:
           TOKEN: ${{ secrets.NECRONOMICODE_INTERNAL_TOKEN }}
-          FAILED: ${{ steps.gates.outputs.failed }}
-          CONFLICT: ${{ steps.merge.outputs.conflict }}
-          BEHIND: ${{ steps.fetch.outputs.behind }}
+          STATE: ${{ needs.gate.outputs.state }}
+          CONFLICTED: ${{ needs.gate.outputs.conflicted }}
+          FAILED: ${{ needs.gate.outputs.failed }}
+          BEHIND: ${{ needs.gate.outputs.behind }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ "$CONFLICT" = "true" ]; then
-            problem="Merging upstream/$BRANCH conflicts in: $(paste -sd, "$RUNNER_TEMP/conflicted.txt")."
+          if [ "$STATE" = "conflict" ]; then
+            problem="Merging upstream/$BRANCH conflicts in: $CONFLICTED."
           else
             problem="upstream/$BRANCH merges cleanly, but these gates fail on the result: $FAILED."
           fi
@@ -206,37 +245,84 @@ jobs:
           echo
           echo "Handed to necro's $THESEAN."
 
-      # Issues are disabled on this fork, so the alert goes to Discord. It must reach a
-      # human: this job's whole failure mode is going quiet while the fork drifts.
+  # Runs every time, so a workflow upstream adds is off before its first trigger.
+  housekeeping:
+    if: github.repository == 'raleesound/Kometa'
+    runs-on: kometa-sync
+    steps:
+      - name: Mint a token scoped to this repository
+        id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Disable workflows this fork does not run
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          own=" fork-ci.yml upstream-sync.yml "
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows" --paginate \
+            -q '.workflows[] | select(.state == "active") | [.id, .path] | @tsv' > "$RUNNER_TEMP/active.tsv"
+          while IFS=$'\t' read -r id path; do
+            case "$own" in *" $(basename "$path") "*) continue ;; esac
+            gh api --silent -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable"
+            echo "Disabled $path"
+            for run in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$id/runs?per_page=20" \
+                -q '.workflow_runs[] | select(.status != "completed") | .id'); do
+              gh api --silent -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/cancel"
+              echo "Cancelled run $run"
+            done
+          done < "$RUNNER_TEMP/active.tsv"
+
+  # Issues are disabled on this fork, so the alert goes to Discord. It must reach a
+  # human: this workflow's whole failure mode is going quiet while the fork drifts.
+  # Also what ends a stuck run red, so the run list never shows an unlanded merge
+  # as green.
+  alert:
+    if: always() && github.repository == 'raleesound/Kometa'
+    needs: [gate, land, handoff, housekeeping]
+    runs-on: kometa-sync
+    steps:
       - name: Report a sync that needs a human
-        # failure() covers every step without its own case, the handoff included. A
-        # resolved branch that still fails a gate is not handed back to the agent
-        # that produced it.
-        if: always() && (failure() || (env.RESOLVED != '' && steps.gates.outputs.failed != ''))
         env:
           WEBHOOK: ${{ secrets.SYNC_ALERT_WEBHOOK }}
-          FAILED: ${{ steps.gates.outputs.failed }}
-          BEHIND: ${{ steps.fetch.outputs.behind }}
-          HANDOFF: ${{ steps.handoff.outcome }}
+          STATE: ${{ needs.gate.outputs.state }}
+          FAILED: ${{ needs.gate.outputs.failed }}
+          BEHIND: ${{ needs.gate.outputs.behind }}
+          RESULTS: ${{ needs.gate.result }} ${{ needs.land.result }} ${{ needs.handoff.result }} ${{ needs.housekeeping.result }}
+          HANDOFF: ${{ needs.handoff.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          case " $RESULTS " in *" failure "*|*" cancelled "*) broken=1 ;; *) broken=0 ;; esac
+          stuck=0
+          if [ "$STATE" = "conflict" ] || [ -n "$FAILED" ]; then stuck=1; fi
+          if [ "$broken" = 0 ] && [ "$stuck" = 0 ]; then
+            echo "Sync healthy (state: ${STATE:-none})."
+            exit 0
+          fi
           if [ -n "$RESOLVED" ] && [ -n "$FAILED" ]; then
             cause="necro's resolution on \`$RESOLVED\` still fails: $FAILED. Nothing was pushed."
           elif [ "$HANDOFF" = "failure" ]; then
             cause="The merge needs fixing and handing it to necro's $THESEAN failed. Nothing was pushed."
+          elif [ "$broken" = 1 ]; then
+            cause="A job failed (gate, token, land, workflow disabling). See the run log."
           else
-            cause="A workflow step failed (token, checkout, fetch, environment, push or workflow disabling). See the run log."
+            cause="The merge did not land and was handed to necro's $THESEAN, which has not resolved it yet."
           fi
-          msg="**Kometa fork upstream sync needs a human.** $cause Behind upstream by **${BEHIND:-?}** commit(s). <$RUN_URL>"
-          echo "$msg"
-          if [ -z "$WEBHOOK" ]; then
-            echo "::error::SYNC_ALERT_WEBHOOK is not set, so this alert reached nobody"
-            exit 1
+          # A merge that was handed off successfully is the agent's to fix; only the
+          # cases a human must see go to Discord, but the run still ends red below.
+          if [ "$broken" = 1 ] || { [ -n "$RESOLVED" ] && [ -n "$FAILED" ]; }; then
+            msg="**Kometa fork upstream sync needs a human.** $cause Behind upstream by **${BEHIND:-?}** commit(s). <$RUN_URL>"
+            echo "$msg"
+            if [ -z "$WEBHOOK" ]; then
+              echo "::error::SYNC_ALERT_WEBHOOK is not set, so this alert reached nobody"
+              exit 1
+            fi
+            jq -n --arg c "$msg" '{content: $c, allowed_mentions: {parse: []}}' |
+              curl -fsS -H 'Content-Type: application/json' --data-binary @- "$WEBHOOK"
           fi
-          jq -n --arg c "$msg" '{content: $c, allowed_mentions: {parse: []}}' |
-            curl -fsS -H 'Content-Type: application/json' --data-binary @- "$WEBHOOK"
-
-      # A merge that did not land ends red, so the run list never shows a stuck fork as green.
-      - name: Fail the run
-        if: always() && (steps.merge.outputs.conflict == 'true' || steps.gates.outputs.failed != '')
-        run: exit 1
+          echo "::error::$cause"
+          exit 1

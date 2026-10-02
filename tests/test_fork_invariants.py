@@ -157,7 +157,7 @@ def test_no_conflict_markers_anywhere():
 # runner.
 FORK_WORKFLOWS = {
     "fork-ci.yml": {"kometa-ci"},
-    "upstream-sync.yml": {"kometa-sync"},
+    "upstream-sync.yml": {"kometa-ci", "kometa-sync"},
 }
 
 
@@ -174,6 +174,27 @@ def test_fork_workflows_run_only_on_fork_pools(workflow: str, pools: set):
     assert jobs, f".github/workflows/{workflow} has no jobs"
     offenders = {name: job.get("runs-on") for name, job in jobs.items() if job.get("runs-on") not in pools}
     assert not offenders, f"{workflow} has jobs on runners other than {sorted(pools)}: {offenders}.\n" f"This fork runs nothing on GitHub-hosted runners; use the in-cluster ARC pool."
+
+
+@pytest.mark.parametrize("workflow", FORK_WORKFLOWS)
+def test_fork_workflow_jobs_are_guarded_to_this_repository(workflow: str):
+    """A copy of the fork elsewhere must not run these on whatever runners it has."""
+    unguarded = [name for name, job in _jobs(workflow).items() if "github.repository == 'raleesound/Kometa'" not in str(job.get("if", ""))]
+    assert not unguarded, f"{workflow} jobs without the same-repo guard: {unguarded}"
+
+
+def test_upstream_sync_splits_untrusted_gate_from_trusted_land():
+    """The gate runs repo code on kometa-ci with no secrets; the job holding the
+    write token runs on kometa-sync and never executes repo code."""
+    jobs = _jobs("upstream-sync.yml")
+    assert jobs["gate"]["runs-on"] == "kometa-ci"
+    assert jobs["land"]["runs-on"] == "kometa-sync"
+    assert jobs["land"]["needs"] == "gate"
+    gate = str(jobs["gate"])
+    assert "secrets." not in gate, "the gate job runs repository code and must not see secrets"
+    land = str(jobs["land"])
+    assert "./.github/actions" not in land and "uv " not in land and "pytest" not in land, "the land job must not execute repository code"
+    assert "--no-ff" in land and "[skip ci]" in land
 
 
 def test_upstream_sync_disables_workflows_it_does_not_own():
