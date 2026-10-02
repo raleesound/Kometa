@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Upgrade SIMKL authentication to AUTH V2 with access-token validation, refresh-on-failure, and an optional `force_refresh` setting.
 - Default `settings.threading.workers` to 4 (was effectively single-threaded) and `settings.threading.prefetch_collection_children` to `true`, deferring a collection's `sync_collection` "what to remove" lookup and PMS's comma-separated `/library/metadata/{ids}` batch-read to the shared thread pool instead of blocking the main collection loop; the cache is now RLock-guarded (`_LockedConnection`) so concurrent worker threads can share one SQLite connection safely.
 - Consolidate end-of-run log-summary routing and repeated high-volume item warnings, including metadata entries skipped because their titles were not found.
 
@@ -21,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Group `STARZ`, `Starz Encore`, and `STARZ Encore` network values into the canonical `Starz` Network Default collection.
 - Honor per-collection `limit_<<key>>` template variables across Defaults files, including Letterboxd charts, Based On collections, and Streaming collections.
 - Fix the `resolution` Defaults overlay file applying the `-Dovetail` variant to every DV HDR10+ item at 4K and 1080P, even without an edition, by matching the Dovetail weights to their plain counterparts. #3654
 - Normalize Letterboxd ratings returned by MDBList batch lookups to their native 0–5 scale, preventing doubled ratings in overlays and metadata updates. #3533
@@ -30,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Only fetch a parent item's `titleSort` when building a display title if sorted output was actually requested, instead of unconditionally.
 - Report Jikan/MyAnimeList search and lookup errors (including Jikan returning an error body for an unreachable MyAnimeList backend) as service errors with recovery guidance instead of a traceback, and fix an `mal_search` error that misidentified itself as an AniList error.
 - Read FlickList ratings once per run instead of once per library item, so `mass_user_rating_update: flicklist_user` and `flicklist_ratings` no longer exhaust FlickList's 1,000 requests/hour limit on larger libraries.
+- Validate that OMDb, IMDb service, and MDBList rating/search responses are the expected object shape before indexing into them, reporting a clean error instead of an unhandled traceback when one of those APIs answers with an unexpected body (e.g. an error payload shaped as a list); remove dead rating/image lookup code left over from the Trakt removal that referenced the no-longer-existing `config.Trakt`.
 - Stop the retired-Trakt config cleanup from discarding unrelated attributes that merely mention "trakt" in a string value (e.g. an `mdblist_list` URL whose slug references Trakt-sourced data, or `summary` prose) or an entire collection whose name contains "trakt", by matching only the actual Trakt builder/attribute key names instead of a substring check against every key and string value.
 - Report a `mass_*_rating_update`/`mass_*_episode_rating_update` value of the retired `trakt`, `trakt_user`, or `mdb_trakt` options with the Trakt-removal message instead of a confusing "must be a number between 0 and 10" error from the generic numeric-rating parser.
 
@@ -84,6 +87,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Show trace messages in terminal and Docker console output when `--trace` is enabled without `--debug`.
+- Retry incomplete or malformed TMDb language configuration during startup instead of reporting a valid language such as `en` as invalid, and log rejected responses at trace level.
 - Fix playlists never being reordered after creation, where every move failed with a `404` on `/playlists/<id>/items/None/move` because updating the metadata of the items cleared the Plex playlist item IDs needed to reorder them. #2265
 - Refresh a playlist after successful moves so `sync_to_users` copies use its current post-move order instead of the cached pre-sort order.
 - Report "Trakt Connection Successful (Public Mode)" instead of a plain "Successful" when a configured Trakt authorization fails to refresh, so the run log doesn't contradict the authentication error logged just above it.
