@@ -576,10 +576,10 @@ class Library(ABC):
         self._add_to_file("Filtered", collection, items, is_movie)
 
     def add_budget_held_back(self, collection, items, is_movie):
-        self._add_to_file("Held Back by Add Missing Budget", collection, items, is_movie)
+        self._add_to_file("Held Back by Add Missing Drip", collection, items, is_movie)
 
     def add_budget_orphans(self, collection, items, is_movie):
-        self._add_to_file("Add Missing Budget Orphans (tagged, no longer on list)", collection, items, is_movie)
+        self._add_to_file("Add Missing Drip Orphans (tagged, no longer on list)", collection, items, is_movie)
 
     def _add_to_file(self, file_type, collection, items, is_movie):
         if collection not in self.report_data:
