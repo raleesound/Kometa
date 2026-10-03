@@ -118,7 +118,7 @@ If your Radarr/Sonarr has different file system mappings from your Plex use `rad
 * Nothing is stored by Kometa: each run reads the `added` date of every item carrying the ledger tag in Radarr/Sonarr.
     * **First week:** while no item carries the tag yet, or the oldest one was added less than 7 days ago, the collection may add up to `initial` items in total.
     * **After that:** it may add up to `per_week` items per rolling 7 days, minus the tagged items added in the last 7 days.
-    * Every tagged item counts, including ones that are no longer on the list (they were still downloads). An item with no `added` date is treated as old.
+    * Every tagged item counts, including ones that are no longer on the list (they were still downloads). An item with no `added` date counts as added now (it uses up the allowance), so a missing date never grants extra adds.
 * Missing items are added in list order. Items already in Radarr/Sonarr, or already in Kometa's add cache, are passed through and do not use the allowance.
 * Items that carry the ledger tag but are no longer on the list are **orphans**. Kometa never deletes anything or removes tags in Radarr/Sonarr; orphans are only logged and written to the missing report.
 * **Fail closed:** if any builder for the collection fails or returns nothing, or any list entry cannot be resolved, Kometa cannot trust that it sees the whole list, so it adds nothing for that collection that run. The reason is logged, and everything that would have been added is reported as held back.
