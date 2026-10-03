@@ -86,15 +86,43 @@ class TestPlanAdds:
         assert p.orphans == [(2, "T2"), (3, "T3")]
         assert p.spent == 2 and p.ids_to_pass == [100] and p.held_back == [101, 102]
 
-    def test_missing_added_date_is_old(self):
-        # An undated tagged item ends the first week and does not count towards the rolling window.
-        p = plan([100, 101], {1: None, 2: ago(days=1)}, initial=50, per_week=2)
-        assert not p.first_week and p.limit == 2 and p.spent == 1
+    def test_missing_added_date_counts_as_now(self):
+        # An undated tagged item fails closed: it spends allowance in the rolling window too.
+        p = plan([100, 101], {0: ago(days=30), 1: None, 2: ago(days=1)}, initial=50, per_week=3)
+        assert not p.first_week and p.limit == 3 and p.spent == 2 and p.remaining == 1
         assert p.ids_to_pass == [100] and p.held_back == [101]
 
-    def test_only_undated_items_means_rolling_with_nothing_spent(self):
-        p = plan([100], {1: None}, initial=0, per_week=1)
+    def test_only_undated_items_spend_first_week_allowance(self):
+        p = plan([100, 101], {1: None}, initial=1, per_week=5)
+        assert p.first_week and p.spent == 1 and p.remaining == 0
+        assert p.ids_to_pass == [] and p.held_back == [100, 101]
+
+    def test_undated_item_does_not_end_first_week(self):
+        p = plan([100], {1: None, 2: ago(days=3)}, initial=2, per_week=5)
+        assert p.first_week and p.spent == 2 and p.held_back == [100]
+
+    def test_item_exactly_at_window_start_is_outside_the_window(self):
+        p = plan([100], {1: ago(days=30), 2: ago(days=7)}, per_week=1)
         assert not p.first_week and p.spent == 0 and p.ids_to_pass == [100]
+        p = plan([100], {1: ago(days=30), 2: ago(days=7) + timedelta(seconds=1)}, per_week=1)
+        assert p.spent == 1 and p.held_back == [100]
+
+    def test_multi_week_sequence_25_then_10_a_week(self):
+        tagged = {}
+        next_id = 1000
+        added_per_run = []
+        for week in range(4):
+            now = NOW + timedelta(days=7 * week)
+            candidates = list(range(next_id, next_id + 100))
+            p = add_budget.plan_adds(candidates, 25, 10, LEDGER, {i: (f"T{i}", d) for i, d in tagged.items()}, set(candidates) | set(tagged), set(), now)
+            added_per_run.append(len(p.ids_to_pass))
+            for _id in p.ids_to_pass:
+                tagged[_id] = now
+            next_id += 100
+            # a second run on the same day adds nothing
+            again = add_budget.plan_adds(candidates, 25, 10, LEDGER, {i: (f"T{i}", d) for i, d in tagged.items()}, set(candidates) | set(tagged), set(), now)
+            assert again.ids_to_pass == []
+        assert added_per_run == [25, 10, 10, 10]
 
     def test_timezone_aware_dates_are_normalized(self):
         aware = (NOW - timedelta(days=1)).replace(tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=-4)))
@@ -175,9 +203,9 @@ class TestBudgetState:
         assert unaddable == {1, 2, 20}
 
     def test_radarr_item_without_added_attribute(self, monkeypatch):
-        movie = SimpleNamespace(tmdbId=1, title="Old", tags=[_tag(LEDGER)])
+        movie = SimpleNamespace(tmdbId=1, title="Undated", tags=[_tag(LEDGER)])
         tagged, _ = _radarr(monkeypatch, [movie]).budget_state(LEDGER, [], False)
-        assert tagged == {1: ("Old", None)}
+        assert tagged == {1: ("Undated", None)}  # None is counted as "now" by plan_adds
 
     def test_radarr_ignore_cache_skips_cache(self, monkeypatch):
         r = _radarr(monkeypatch, [])
@@ -299,12 +327,13 @@ class TestApplyAddBudget:
         r.api.delete_multiple_movies.assert_not_called()
         r.api.edit_multiple_movies.assert_not_called()
 
-    def test_missing_added_dates_treated_as_old(self, monkeypatch):
-        r = _radarr(monkeypatch, [_movie(1, "Undated", LEDGER, added=None)])
+    @pytest.mark.parametrize("undated", [_movie(1, "Undated", LEDGER, added=None), SimpleNamespace(tmdbId=1, title="Undated", tags=[_tag(LEDGER)])])
+    def test_missing_added_dates_count_as_now(self, monkeypatch, undated):
+        r = _radarr(monkeypatch, [undated])
         b, _ = _builder(monkeypatch, r, plex_tmdb_by_key={100: 1}, found_keys=[100], missing=[10, 11, 12])
-        ids, _ = b._apply_add_budget(r, _drip(initial=50, per_week=2), [("A", 10), ("B", 11), ("C", 12)], True)
-        assert ids == [10, 11]  # rolling window (undated = old ends the first week), nothing spent this week
-        assert any("rolling 7 days, 0/2" in m for m in modules.builder.logger.info_messages)
+        ids, _ = b._apply_add_budget(r, _drip(initial=2, per_week=5), [("A", 10), ("B", 11), ("C", 12)], True)
+        assert ids == [10]  # first week, the undated item spent 1 of 2
+        assert any("first week, 1/2 added in the last 7 days, 1 remaining" in m for m in modules.builder.logger.info_messages)
 
     def test_uses_injected_clock(self, monkeypatch):
         r = _radarr(monkeypatch, [_movie(1, "A", LEDGER, added=ago(days=3))])

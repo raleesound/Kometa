@@ -7,7 +7,10 @@ the arr each run using the ``added`` date of every tagged item, so nothing is st
 * After that: up to ``per_week`` items per rolling 7 days.
 
 Every tagged item counts towards the rate, including ones no longer on the list (they were still downloads). Nothing is ever removed or untagged here;
-tagged items that are no longer on the list are only reported as orphans.
+tagged items that are no longer on the list are only reported as orphans. A tagged item with no ``added`` date fails closed: it counts as added now, so it
+uses up both the first-week and the rolling-week allowance.
+
+Known and accepted for now: the ledger is the tagged items themselves, so deleting a list's tagged items from the arr resets its first-week ``initial`` burst.
 """
 
 import re
@@ -69,16 +72,16 @@ def plan_adds(candidates, initial, per_week, ledger_tag, tagged, list_ids, unadd
     """Decide which missing items may be added this run.
 
     candidates: missing ids in list order.
-    tagged:     {id: (title, added)} for every arr item carrying the ledger tag; added is a datetime or None (None counts as old).
+    tagged:     {id: (title, added)} for every arr item carrying the ledger tag; added is a datetime or None (None counts as ``now``: fail closed).
     list_ids:   ids currently on the collection's list (found in Plex or missing); only used to report orphans.
     unaddable:  ids the arr would skip anyway (already in the arr or cached as added); they do not consume allowance and are passed through untouched.
     now:        run time, naive UTC.
     """
     window_start = now - WINDOW
-    dates = [_naive_utc(added) for _, added in tagged.values()]
-    # An undated item is treated as old, so it ends the first week and does not count towards the rolling window.
-    first_week = not dates or all(added is not None and added > window_start for added in dates)
-    spent = sum(1 for added in dates if added is not None and added > window_start)
+    # An undated item fails closed: it counts as added now, so it spends allowance in both the first week and the rolling window.
+    dates = [_naive_utc(added) or now for _, added in tagged.values()]
+    first_week = not dates or all(added > window_start for added in dates)
+    spent = sum(1 for added in dates if added > window_start)
     limit = initial if first_week else per_week
     remaining = max(limit - spent, 0)
     orphans = [(_id, title) for _id, (title, _) in tagged.items() if _id not in list_ids]
