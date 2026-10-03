@@ -299,7 +299,8 @@ none_details = [
 none_builders = ["radarr_taglist", "sonarr_taglist", "flicklist_watchlist", "flicklist_favorites", "flicklist_watched", "flicklist_up_next", "flicklist_tracked", "flicklist_ratings", "wetrakr_favorites", "wetrakr_tracking", "wetrakr_ratings"]
 radarr_details = [
     "radarr_add_missing",
-    "radarr_add_missing_budget",
+    "radarr_add_missing_initial",
+    "radarr_add_missing_per_week",
     "radarr_add_missing_ledger_tag",
     "radarr_add_existing",
     "radarr_upgrade_existing",
@@ -315,7 +316,8 @@ radarr_details = [
 ]
 sonarr_details = [
     "sonarr_add_missing",
-    "sonarr_add_missing_budget",
+    "sonarr_add_missing_initial",
+    "sonarr_add_missing_per_week",
     "sonarr_add_missing_ledger_tag",
     "sonarr_add_existing",
     "sonarr_upgrade_existing",
@@ -2183,8 +2185,8 @@ class CollectionBuilder:
             "radarr_ignore_cache",
         ]:
             self.radarr_details[method_name[7:]] = util.parse(self.Type, method_name, method_data, datatype="bool")
-        elif method_name == "radarr_add_missing_budget":
-            self.radarr_details["add_missing_budget"] = util.parse(self.Type, method_name, method_data, datatype="int", minimum=0)
+        elif method_name in ["radarr_add_missing_initial", "radarr_add_missing_per_week"]:
+            self.radarr_details[method_name[7:]] = util.parse(self.Type, method_name, method_data, datatype="int", minimum=0)
         elif method_name == "radarr_add_missing_ledger_tag":
             self.radarr_details["add_missing_ledger_tag"] = self._parse_ledger_tag(method_name, method_data)
         elif method_name == "radarr_folder":
@@ -2215,8 +2217,8 @@ class CollectionBuilder:
             "sonarr_ignore_cache",
         ]:
             self.sonarr_details[method_name[7:]] = util.parse(self.Type, method_name, method_data, datatype="bool")
-        elif method_name == "sonarr_add_missing_budget":
-            self.sonarr_details["add_missing_budget"] = util.parse(self.Type, method_name, method_data, datatype="int", minimum=0)
+        elif method_name in ["sonarr_add_missing_initial", "sonarr_add_missing_per_week"]:
+            self.sonarr_details[method_name[7:]] = util.parse(self.Type, method_name, method_data, datatype="int", minimum=0)
         elif method_name == "sonarr_add_missing_ledger_tag":
             self.sonarr_details["add_missing_ledger_tag"] = self._parse_ledger_tag(method_name, method_data)
         elif method_name in ["sonarr_folder", "sonarr_quality", "sonarr_language"]:
@@ -5212,17 +5214,18 @@ class CollectionBuilder:
 
     def _validate_add_budgets(self):
         for arr_name, arr_details in (("radarr", self.radarr_details), ("sonarr", self.sonarr_details)):
-            if "add_missing_ledger_tag" in arr_details and "add_missing_budget" not in arr_details:
-                raise BuilderValidationError(f"{self.Type} Error: {arr_name}_add_missing_ledger_tag requires {arr_name}_add_missing_budget")
-            if "add_missing_budget" in arr_details:
+            has_initial = "add_missing_initial" in arr_details
+            if has_initial != ("add_missing_per_week" in arr_details):
+                raise BuilderValidationError(f"{self.Type} Error: {arr_name}_add_missing_initial and {arr_name}_add_missing_per_week must be used together")
+            if has_initial or "add_missing_ledger_tag" in arr_details:
                 if "add_missing_ledger_tag" not in arr_details:
                     arr_details["add_missing_ledger_tag"] = add_budget.default_ledger_tag(self.name)
                 if not arr_details["add_missing"]:
-                    logger.warning(f"{self.Type} Warning: {arr_name}_add_missing_budget has no effect because {arr_name}_add_missing is not enabled for {self.name}")
+                    logger.warning(f"{self.Type} Warning: {arr_name}_add_missing drip/ledger attributes have no effect because {arr_name}_add_missing is not enabled for {self.name}")
 
     def gather_and_save_items(self, method, value, pending=None):
         # pending: a future from the threading prefetch; its result() raises inside this try,
-        # so a builder that failed in the background still blocks the add_missing budget.
+        # so a builder that failed in the background still blocks the add_missing drip.
         try:
             ids = pending.result() if pending is not None else self.gather_ids(method, value)
             if not ids:
@@ -5238,7 +5241,7 @@ class CollectionBuilder:
                 raise Failed(e)
 
     def add_budget_blocker(self, reason):
-        """Record that this run's view of the list may be incomplete, which makes any add_missing budget fail closed."""
+        """Record that this run's view of the list may be incomplete, which makes any add_missing drip fail closed."""
         if reason not in self.budget_blockers:
             self.budget_blockers.append(reason)
 
@@ -5252,18 +5255,23 @@ class CollectionBuilder:
         return ids
 
     def _apply_add_budget(self, arr, details, missing_with_names, is_movie):
-        """Return (ids to hand to Radarr/Sonarr, add options). Without a budget this is a no-op passthrough."""
+        """Return (ids to hand to Radarr/Sonarr, add options). Without a ledger tag this is a no-op passthrough."""
         candidates = [missing_id for _, missing_id in missing_with_names]
-        if "add_missing_budget" not in details:
+        if "add_missing_ledger_tag" not in details:
             return candidates, details
         arr_name = "Radarr" if is_movie else "Sonarr"
         ledger_tag = details["add_missing_ledger_tag"]
+        options = dict(details)
+        options["tag"] = add_budget.with_ledger_tag(details.get("tag", arr.tag), ledger_tag)
+        if "add_missing_initial" not in details:
+            # Exempt list: every add is tagged, nothing is limited.
+            return candidates, options
         if self.budget_blockers:
-            # The list may be incomplete, so tagged items could look like orphans and free budget that was never freed. Add nothing.
+            # The list may be incomplete, so this run cannot trust what it would add. Add nothing.
             logger.info("")
-            logger.warning(f"{arr_name} Add Missing Budget ({ledger_tag}): skipping all adds this run because the list may be incomplete")
+            logger.warning(f"{arr_name} Add Missing Drip ({ledger_tag}): skipping all adds this run because the list may be incomplete")
             for reason in self.budget_blockers:
-                logger.warning(f"{arr_name} Budget Blocker | {reason}")
+                logger.warning(f"{arr_name} Drip Blocker | {reason}")
             held = [{"title": title, "id": missing_id} for title, missing_id in missing_with_names]
             (self.held_back_radarr if is_movie else self.held_back_sonarr).extend(held)
             if self.do_report and missing_with_names:
@@ -5271,15 +5279,16 @@ class CollectionBuilder:
             return [], details
         titles = {missing_id: title for title, missing_id in missing_with_names}
         tagged, unaddable = arr.budget_state(ledger_tag, candidates, details.get("ignore_cache", arr.ignore_cache))
-        plan = add_budget.plan_adds(candidates, details["add_missing_budget"], ledger_tag, tagged, self._list_ids(is_movie), unaddable)
+        plan = add_budget.plan_adds(candidates, details["add_missing_initial"], details["add_missing_per_week"], ledger_tag, tagged, self._list_ids(is_movie), unaddable, add_budget.utcnow())
+        phase = "first week" if plan.first_week else "rolling 7 days"
         logger.info("")
-        logger.info(f"{arr_name} Add Missing Budget ({ledger_tag}): {plan.spent}/{plan.budget} used, {plan.remaining} remaining")
+        logger.info(f"{arr_name} Add Missing Drip ({ledger_tag}): {phase}, {plan.spent}/{plan.limit} added in the last 7 days, {plan.remaining} remaining")
         for _id, title in plan.orphans:
-            logger.info(f"{arr_name} Budget Orphan | {title} ({_id}) is tagged {ledger_tag} but no longer on the list; not counted, left untouched")
+            logger.info(f"{arr_name} Drip Orphan | {title} ({_id}) is tagged {ledger_tag} but no longer on the list; left untouched")
         for _id in plan.held_back:
-            logger.warning(f"{arr_name} Budget Held Back | {titles[_id]} ({_id}) not added; budget of {plan.budget} reached")
+            logger.warning(f"{arr_name} Drip Held Back | {titles[_id]} ({_id}) not added; {phase} allowance of {plan.limit} reached")
         if plan.held_back:
-            logger.info(f"{len(plan.held_back)} Item{'s' if len(plan.held_back) != 1 else ''} Held Back by the {arr_name} Add Missing Budget")
+            logger.info(f"{len(plan.held_back)} Item{'s' if len(plan.held_back) != 1 else ''} Held Back by the {arr_name} Add Missing Drip, next run will continue")
         held = [{"title": titles[_id], "id": _id} for _id in plan.held_back]
         (self.held_back_radarr if is_movie else self.held_back_sonarr).extend(held)
         if self.do_report:
@@ -5287,8 +5296,6 @@ class CollectionBuilder:
                 self.library.add_budget_held_back(self.name, [(titles[_id], _id) for _id in plan.held_back], is_movie)
             if plan.orphans:
                 self.library.add_budget_orphans(self.name, [(title, _id) for _id, title in plan.orphans], is_movie)
-        options = dict(details)
-        options["tag"] = add_budget.with_ledger_tag(details.get("tag", arr.tag), ledger_tag)
         return plan.ids_to_pass, options
 
     @timings.timed("load_collection_items")
