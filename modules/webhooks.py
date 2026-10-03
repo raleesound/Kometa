@@ -69,9 +69,9 @@ def get_message(json):
             if json["sonarr_adds"]:
                 message += f"{new_line if message else ''}{len(json['sonarr_adds'])} Sonarr Additions:"
             if json.get("radarr_held_back"):
-                message += f"{new_line if message else ''}{len(json['radarr_held_back'])} Held Back From Radarr (add_missing budget)"
+                message += f"{new_line if message else ''}{len(json['radarr_held_back'])} Held Back From Radarr (add_missing drip)"
             if json.get("sonarr_held_back"):
-                message += f"{new_line if message else ''}{len(json['sonarr_held_back'])} Held Back From Sonarr (add_missing budget)"
+                message += f"{new_line if message else ''}{len(json['sonarr_held_back'])} Held Back From Sonarr (add_missing drip)"
             message += f"{new_line if message else ''}{len(json['additions'])} Additions:"
             for add_dict in json["additions"]:
                 message += f"\n{add_dict['title']}"

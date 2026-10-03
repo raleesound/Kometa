@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Support the `folder_location` Plex search option in music-library track builders.
-- Add `radarr_add_missing_budget`/`sonarr_add_missing_budget` (and `*_add_missing_ledger_tag`) collection attributes: a lifetime per-collection cap on `add_missing`, tracked with a Radarr/Sonarr tag. Items held back and orphaned ledger items are logged and reported, nothing is ever removed or untagged, and a collection whose lists may be incomplete adds nothing that run.
+- Add `radarr_add_missing_initial`/`radarr_add_missing_per_week` (and the `sonarr_` equivalents, plus `*_add_missing_ledger_tag`) collection attributes: a per-collection drip on `add_missing` - up to `initial` items in the list's first 7 days, then up to `per_week` per rolling 7 days - counted statelessly from the `added` dates of items carrying a Radarr/Sonarr ledger tag. A ledger tag on its own marks an exempt list (tagged, not limited). Items held back and orphaned ledger items are logged and reported, nothing is ever removed or untagged, and a collection whose lists may be incomplete adds nothing that run.
 
 ### Fixed
 

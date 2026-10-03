@@ -295,13 +295,13 @@ class Sonarr:
         return ids
 
     def budget_state(self, ledger_tag, candidates, ignore_cache):
-        """Ledger snapshot for an add_missing budget: ({tvdb_id: title} tagged with ledger_tag, tvdb ids add_tvdb would skip anyway)."""
+        """Ledger snapshot for an add_missing drip: ({tvdb_id: (title, added)} tagged with ledger_tag, tvdb ids add_tvdb would skip anyway)."""
         tagged = {}
         in_sonarr = set()
         for series in self.api.all_series():
             in_sonarr.add(series.tvdbId)
             if any(_t.label.lower() == ledger_tag for _t in series.tags):
-                tagged[series.tvdbId] = series.title
+                tagged[series.tvdbId] = (series.title, getattr(series, "added", None))
         unaddable = {c for c in candidates if c in in_sonarr}
         if self.cache and not ignore_cache:
             unaddable.update(c for c in candidates if self.cache.query_sonarr_adds(c, self.library.original_mapping_name))
