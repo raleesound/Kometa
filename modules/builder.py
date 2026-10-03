@@ -302,6 +302,7 @@ radarr_details = [
     "radarr_add_missing_initial",
     "radarr_add_missing_per_week",
     "radarr_add_missing_ledger_tag",
+    "radarr_add_missing_budget",  # COMPAT(remove after the monorepo addlist drip rollout, raleesound/ai-app-factory#4532): deprecated lifetime key
     "radarr_add_existing",
     "radarr_upgrade_existing",
     "radarr_monitor_existing",
@@ -319,6 +320,7 @@ sonarr_details = [
     "sonarr_add_missing_initial",
     "sonarr_add_missing_per_week",
     "sonarr_add_missing_ledger_tag",
+    "sonarr_add_missing_budget",  # COMPAT(remove after the monorepo addlist drip rollout, raleesound/ai-app-factory#4532): deprecated lifetime key
     "sonarr_add_existing",
     "sonarr_upgrade_existing",
     "sonarr_monitor_existing",
@@ -2187,6 +2189,10 @@ class CollectionBuilder:
             self.radarr_details[method_name[7:]] = util.parse(self.Type, method_name, method_data, datatype="bool")
         elif method_name in ["radarr_add_missing_initial", "radarr_add_missing_per_week"]:
             self.radarr_details[method_name[7:]] = util.parse(self.Type, method_name, method_data, datatype="int", minimum=0)
+        elif method_name == "radarr_add_missing_budget":
+            # COMPAT(remove after the monorepo addlist drip rollout, raleesound/ai-app-factory#4532): the value is ignored; _validate_add_budgets maps this to the default drip.
+            util.parse(self.Type, method_name, method_data, datatype="int", minimum=0)
+            self.radarr_details["add_missing_budget"] = True
         elif method_name == "radarr_add_missing_ledger_tag":
             self.radarr_details["add_missing_ledger_tag"] = self._parse_ledger_tag(method_name, method_data)
         elif method_name == "radarr_folder":
@@ -2219,6 +2225,10 @@ class CollectionBuilder:
             self.sonarr_details[method_name[7:]] = util.parse(self.Type, method_name, method_data, datatype="bool")
         elif method_name in ["sonarr_add_missing_initial", "sonarr_add_missing_per_week"]:
             self.sonarr_details[method_name[7:]] = util.parse(self.Type, method_name, method_data, datatype="int", minimum=0)
+        elif method_name == "sonarr_add_missing_budget":
+            # COMPAT(remove after the monorepo addlist drip rollout, raleesound/ai-app-factory#4532): the value is ignored; _validate_add_budgets maps this to the default drip.
+            util.parse(self.Type, method_name, method_data, datatype="int", minimum=0)
+            self.sonarr_details["add_missing_budget"] = True
         elif method_name == "sonarr_add_missing_ledger_tag":
             self.sonarr_details["add_missing_ledger_tag"] = self._parse_ledger_tag(method_name, method_data)
         elif method_name in ["sonarr_folder", "sonarr_quality", "sonarr_language"]:
@@ -5214,6 +5224,16 @@ class CollectionBuilder:
 
     def _validate_add_budgets(self):
         for arr_name, arr_details in (("radarr", self.radarr_details), ("sonarr", self.sonarr_details)):
+            # COMPAT(remove after the monorepo addlist drip rollout, raleesound/ai-app-factory#4532): a leftover *_add_missing_budget becomes the default drip, never an exempt list.
+            if arr_details.pop("add_missing_budget", False):
+                if "add_missing_initial" in arr_details or "add_missing_per_week" in arr_details:
+                    raise BuilderValidationError(f"{self.Type} Error: {arr_name}_add_missing_budget cannot be combined with {arr_name}_add_missing_initial or {arr_name}_add_missing_per_week")
+                logger.warning(
+                    f"{self.Type} Warning: {arr_name}_add_missing_budget is deprecated and now means the default drip (initial {add_budget.COMPAT_DRIP_INITIAL}, per_week {add_budget.COMPAT_DRIP_PER_WEEK}); "
+                    f"rewrite this collection to {arr_name}_add_missing_initial/{arr_name}_add_missing_per_week"
+                )
+                arr_details["add_missing_initial"] = add_budget.COMPAT_DRIP_INITIAL
+                arr_details["add_missing_per_week"] = add_budget.COMPAT_DRIP_PER_WEEK
             has_initial = "add_missing_initial" in arr_details
             if has_initial != ("add_missing_per_week" in arr_details):
                 raise BuilderValidationError(f"{self.Type} Error: {arr_name}_add_missing_initial and {arr_name}_add_missing_per_week must be used together")
