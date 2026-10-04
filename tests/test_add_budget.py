@@ -410,14 +410,15 @@ class TestAttributeParsing:
             b._radarr(key, -1)
 
     @pytest.mark.parametrize("arr", ["radarr", "sonarr"])
-    def test_deprecated_budget_key_parses_to_marker(self, arr):
-        from modules.util import Failed
+    def test_removed_budget_key_is_unknown_attribute(self, arr):
+        import modules.builder as mb
 
-        b = self._builder()
-        getattr(b, f"_{arr}")(f"{arr}_add_missing_budget", "7")
-        assert getattr(b, f"{arr}_details") == {"add_missing_budget": True}
-        with pytest.raises(Failed):
-            getattr(b, f"_{arr}")(f"{arr}_add_missing_budget", -1)
+        key = f"{arr}_add_missing_budget"
+        # Not accepted anywhere, so the builder's dispatch falls through to "'<key>' attribute is invalid".
+        assert key not in mb.radarr_details
+        assert key not in mb.sonarr_details
+        assert key not in mb.radarr.builders + mb.sonarr.builders
+        assert key not in mb.all_builders + mb.details + mb.item_details
 
     def test_invalid_ledger_tag_rejected(self):
         from modules.util import BuilderValidationError
@@ -581,37 +582,6 @@ class TestValidateAddBudgets:
 
         b = self._builder(monkeypatch, {"add_missing": True, "add_missing_initial": 5, "add_missing_ledger_tag": "kl-x"})
         with pytest.raises(BuilderValidationError):
-            b._validate_add_budgets()
-
-    @pytest.mark.parametrize("arr", ["radarr", "sonarr"])
-    def test_compat_budget_only_maps_to_default_drip(self, monkeypatch, arr):
-        details = {"add_missing": True, "add_missing_budget": True}
-        b = self._builder(monkeypatch, details if arr == "radarr" else {"add_missing": True}, details if arr == "sonarr" else None)
-        b._validate_add_budgets()
-        got = getattr(b, f"{arr}_details")
-        assert got == {"add_missing": True, "add_missing_initial": 25, "add_missing_per_week": 10, "add_missing_ledger_tag": "kl-member-picks"}
-        assert modules.builder.logger.warning_messages == [
-            f"Collection Warning: {arr}_add_missing_budget is deprecated and now means the default drip (initial 25, per_week 10); rewrite this collection to {arr}_add_missing_initial/{arr}_add_missing_per_week"
-        ]
-
-    @pytest.mark.parametrize("arr", ["radarr", "sonarr"])
-    def test_compat_budget_with_ledger_tag_is_drip_not_exempt(self, monkeypatch, arr):
-        details = {"add_missing": True, "add_missing_budget": True, "add_missing_ledger_tag": "kl-mine"}
-        b = self._builder(monkeypatch, details if arr == "radarr" else {"add_missing": True}, details if arr == "sonarr" else None)
-        b._validate_add_budgets()
-        got = getattr(b, f"{arr}_details")
-        assert got["add_missing_initial"] == 25 and got["add_missing_per_week"] == 10
-        assert got["add_missing_ledger_tag"] == "kl-mine"
-        assert "add_missing_budget" not in got
-
-    @pytest.mark.parametrize("arr", ["radarr", "sonarr"])
-    @pytest.mark.parametrize("other", ["add_missing_initial", "add_missing_per_week"])
-    def test_compat_budget_cannot_combine_with_drip(self, monkeypatch, arr, other):
-        from modules.util import BuilderValidationError
-
-        details = {"add_missing": True, "add_missing_budget": True, other: 5}
-        b = self._builder(monkeypatch, details if arr == "radarr" else {"add_missing": True}, details if arr == "sonarr" else None)
-        with pytest.raises(BuilderValidationError, match=f"{arr}_add_missing_budget cannot be combined with"):
             b._validate_add_budgets()
 
     def test_warns_when_drip_set_but_add_missing_off(self, monkeypatch):
