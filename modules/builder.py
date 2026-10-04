@@ -305,11 +305,15 @@ radarr_details = [
     "radarr_upgrade_existing",
     "radarr_monitor_existing",
     "radarr_folder",
+    "radarr_root_folder_path",
     "radarr_monitor",
     "radarr_search",
     "radarr_availability",
+    "radarr_minimum_availability",
     "radarr_quality",
+    "radarr_quality_profile",
     "radarr_tag",
+    "radarr_tags",
     "item_radarr_tag",
     "radarr_ignore_cache",
 ]
@@ -321,14 +325,20 @@ sonarr_details = [
     "sonarr_upgrade_existing",
     "sonarr_monitor_existing",
     "sonarr_folder",
+    "sonarr_root_folder_path",
     "sonarr_monitor",
     "sonarr_language",
+    "sonarr_language_profile",
     "sonarr_series",
+    "sonarr_series_type",
     "sonarr_quality",
+    "sonarr_quality_profile",
     "sonarr_season",
+    "sonarr_season_folder",
     "sonarr_search",
     "sonarr_cutoff_search",
     "sonarr_tag",
+    "sonarr_tags",
     "item_sonarr_tag",
     "sonarr_ignore_cache",
 ]
@@ -1276,7 +1286,6 @@ class CollectionBuilder:
         self.collection_background = None
         self.collection_logo = None
         self.exists = False
-        self.non_existing = False
         self.created = False
         self.deleted = False
 
@@ -1341,9 +1350,7 @@ class CollectionBuilder:
                 logger.debug(f"Value: {self.data[methods['schedule']]}")
                 err = None
                 try:
-                    util.schedule_check("schedule", self.data[methods["schedule"]], self.current_time, self.config.run_hour)
-                except NonExisting as e:
-                    self.non_existing = str(e)
+                    util.schedule_check("schedule", self.data[methods["schedule"]], self.current_time, self.config.run_hour, object_exists=self.obj is not None)
                 except NotScheduledRange as e:
                     err = e
                 except NotScheduled as e:
@@ -1897,9 +1904,6 @@ class CollectionBuilder:
                 logger.warning(f"{self.Type} Error: Sync Mode can only be append when using build_collection: false")
                 self.sync = False
             self.run_again = False
-        if self.non_existing is not False and self.obj is not None:
-            raise NotScheduled(self.non_existing)
-
         logger.info("")
         logger.info("Validation Successful")
 
@@ -2187,16 +2191,16 @@ class CollectionBuilder:
             self.radarr_details["add_missing_budget"] = util.parse(self.Type, method_name, method_data, datatype="int", minimum=0)
         elif method_name == "radarr_add_missing_ledger_tag":
             self.radarr_details["add_missing_ledger_tag"] = self._parse_ledger_tag(method_name, method_data)
-        elif method_name == "radarr_folder":
+        elif method_name in ["radarr_folder", "radarr_root_folder_path"]:
             self.radarr_details["folder"] = method_data
-        elif method_name == "radarr_availability":
+        elif method_name in ["radarr_availability", "radarr_minimum_availability"]:
             if str(method_data).lower() in radarr.availability_translation:
                 self.radarr_details["availability"] = str(method_data).lower()
             else:
                 raise BuilderValidationError(f"{self.Type} Error: {method_name} attribute must be either announced, cinemas, released or db")
-        elif method_name == "radarr_quality":
+        elif method_name in ["radarr_quality", "radarr_quality_profile"]:
             self.radarr_details["quality"] = method_data
-        elif method_name == "radarr_tag":
+        elif method_name in ["radarr_tag", "radarr_tags"]:
             self.radarr_details["tag"] = util.get_list(method_data, lower=True)
         elif method_name == "radarr_taglist":
             self.builders.append((method_name, util.get_list(method_data, lower=True, return_none=False)))
@@ -2209,7 +2213,6 @@ class CollectionBuilder:
             "sonarr_add_existing",
             "sonarr_upgrade_existing",
             "sonarr_monitor_existing",
-            "sonarr_season",
             "sonarr_search",
             "sonarr_cutoff_search",
             "sonarr_ignore_cache",
@@ -2219,19 +2222,25 @@ class CollectionBuilder:
             self.sonarr_details["add_missing_budget"] = util.parse(self.Type, method_name, method_data, datatype="int", minimum=0)
         elif method_name == "sonarr_add_missing_ledger_tag":
             self.sonarr_details["add_missing_ledger_tag"] = self._parse_ledger_tag(method_name, method_data)
-        elif method_name in ["sonarr_folder", "sonarr_quality", "sonarr_language"]:
-            self.sonarr_details[method_name[7:]] = method_data
+        elif method_name in ["sonarr_season", "sonarr_season_folder"]:
+            self.sonarr_details["season"] = method_data
+        elif method_name in ["sonarr_folder", "sonarr_root_folder_path"]:
+            self.sonarr_details["folder"] = method_data
+        elif method_name in ["sonarr_quality", "sonarr_quality_profile"]:
+            self.sonarr_details["quality"] = method_data
+        elif method_name in ["sonarr_language", "sonarr_language_profile"]:
+            self.sonarr_details["language"] = method_data
         elif method_name == "sonarr_monitor":
             if str(method_data).lower() in sonarr.monitor_translation:
                 self.sonarr_details["monitor"] = str(method_data).lower()
             else:
                 raise Failed(f"{self.Type} Error: {method_name} attribute must be either all, future, missing, existing, pilot, first, latest or none")
-        elif method_name == "sonarr_series":
+        elif method_name in ["sonarr_series", "sonarr_series_type"]:
             if str(method_data).lower() in sonarr.series_types:
                 self.sonarr_details["series"] = str(method_data).lower()
             else:
                 raise Failed(f"{self.Type} Error: {method_name} attribute must be either standard, daily, or anime")
-        elif method_name == "sonarr_tag":
+        elif method_name in ["sonarr_tag", "sonarr_tags"]:
             self.sonarr_details["tag"] = util.get_list(method_data, lower=True)
         elif method_name == "sonarr_taglist":
             self.builders.append((method_name, util.get_list(method_data, lower=True, return_none=False)))
