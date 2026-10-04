@@ -19,9 +19,6 @@ from datetime import datetime, timedelta, timezone
 
 LEDGER_PREFIX = "kl-"
 WINDOW = timedelta(days=7)
-# COMPAT(remove after the monorepo addlist drip rollout, raleesound/ai-app-factory#4532): drip a leftover *_add_missing_budget key maps to.
-COMPAT_DRIP_INITIAL = 25
-COMPAT_DRIP_PER_WEEK = 10
 _TAG_LABEL = re.compile(r"^[a-z0-9-]+$")
 
 
