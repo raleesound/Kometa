@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Accept YAML lists for schedules and scheduled visibility attributes across the config, collection, overlay, and playlist schemas, matching documented runtime OR semantics.
+- Accept scalar values for the legacy `mass_content_rating_update` and `mass_original_title_update` operations in the config schema, matching runtime normalization and the other legacy mass metadata operations.
 - Evaluate `non_existing` schedules against collection or playlist existence, preserving OR behavior in schedule lists while allowing `all[...]` to require absence alongside other conditions. #3675
 - Allow `floppy_list` and `floppy_list_details` builders in episode-level collections, including exact episodes from public Floppy RSS feeds.
 - Group `STARZ`, `Starz Encore`, and `STARZ Encore` network values into the canonical `Starz` Network Default collection.
@@ -277,6 +279,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `modules/imdb.py`: `imdb_search` builder now routes advanced title searches through the Kometa IMDb Service (`POST /search/advanced`) instead of reaching IMDb GraphQL directly. The service runs a single paginated query server-side, caches results by constraint hash with a 1-day TTL, and returns the full ordered result list — eliminating client-side cursor pagination. Lookups with no fallback dataset (parental guide, charts, keywords, and now advanced search) degrade with a logged warning when the service is unavailable.
 - `modules/imdb.py`: IMDb-backed mass rating, genre, episode-rating, parental guide, chart, and keyword lookups now prefer the Kometa IMDb Service (`utilities.kometa.wiki/imdb-service`). If the service is unresponsive, Kometa logs the failure and falls back: ratings/genres/episode-ratings to the public IMDb TSV datasets (`title.ratings.tsv.gz`, `title.basics.tsv.gz`, `title.episode.tsv.gz`), parental guide/charts/keywords to GraphQL queries or HTML scraping.
 - Update requirements
 - `modules/imdb.py`: the `imdb_search` `interests:` catalog (interest name → IMDb `in########` id) is now fetched at runtime from `Kometa-Team/IMDb-Interests` (`INTERESTS.json`) and cached per run, with the bundled snapshot used only as a fallback when the fetch fails. This lets new IMDb interests become usable without a Kometa release. The bundled fallback is also refreshed from 211 to the current 313 interests, and the `imdb_search` Interests Options documentation table is refreshed to match and now points at `INTERESTS.json` as the authoritative source. A staged generator script and scheduled workflow (`.github/imdb-interests-repo-files/`) keep `INTERESTS.json` up to date in the IMDb-Interests repo.
