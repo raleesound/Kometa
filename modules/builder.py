@@ -1185,23 +1185,7 @@ class CollectionBuilder:
                 self.exclude_users = config.general["playlist_exclude_users"]
                 logger.info(f"Playlist Warning: exclude_users attribute not found defaulting to playlist_exclude_users: {self.exclude_users}")
 
-            plex_users = self.library.users + [self.library.account.username]
-
-            self.exclude_users = util.get_list(self.exclude_users) if self.exclude_users else []
-            for user in self.exclude_users:
-                if user not in plex_users:
-                    raise Failed(f"Playlist Error: User: {user} not found in plex\nOptions: {plex_users}")
-
-            if self.sync_to_users:
-                if str(self.sync_to_users) == "all":
-                    self.valid_users = [p for p in plex_users if p not in self.exclude_users]
-                else:
-                    user_list = self.sync_to_users if isinstance(self.sync_to_users, list) else util.get_list(self.sync_to_users)
-                    for user in user_list:
-                        if user not in plex_users:
-                            raise Failed(f"Playlist Error: User: {user} not found in plex\nOptions: {plex_users}")
-                        if user not in self.exclude_users:
-                            self.valid_users.append(user)
+            self._resolve_playlist_users()
 
             if "delete_playlist" in methods:
                 logger.debug("")
@@ -1889,10 +1873,7 @@ class CollectionBuilder:
                 self.obj = None
             if self.smart:
                 check_url = self.smart_url if self.smart_url else self.smart_label_url
-                if self.obj is not None:
-                    if check_url != self.library.smart_filter(self.obj):
-                        self.library.update_smart_collection(self.obj, check_url)
-                        logger.info(f"Metadata: Smart Collection updated to {check_url}")
+                self.update_smart_filter(check_url)
                 self.beginning_count = len(self.library.fetchItems(check_url)) if check_url else 0
             if self.obj is not None:
                 self.exists = True
@@ -5639,6 +5620,16 @@ class CollectionBuilder:
         # Plex returns None for childCount on genuinely-empty separator collections - treat as 0, not a TypeError (builder.py fix, 2026-07-30).
         return obj.childCount or 0
 
+    def update_smart_filter(self, check_url):
+        # An unresolved filter URL is never a valid target for an existing collection: a smart_label collection whose
+        # label isn't currently in Plex resolves to None, and build_smart_filter() turns that into the bogus
+        # `.../allNone` URI, wiping the collection's real filter (builder.py fix, 2026-10-06).
+        if self.obj is None or check_url is None:
+            return
+        if check_url != self.library.smart_filter(self.obj):
+            self.library.update_smart_collection(self.obj, check_url)
+            logger.info(f"Metadata: Smart Collection updated to {check_url}")
+
     @timings.timed("load_collection")
     def load_collection(self):
         if self.obj is None and self.smart_url:
@@ -6139,6 +6130,27 @@ class CollectionBuilder:
             self.deleted = True
         return output
 
+    def _resolve_playlist_users(self):
+        self.exclude_users = (util.get_list(self.exclude_users) or []) if self.exclude_users else []
+        if not self.sync_to_users and not self.exclude_users:
+            return
+
+        plex_users = self.library.users + [self.library.account.username]
+        for user in self.exclude_users:
+            if user not in plex_users:
+                raise Failed(f"Playlist Error: User: {user} not found in plex\nOptions: {plex_users}")
+
+        if self.sync_to_users:
+            if str(self.sync_to_users) == "all":
+                self.valid_users = [p for p in plex_users if p not in self.exclude_users]
+            else:
+                user_list = self.sync_to_users if isinstance(self.sync_to_users, list) else (util.get_list(self.sync_to_users) or [])
+                for user in user_list:
+                    if user not in plex_users:
+                        raise Failed(f"Playlist Error: User: {user} not found in plex\nOptions: {plex_users}")
+                    if user not in self.exclude_users:
+                        self.valid_users.append(user)
+
     def sync_playlist(self):
         if self.obj is not None and self.valid_users:
             logger.info("")
@@ -6154,7 +6166,7 @@ class CollectionBuilder:
                     logger.info(f"Playlist: {self.name} synced to {user}")
 
     def exclude_admin_from_playlist(self):
-        if self.obj is not None and (self.exclude_users is not None and self.library.account.username in self.exclude_users):
+        if self.obj is not None and (self.exclude_users and self.library.account.username in self.exclude_users):
             logger.info("")
             logger.separator("Excluding Admin from Playlist", space=False, border=False)
             logger.info("")

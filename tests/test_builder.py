@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextlib
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, PropertyMock
 
 import pytest
 from plexapi.exceptions import NotFound
@@ -1266,6 +1266,80 @@ class TestDelete:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# update_smart_filter
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestUpdateSmartFilter:
+    """Regression coverage for the "Metadata: Smart Collection updated to None" log line."""
+
+    @staticmethod
+    def _library(existing_filter):
+        library = MagicMock()
+        library.smart_filter.return_value = existing_filter
+        return library
+
+    def test_bug_smart_label_none_filter_does_not_overwrite_the_collection(self, monkeypatch):
+        """Regression for the "Metadata: Smart Collection updated to None" log line — a smart_label
+        collection resolves smart_label_url to None whenever its label isn't in Plex (e.g. the labelled
+        items are gone), and __init__ sent that None as the collection's new filter:
+        update_smart_collection(obj, None) -> build_smart_filter(None) -> `.../allNone`.
+        See CollectionBuilder.update_smart_filter() in modules/builder.py.
+        """
+        monkeypatch.setattr(builder_module, "logger", FakeLogger())
+        library = self._library("?label=Newly+Released&sort=random")
+        builder = make_builder(library=library, obj=SimpleNamespace(title="Newly Released"), smart_label_collection=True, smart_url=None, smart_label_url=None)
+
+        builder.update_smart_filter(None)
+
+        library.smart_filter.assert_not_called()
+        library.update_smart_collection.assert_not_called()
+
+    def test_unchanged_filter_is_not_rewritten(self, monkeypatch):
+        monkeypatch.setattr(builder_module, "logger", FakeLogger())
+        library = self._library("?label=Newly+Released&sort=random")
+        builder = make_builder(
+            library=library,
+            obj=SimpleNamespace(title="Newly Released"),
+            smart_label_collection=True,
+            smart_url=None,
+            smart_label_url="?label=Newly+Released&sort=random",
+        )
+
+        builder.update_smart_filter(builder.smart_label_url)
+
+        library.update_smart_collection.assert_not_called()
+
+    def test_changed_filter_updates_the_existing_collection(self, monkeypatch):
+        logger = FakeLogger()
+        monkeypatch.setattr(builder_module, "logger", logger)
+        library = self._library("?label=Newly+Released&sort=titleSort")
+        obj = SimpleNamespace(title="Newly Released")
+        builder = make_builder(
+            library=library,
+            obj=obj,
+            smart_label_collection=True,
+            smart_url=None,
+            smart_label_url="?label=Newly+Released&sort=random",
+        )
+
+        builder.update_smart_filter(builder.smart_label_url)
+
+        library.update_smart_collection.assert_called_once_with(obj, "?label=Newly+Released&sort=random")
+        assert logger.info_messages == ["Metadata: Smart Collection updated to ?label=Newly+Released&sort=random"]
+
+    def test_collection_that_does_not_exist_yet_is_skipped(self, monkeypatch):
+        monkeypatch.setattr(builder_module, "logger", FakeLogger())
+        library = self._library(None)
+        builder = make_builder(library=library, obj=None, smart_url="?label=Newly+Released&sort=random")
+
+        builder.update_smart_filter(builder.smart_url)
+
+        library.smart_filter.assert_not_called()
+        library.update_smart_collection.assert_not_called()
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # gather_ids
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1804,3 +1878,60 @@ class TestCollectionChildCount:
     def test_zero_childcount_stays_zero(self):
         obj = SimpleNamespace(childCount=0)
         assert CollectionBuilder._collection_child_count(obj) == 0
+
+
+@pytest.mark.parametrize("sync_to_users", [None, False, "", []])
+@pytest.mark.parametrize("exclude_users", [None, False, "", []])
+def test_owner_only_playlist_skips_cloud_user_discovery(sync_to_users, exclude_users):
+    library = MagicMock()
+    account = PropertyMock(side_effect=AssertionError("Unexpected plex.tv account lookup"))
+    users = PropertyMock(side_effect=AssertionError("Unexpected plex.tv user lookup"))
+    type(library).account = account
+    type(library).users = users
+    builder = make_builder(playlist=True, library=library, sync_to_users=sync_to_users, exclude_users=exclude_users, valid_users=[])
+
+    builder._resolve_playlist_users()
+    builder.obj = SimpleNamespace(title="Owner Playlist")
+    builder.sync_playlist()
+    builder.exclude_admin_from_playlist()
+
+    assert builder.valid_users == []
+    assert builder.exclude_users == []
+    account.assert_not_called()
+    users.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("sync_to_users", "exclude_users", "expected"),
+    [("all", "Guest", ["Owner"]), (["Guest", "Owner"], ["Owner"], ["Guest"]), ("Guest", None, ["Guest"]), (False, "Guest", [])],
+)
+def test_playlist_user_resolution_preserves_sync_and_exclusions(sync_to_users, exclude_users, expected):
+    library = SimpleNamespace(users=["Guest"], account=SimpleNamespace(username="Owner"))
+    builder = make_builder(playlist=True, library=library, sync_to_users=sync_to_users, exclude_users=exclude_users, valid_users=[])
+
+    builder._resolve_playlist_users()
+
+    assert builder.valid_users == expected
+    assert builder.exclude_users == ([exclude_users] if isinstance(exclude_users, str) else exclude_users or [])
+
+
+@pytest.mark.parametrize(("sync_to_users", "exclude_users"), [("Missing", None), (False, "Missing")])
+def test_playlist_user_resolution_still_rejects_unknown_users(sync_to_users, exclude_users):
+    library = SimpleNamespace(users=["Guest"], account=SimpleNamespace(username="Owner"))
+    builder = make_builder(playlist=True, library=library, sync_to_users=sync_to_users, exclude_users=exclude_users, valid_users=[])
+
+    with pytest.raises(Failed, match="User: Missing not found in plex"):
+        builder._resolve_playlist_users()
+
+
+def test_playlist_owner_exclusion_still_deletes_owner_playlist(monkeypatch):
+    monkeypatch.setattr(builder_module, "logger", FakeLogger())
+    library = SimpleNamespace(users=["Guest"], account=SimpleNamespace(username="Owner"), delete=MagicMock())
+    playlist = SimpleNamespace(title="Excluded Playlist")
+    builder = make_builder(playlist=True, library=library, obj=playlist, sync_to_users="all", exclude_users="Owner", valid_users=[])
+
+    builder._resolve_playlist_users()
+    builder.exclude_admin_from_playlist()
+
+    assert builder.valid_users == ["Guest"]
+    library.delete.assert_called_once_with(playlist)
