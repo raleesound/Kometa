@@ -69,6 +69,7 @@ search_translation = {
     "user_rating": "userRating",
     "episode_user_rating": "episode.userRating",
     "content_rating": "contentRating",
+    "commonsense_rating": "contentRatingAge",
     "episode_year": "episode.year",
     "release": "originallyAvailableAt",
     "show_unmatched": "show.unmatched",
@@ -547,7 +548,7 @@ date_attributes = [
 ]
 date_modifiers = ["", ".not", ".before", ".after"]
 year_attributes = ["decade", "year", "episode_year", "album_year", "album_decade"]
-number_attributes = ["plays", "episode_plays", "album_plays", "track_plays", "track_skips"] + year_attributes
+number_attributes = ["plays", "episode_plays", "album_plays", "track_plays", "track_skips", "commonsense_rating"] + year_attributes
 number_modifiers = [".gt", ".gte", ".lt", ".lte"]
 float_attributes = ["user_rating", "episode_user_rating", "critic_rating", "episode_critic_rating", "audience_rating", "episode_audience_rating", "duration", "artist_user_rating", "album_user_rating", "album_critic_rating", "track_user_rating"]
 float_modifiers = number_modifiers + [".rated"]
@@ -600,6 +601,7 @@ searches = (
     + [f"{f}{m}" for f in tag_attributes + year_attributes for m in tag_modifiers if f not in no_not_mods or m != ".not"]
     + [f"{f}{m}" for f in date_attributes for m in date_modifiers]
     + [f"{f}{m}" for f in number_attributes for m in number_modifiers if f not in no_not_mods]
+    + ["commonsense_rating"]
     + [f"{f}{m}" for f in float_attributes for m in float_modifiers if f != "duration" or m != ".rated"]
 )
 music_searches = [a for a in searches if a.startswith(("artist", "album", "track"))]
@@ -2366,7 +2368,8 @@ class Plex(Library):
                     if season_poster:
                         found_season = True
                     elif self.show_missing_season_assets and season.seasonNumber and season.seasonNumber > 0:
-                        missing_seasons += f"\nMissing Season {season.seasonNumber} Poster"
+                        paths = self.asset_search_paths(season, item_dir, name, asset_directory)
+                        missing_seasons += f"\nMissing Season {season.seasonNumber} Poster [{paths}]"
                     if season_poster or season_background or season_logo or season_square_art:
                         has_season_overlay = "Overlay" in [la.tag for la in self.item_labels(season)]
                         self.upload_images(season, poster=None if has_season_overlay else season_poster, background=season_background, logo=season_logo, square_art=season_square_art)
@@ -2382,7 +2385,8 @@ class Plex(Library):
                                 has_episode_overlay = "Overlay" in [la.tag for la in self.item_labels(episode)]
                                 self.upload_images(episode, poster=None if has_episode_overlay else episode_poster, background=episode_background, logo=episode_logo, square_art=episode_square_art)
                             elif self.show_missing_episode_assets:
-                                missing_episodes += f"\nMissing {episode.seasonEpisode.upper()} Title Card"
+                                paths = self.asset_search_paths(episode, item_dir, name, asset_directory)
+                                missing_episodes += f"\nMissing {episode.seasonEpisode.upper()} Title Card [{paths}]"
                     except Failed as e:
                         if self.show_missing_assets:
                             logger.warning(e)
@@ -2397,7 +2401,8 @@ class Plex(Library):
                     if album_poster or album_background:
                         found_album = True
                     elif self.show_missing_season_assets:
-                        missing_assets += f"\nMissing Album {album.title} Poster"
+                        paths = self.asset_search_paths(album, item_dir, name, asset_directory)
+                        missing_assets += f"\nMissing Album {album.title} Poster [{paths}]"
                     if album_poster or album_background or album_square_art:
                         self.upload_images(album, poster=album_poster, background=album_background, square_art=album_square_art)
                 except Failed as e:
@@ -2405,6 +2410,29 @@ class Plex(Library):
                         logger.warning(e)
             if self.show_missing_season_assets and found_album and missing_assets:
                 logger.info(f"Missing Album Posters for {item.title}{missing_assets}")
+
+    def asset_search_paths(self, item, item_dir=None, folder_name=None, asset_directory=None, folders_only=False):
+        """Describe the configured artwork search locations without querying Plex or the filesystem."""
+        directories = self.asset_directory if asset_directory is None else asset_directory
+        if item_dir:
+            directories = [item_dir]
+        elif self.asset_folders and folder_name is not None:
+            directories = [os.path.join(ad, *(["*"] * depth), folder_name) for ad in directories for depth in range(self.asset_depth + 1)]
+        if folders_only:
+            return ", ".join(directories)
+
+        if isinstance(item, Season):
+            file_name = f"Season{item.seasonNumber or 0:02}"
+        elif isinstance(item, Episode):
+            file_name = item.seasonEpisode.upper()
+        elif isinstance(item, Album):
+            file_name = item.title
+        else:
+            file_name = "poster"
+        if not self.asset_folders:
+            file_name = folder_name if file_name == "poster" else f"{folder_name}_{file_name}"
+        names = ["poster", "cover", "default", "folder", "movie"] if self.asset_folders and file_name == "poster" else [file_name]
+        return ", ".join(os.path.join(ad, f"{name}.*") for ad in directories for name in names)
 
     def find_item_assets(self, item, item_asset_directory=None, asset_directory=None, folder_name=None):
         poster = None
@@ -2479,7 +2507,8 @@ class Plex(Library):
                         os.makedirs(item_asset_directory, exist_ok=True)
                         logger.warning(f"Asset Warning: Asset Directory Not Found and Created: {item_asset_directory}")
                     else:
-                        raise Failed(f"Asset Warning: Unable to find asset folder: '{folder_name}'")
+                        paths = self.asset_search_paths(item, folder_name=folder_name, asset_directory=asset_directory, folders_only=True)
+                        raise Failed(f"Asset Warning: Unable to find asset folder: '{folder_name}' [{paths}]")
                 return None, None, None, None, item_asset_directory, folder_name
 
         if file_name == "poster":
