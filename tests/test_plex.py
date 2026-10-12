@@ -2188,7 +2188,7 @@ def test_collection_file_asset_override_reaches_both_metadata_scans(monkeypatch,
     constructor = MagicMock(return_value=metadata)
     monkeypatch.setattr(library_module, "MetadataFile", constructor)
     library = make_plex(
-        config=SimpleNamespace(),
+        config=SimpleNamespace(run_items=None),
         configured_collection_files=[entry],
         scanned_collection_files=[entry],
         configured_collection_metadata_files=[],
@@ -2198,8 +2198,8 @@ def test_collection_file_asset_override_reaches_both_metadata_scans(monkeypatch,
     )
     library.scan_files(False, False, True, False)
     assert constructor.call_count == 2
-    for call in constructor.call_args_list:
-        assert call.args[5] == entry[3]
+    for c in constructor.call_args_list:
+        assert c.args[5] == entry[3]
     assert constructor.call_args_list[0].kwargs["configured_names_only"] is True
     assert library.collection_names == ["Test"]
     assert library.collections == ["Test"]
