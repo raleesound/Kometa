@@ -23,6 +23,7 @@ class Library(ABC):
         self.session = None
         self.Radarr = None
         self.Sonarr = None
+        self.Lidarr = None
         self.Tautulli = None
         self.Tracearr = None
         self.Webhooks = None
@@ -140,6 +141,8 @@ class Library(ABC):
         self.radarr_remove_by_tag = params["radarr_remove_by_tag"]
         self.sonarr_add_all_existing = params["sonarr_add_all_existing"]
         self.sonarr_remove_by_tag = params["sonarr_remove_by_tag"]
+        self.lidarr_add_all_existing = params["lidarr_add_all_existing"]
+        self.lidarr_remove_by_tag = params["lidarr_remove_by_tag"]
         self.update_blank_track_titles = params["update_blank_track_titles"]
         self.remove_title_parentheses = params["remove_title_parentheses"]
         self.remove_overlays = params["remove_overlays"]
@@ -161,6 +164,7 @@ class Library(ABC):
             "removed": 0,
             "radarr": 0,
             "sonarr": 0,
+            "lidarr": 0,
             "names": [],
         }
         self.status = {}
@@ -187,6 +191,7 @@ class Library(ABC):
             or self.mass_studio_update
             or self.radarr_add_all_existing
             or self.sonarr_add_all_existing
+            or self.lidarr_add_all_existing
             or self.mass_poster_update
             or self.mass_background_update
             or self.mass_logo_update
@@ -201,6 +206,7 @@ class Library(ABC):
             or self.mass_collection_mode
             or self.radarr_remove_by_tag
             or self.sonarr_remove_by_tag
+            or self.lidarr_remove_by_tag
             or self.show_unmanaged
             or self.show_unconfigured
             or self.metadata_backup
