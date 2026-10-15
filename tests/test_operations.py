@@ -1331,7 +1331,7 @@ def test_random_rating_source(monkeypatch, field, episode, draw, expected, retry
         randint = MagicMock(return_value=draw)
     monkeypatch.setattr(ops_module.random, "randint", randint)
 
-    Operations(config=MagicMock(), library=library).run_operations()
+    Operations(config=make_config(), library=library).run_operations()
 
     assert randint.call_count == (3 if retry else 1)
     assert all(call.args == (0, 100) for call in randint.call_args_list)
