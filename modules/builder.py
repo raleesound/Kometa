@@ -17,6 +17,7 @@ from modules import (
     add_budget,
     anidb,
     anilist,
+    apple_chart,
     flicklist,
     floppy,
     icheckmovies,
@@ -32,6 +33,7 @@ from modules import (
     serializd,
     simkl,
     sonarr,
+    spotify_chart,
     stevenlu,
     tautulli,
     textfile,
@@ -53,11 +55,20 @@ logger = util.logger
 
 mdb_list_arr_types = {"radarr_taglist": "tmdb", "sonarr_taglist": "tmdb_show"}
 lastfm_track_builders = ("lastfm_user_top_tracks", "lastfm_user_loved_tracks", "lastfm_user_recent_tracks", "lastfm_chart_top_tracks")
-ytmusic_track_builders = ("ytmusic_list",)
+ytmusic_track_builders = ("ytmusic_list", *spotify_chart.builders)
 
 
-def _default_music_level(methods):
+def _default_music_level(methods, data=None):
+    data = data or {}
+    for method in ("apple_chart", "itunes_chart"):
+        if method in methods:
+            chart = data.get(methods[method])
+            if isinstance(chart, dict) and str(chart.get("type", "track")).lower() == "album":
+                return "album"
+            return "track"
     if "lastfm_user_top_albums" in methods:
+        return "album"
+    if "tautulli_top" in methods or "tautulli_watched" in methods:
         return "album"
     if any(method in methods for method in (*lastfm_track_builders, *ytmusic_track_builders)):
         return "track"
@@ -160,6 +171,8 @@ all_builders = (
     + lidarr.builders
     + lastfm.builders
     + ytmusic.builders
+    + spotify_chart.builders
+    + apple_chart.builders
     + flicklist.builders
     + wetrakr.builders
 )
@@ -207,7 +220,7 @@ movie_only_builders = [
     "mojo_all_time",
     "mojo_never",
 ]
-music_only_builders = ["item_album_sorting", *lidarr.builders, *lastfm.builders, *ytmusic.builders]
+music_only_builders = ["item_album_sorting", *lidarr.builders, *lastfm.builders, *ytmusic.builders, *spotify_chart.builders, *apple_chart.builders]
 summary_details = [
     "summary",
     "tmdb_summary",
@@ -410,7 +423,7 @@ sonarr_details = [
     "item_sonarr_tag",
     "sonarr_ignore_cache",
 ]
-album_details = ["non_item_remove_label", "item_label", "item_album_sorting"]
+album_details = ["non_item_remove_label", "item_album_sorting"]
 sub_filters = [
     "filepath",
     "audio_track_title",
@@ -646,6 +659,8 @@ smart_url_invalid = (
 custom_sort_builders = [
     *lastfm.builders,
     *ytmusic.builders,
+    *spotify_chart.builders,
+    *apple_chart.builders,
     "plex_search",
     "plex_watchlist",
     "plex_pilots",
@@ -710,8 +725,7 @@ custom_sort_builders = [
     "tracearr_watch_time",
     "tracearr_in_progress",
     "tracearr_watched_media",
-    "tautulli_popular",
-    "tautulli_watched",
+    *tautulli.builders,
     "mdblist_list",
     "letterboxd_list",
     *letterboxd.semantic_builders,
@@ -791,7 +805,10 @@ parts_collection_valid = (
         "lastfm_user_tags",
         "lastfm_tag_charts",
         "lastfm_chart_top_tracks",
+        *tautulli.music_builders,
         *ytmusic.builders,
+        *spotify_chart.builders,
+        *apple_chart.builders,
         "collection_filtering",
         "collection_mode",
         "label",
@@ -837,6 +854,9 @@ parts_collection_valid = (
 )
 playlist_attributes = (
     [
+        "smart_filter",
+        "smart_label",
+        "smart_url",
         "filters",
         "name_mapping",
         "show_filtered",
@@ -857,6 +877,9 @@ playlist_attributes = (
         "default_percent",
     ]
     + custom_sort_builders
+    + lidarr.builders
+    + ["plex_all", "plex_id", "plex_rating_key"]
+    + tautulli.music_builders
     + summary_details
     + poster_details
     + radarr_details
@@ -864,6 +887,9 @@ playlist_attributes = (
 )
 music_attributes = (
     [
+        "smart_filter",
+        "smart_label",
+        "smart_url",
         "asset_directory",
         "non_item_remove_label",
         "item_label",
@@ -888,6 +914,9 @@ music_attributes = (
     + lidarr.builders
     + lastfm.builders
     + ytmusic.builders
+    + spotify_chart.builders
+    + apple_chart.builders
+    + tautulli.music_builders
 )
 
 
@@ -903,7 +932,12 @@ class CollectionBuilder:
             raise BuilderValidationError("Playlist Error: No libraries were processed this run to use as the playlist default")
         return libraries
 
-    def __init__(self, config, metadata, name, data, library=None, overlay=None, extra=None):
+    def _warn_smart_playlist_album_tracks(self):
+        if self.music_playlist_smart and not getattr(self, "smart_playlist_album_warning", False):
+            logger.warning("Playlist Warning: Smart Playlists do not support albums; the underlying tracks have been added instead")
+            self.smart_playlist_album_warning = True
+
+    def __init__(self, config, metadata, name, data, library=None, overlay=None, extra=None, music_playlist=False):
         self.config = config
         self.metadata = metadata
         self.mapping_name = name
@@ -912,9 +946,15 @@ class CollectionBuilder:
         self.libraries = []
         self.summaries = {}
         self.is_playlist = False
-        self.playlist = library is None
-        self.overlay = overlay
+        self.music_playlist = music_playlist
         methods = {m.lower(): m for m in self.data}
+        self.music_playlist_smart = self.music_playlist and any(method in methods for method in ["smart_filter", "smart_label", "smart_url"])
+        self.smart_playlist_album_warning = False
+        self.smart_url_builder = False
+        if self.music_playlist_smart and sum(method in methods for method in ["smart_filter", "smart_label", "smart_url"]) > 1:
+            raise BuilderValidationError("Playlist Error: Use only one of smart_filter, smart_label, or smart_url in a music playlist")
+        self.playlist = library is None or music_playlist
+        self.overlay = overlay
         if self.playlist:
             self.type = "playlist"
         elif self.overlay:
@@ -1128,18 +1168,23 @@ class CollectionBuilder:
         if not self.name:
             self.name = self.mapping_name
 
-        if self.library and self.name not in self.library.collections:
+        if self.library and not self.playlist and self.name not in self.library.collections:
             self.library.collections.append(self.name)
 
         if self.playlist:
             logger.debug("")
             logger.debug("Validating Method: libraries")
-            playlist_libraries = self._playlist_libraries(config, self.data, methods)
-            logger.debug(f"Value: {', '.join(playlist_libraries)}")
-            for pl_library in playlist_libraries:
-                if str(pl_library) not in config.library_map:
-                    raise BuilderValidationError(f"Playlist Error: Library '{pl_library}' not defined. Libraries must be defined within `libraries` section of Configuration File to be usable with playlists")
-                self.libraries.append(config.library_map[pl_library])
+            if self.music_playlist:
+                if not self.library.is_music:
+                    raise BuilderValidationError("Playlist Error: music_playlists can only be used with a Music library")
+                self.libraries.append(self.library)
+            else:
+                playlist_libraries = self._playlist_libraries(config, self.data, methods)
+                logger.debug(f"Value: {', '.join(playlist_libraries)}")
+                for pl_library in playlist_libraries:
+                    if str(pl_library) not in config.library_map:
+                        raise BuilderValidationError(f"Playlist Error: Library '{pl_library}' not defined. Libraries must be defined within `libraries` section of Configuration File to be usable with playlists")
+                    self.libraries.append(config.library_map[pl_library])
             self.library = self.libraries[0]
 
         try:
@@ -1208,7 +1253,9 @@ class CollectionBuilder:
                         options = "\n    album (Collection at the Album Level)\n    track (Collection at the Track Level)"
                     raise BuilderValidationError(f"{self.Type} Error: builder_level '{self.data[methods['builder_level']]}' is invalid. Options: {options}")
         elif self.library.is_music:
-            self.builder_level = _default_music_level(methods)
+            self.builder_level = _default_music_level(methods, self.data)
+        if self.music_playlist_smart and self.library.is_music and self.builder_level == "album":
+            self._warn_smart_playlist_album_tracks()
         self.parts_collection = self.builder_level in plex.builder_level_options
 
         self.posters = {}
@@ -1247,27 +1294,31 @@ class CollectionBuilder:
         self.exclude_users = None
         self.valid_users = []
         if self.playlist:
-            if "sync_to_users" in methods or "sync_to_user" in methods:
-                s_attr = f"sync_to_user{'s' if 'sync_to_users' in methods else ''}"
-                logger.debug("")
-                logger.debug(f"Validating Method: {s_attr}")
-                logger.debug(f"Value: {self.data[methods[s_attr]]}")
-                self.sync_to_users = self.data[methods[s_attr]]
+            if self.music_playlist_smart:
+                self.sync_to_users = None
+                self.exclude_users = None
             else:
-                self.sync_to_users = config.general["playlist_sync_to_users"]
-                logger.info(f"Playlist Warning: sync_to_users attribute not found defaulting to playlist_sync_to_users: {self.sync_to_users}")
+                if "sync_to_users" in methods or "sync_to_user" in methods:
+                    s_attr = f"sync_to_user{'s' if 'sync_to_users' in methods else ''}"
+                    logger.debug("")
+                    logger.debug(f"Validating Method: {s_attr}")
+                    logger.debug(f"Value: {self.data[methods[s_attr]]}")
+                    self.sync_to_users = self.data[methods[s_attr]]
+                else:
+                    self.sync_to_users = config.general["playlist_sync_to_users"]
+                    logger.info(f"Playlist Warning: sync_to_users attribute not found defaulting to playlist_sync_to_users: {self.sync_to_users}")
 
-            if "exclude_users" in methods or "exclude_user" in methods:
-                s_attr = f"exclude_user{'s' if 'exclude_users' in methods else ''}"
-                logger.debug("")
-                logger.debug(f"Validating Method: {s_attr}")
-                logger.debug(f"Value: {self.data[methods[s_attr]]}")
-                self.exclude_users = self.data[methods[s_attr]]
-            elif config.general["playlist_exclude_users"]:
-                self.exclude_users = config.general["playlist_exclude_users"]
-                logger.info(f"Playlist Warning: exclude_users attribute not found defaulting to playlist_exclude_users: {self.exclude_users}")
+                if "exclude_users" in methods or "exclude_user" in methods:
+                    s_attr = f"exclude_user{'s' if 'exclude_users' in methods else ''}"
+                    logger.debug("")
+                    logger.debug(f"Validating Method: {s_attr}")
+                    logger.debug(f"Value: {self.data[methods[s_attr]]}")
+                    self.exclude_users = self.data[methods[s_attr]]
+                elif config.general["playlist_exclude_users"]:
+                    self.exclude_users = config.general["playlist_exclude_users"]
+                    logger.info(f"Playlist Warning: exclude_users attribute not found defaulting to playlist_exclude_users: {self.exclude_users}")
 
-            self._resolve_playlist_users()
+                self._resolve_playlist_users()
 
             if "delete_playlist" in methods:
                 logger.debug("")
@@ -1321,11 +1372,13 @@ class CollectionBuilder:
         self.held_back_sonarr = []
         self.budget_blockers = []
         self.builders = []
+        self.spotify_chart_order = {}
         self.filters = []
         self.value_filters = []
         self.has_tmdb_filters = False
         self.has_imdb_filters = False
         self.found_items = []
+        self.found_item_keys = set()
         self.filtered_items = []
         self.filtered_keys = {}
         self.run_again_movies = []
@@ -1643,7 +1696,9 @@ class CollectionBuilder:
 
         self.smart_url = None
         self.smart_type_key = None
-        if "smart_url" in methods and not self.playlist and not self.overlay:
+        self.smart_filter_result_type = None
+        self.smart_label_url = None
+        if "smart_url" in methods and (not self.playlist or self.music_playlist) and not self.overlay:
             logger.debug("")
             logger.debug("Validating Method: smart_url")
             if not self.data[methods["smart_url"]]:
@@ -1652,10 +1707,13 @@ class CollectionBuilder:
                 logger.debug(f"Value: {self.data[methods['smart_url']]}")
                 try:
                     self.smart_url, self.smart_type_key = self.library.get_smart_filter_from_uri(self.data[methods["smart_url"]])
+                    self.smart_url_builder = True
+                    if self.music_playlist_smart and self.smart_type_key == plex.sort_types["album"][1]:
+                        self._warn_smart_playlist_album_tracks()
                 except ValueError:
                     raise BuilderValidationError(f"{self.Type} Error: 'smart_url' attribute is incorrectly formatted")
 
-        if "smart_filter" in methods and not self.playlist and not self.overlay:
+        if "smart_filter" in methods and (not self.playlist or self.music_playlist) and not self.overlay:
             try:
                 self.smart_type_key, self.smart_filter_details, self.smart_url = self.build_filter("smart_filter", self.data[methods["smart_filter"]], display=True, default_sort="random")
             except FilterFailed as e:
@@ -1663,6 +1721,22 @@ class CollectionBuilder:
                     raise
                 else:
                     raise Failed(str(e))
+
+        if "smart_label" in methods and self.music_playlist:
+            self.smart_label = {"sort_by": "random", "all": {"label": [self.name]}}
+            label_data = self.data[methods["smart_label"]]
+            if isinstance(label_data, dict):
+                self.smart_label = label_data
+                if "label" in self.smart_label:
+                    _data, replaced = util.replace_label(self.name, self.smart_label)
+                    if not replaced:
+                        raise BuilderValidationError("Playlist Error: <<smart_label>> not found in the smart_label attribute data")
+                    self.smart_label = _data
+            elif isinstance(label_data, str) and label_data.lower() in plex.sort_types["track"][2]:
+                self.smart_label["sort_by"] = label_data.lower()
+            elif label_data:
+                logger.warning(f"Playlist Warning: smart_label '{label_data}' is invalid, defaulting to random sort and the playlist name label")
+            self.smart_type_key, self.smart_filter_details, self.smart_url = self.build_filter("smart_label", self.smart_label, display=True, default_sort="random")
 
         if self.collectionless:
             for x in ["smart_label", "smart_filter", "smart_url"]:
@@ -1679,10 +1753,13 @@ class CollectionBuilder:
         if self.smart_url and self.smart_label_collection:
             raise BuilderValidationError(f"{self.Type} Error: 'smart_filter' is not compatible with 'smart_label'")
 
-        if self.parts_collection and "smart_url" in methods:
+        if self.parts_collection and self.smart_url_builder:
             raise BuilderValidationError(f"{self.Type} Error: 'smart_url' is not compatible with builder_level '{self.builder_level}'")
 
-        self.smart = self.smart_url or self.smart_label_collection
+        self.smart = bool(self.smart_url) or self.smart_label_collection
+        if self.music_playlist_smart:
+            self.minimum = 0
+            self.build_collection = True
 
         test_sort = None
         if "collection_order" in methods and not self.playlist and self.build_collection:
@@ -1744,12 +1821,20 @@ class CollectionBuilder:
             logger.debug(f"Validating Method: {method_key}")
             logger.debug(f"Value: {method_data}")
             try:
+                if self.music_playlist_smart and method_name in ["smart_filter", "smart_label", "smart_url"]:
+                    continue
                 if method_data is None and method_name in all_builders + plex.searches and method_final not in none_builders:
                     raise BuilderValidationError(f"{self.Type} Error: '{method_final}' attribute is blank")
                 elif method_data is None and method_final not in none_details:
                     logger.warning(f"Collection Warning: '{method_final}' attribute is blank")
                 elif self.playlist and method_name not in playlist_attributes:
                     raise BuilderValidationError(f"{self.Type} Error: '{method_final}' attribute not compatible with playlists")
+                elif self.playlist and not self.music_playlist and method_name in ["smart_filter", "smart_label", "smart_url"]:
+                    raise BuilderValidationError(f"{self.Type} Error: '{method_final}' is only supported for music_playlists")
+                elif self.music_playlist_smart and method_name in all_builders:
+                    raise BuilderValidationError(f"Playlist Error: A music smart playlist cannot combine {method_final} with its smart filter")
+                elif self.music_playlist_smart and method_name in ["build_collection", "minimum_items", "delete_below_minimum", "ignore_blank_results", "collection_order"]:
+                    raise BuilderValidationError(f"Playlist Error: '{method_final}' is not supported for smart playlists")
                 elif not self.config.FlickList and "flicklist" in method_name:
                     raise ServiceError(f"{self.Type} Error: '{method_final}' requires FlickList to be configured")
                 elif not self.config.WeTrakr and "wetrakr" in method_name:
@@ -1798,7 +1883,7 @@ class CollectionBuilder:
                     raise BuilderValidationError(f"{self.Type} Error: '{method_final}' attribute only allowed with smart collections")
                 elif self.collectionless and method_name not in collectionless_details:
                     raise BuilderValidationError(f"{self.Type} Error: '{method_final}' attribute not allowed for 'collectionless' collection")
-                elif self.smart_url and method_name in all_builders + smart_url_invalid:
+                elif self.smart_url_builder and method_name in all_builders + smart_url_invalid:
                     raise BuilderValidationError(f"{self.Type} Error: '{method_final}' builder not allowed when using 'smart_filter'")
                 elif not self.overlay and method_name in overlay_only:
                     raise BuilderValidationError(f"{self.Type} Error: '{method_final}' attribute only allowed in an Overlay File")
@@ -1828,6 +1913,10 @@ class CollectionBuilder:
                     self._lastfm(method_name, method_data)
                 elif method_name in ytmusic.builders:
                     self._ytmusic(method_name, method_data)
+                elif method_name in spotify_chart.builders:
+                    self.builders.append((method_name, spotify_chart.SpotifyChart.validate(method_data)))
+                elif method_name in apple_chart.builders:
+                    self.builders.append((method_name, apple_chart.validate(method_name, method_data)))
                 elif method_name in anidb.builders:
                     self._anidb(method_name, method_data)
                 elif method_name in anilist.builders:
@@ -1916,7 +2005,8 @@ class CollectionBuilder:
                 self.details["label"] = append_labels
 
         if not self.server_preroll and not self.smart_url and not self.blank_collection and len(self.builders) == 0:
-            raise BuilderValidationError(f"{self.Type} Error: No builders were found")
+            if not self.music_playlist_smart:
+                raise BuilderValidationError(f"{self.Type} Error: No builders were found")
 
         if self.blank_collection and len(self.builders) > 0:
             raise BuilderValidationError(f"{self.Type} Error: No builders allowed with blank_collection")
@@ -1962,24 +2052,36 @@ class CollectionBuilder:
 
         if self.smart_url:
             self.sync = False
+        if self.music_playlist_smart:
+            self.sync = False
 
         self.do_report = not self.config.no_report and (self.details["save_report"])
         self.do_missing = not self.config.no_missing and (self.details["show_missing"] or self.do_report or (self.library.Radarr and self.radarr_details["add_missing"]) or (self.library.Sonarr and self.sonarr_details["add_missing"]))
-        if self.build_collection:
+        if self.build_collection or self.music_playlist_smart:
             if self.obj is not None and ((self.smart and not self.obj.smart) or (not self.smart and self.obj.smart)):
                 logger.info("")
-                logger.error(f"{self.Type} Error: Converting {self.obj.title} to a {'smart' if self.smart else 'normal'} collection")
+                logger.error(f"{self.Type} Error: Converting {self.obj.title} to a {'smart' if self.smart else 'normal'} {'playlist' if self.playlist else 'collection'}")
                 self.library.delete(self.obj)
                 self.obj = None
             if self.smart:
                 check_url = self.smart_url if self.smart_url else self.smart_label_url
-                self.update_smart_filter(check_url)
-                self.beginning_count = len(self.library.fetchItems(check_url)) if check_url else 0
+                if self.music_playlist:
+                    check_filter = check_url[check_url.index("?") :] if check_url and "?" in check_url else check_url
+                    if self.obj is not None and check_filter != self.library.smart_playlist_filter(self.obj):
+                        self.library.update_smart_playlist(self.obj, check_url)
+                        logger.info(f"Metadata: Smart Playlist updated to {check_url}")
+                    if check_url:
+                        self.beginning_count = self._music_playlist_result_count(check_url)
+                    if self.obj is not None:
+                        self.exists = True
+                else:
+                    self.update_smart_filter(check_url)
+                    self.beginning_count = len(self.library.fetchItems(check_url)) if check_url else 0
             if self.obj is not None:
                 self.exists = True
-                if self.sync or self.playlist:
+                if (self.sync or self.playlist) and not self.music_playlist_smart:
                     self._remove_item_map = self._resolve_remove_item_map()
-                if not self.smart:
+                if not self.smart and not self.music_playlist_smart:
                     self.beginning_count = len(self.remove_item_map) if self.playlist else self._collection_child_count(self.obj)
         else:
             self.obj = None
@@ -3550,7 +3652,7 @@ class CollectionBuilder:
                 dict_methods = {dm.lower(): dm for dm in dict_data}
                 if method_name == "plex_search":
                     try:
-                        self.builders.append((method_name, dict_data if self.playlist else self.build_filter("plex_search", dict_data)))
+                        self.builders.append((method_name, self.build_filter("plex_search", dict_data) if self.music_playlist or not self.playlist else dict_data))
                     except FilterFailed as e:
                         if self.ignore_blank_results:
                             raise
@@ -3597,7 +3699,7 @@ class CollectionBuilder:
         for dict_data in util.parse(self.Type, method_name, method_data, datatype="listdict"):
             dict_methods = {dm.lower(): dm for dm in dict_data}
             final_dict = {
-                "list_type": "popular" if method_name == "tautulli_popular" else "watched",
+                "list_type": tautulli.builder_types[method_name],
                 "list_days": util.parse(
                     self.Type,
                     "list_days",
@@ -3625,6 +3727,7 @@ class CollectionBuilder:
                     default=0,
                     parent=method_name,
                 ),
+                "builder_level": ("track" if self.playlist else self.builder_level) if self.library.is_music else None,
             }
             buff = final_dict["list_size"] * 3
             if self.library.Tautulli.has_section:
@@ -4175,6 +4278,14 @@ class CollectionBuilder:
                     ids = self.config.YouTubeMusic.get_rating_keys(value, self.library)
                 elif method == "ytmusic_top_artists":
                     ids = self.config.YouTubeMusic.get_top_artists(value, self.library)
+            elif method in spotify_chart.builders:
+                spotify_builder = spotify_chart.SpotifyChart()
+                ids = spotify_builder.get_rating_keys(value, self.library)
+                self.spotify_chart_order.update(spotify_builder.chart_order)
+            elif method in apple_chart.builders:
+                chart_builder = apple_chart.MusicChart(method)
+                ids = chart_builder.get_rating_keys(value, self.library)
+                self.spotify_chart_order.update(chart_builder.chart_order)
             else:
                 ids = []
                 logger.error(f"{self.Type} Error: {method} method not supported")
@@ -4515,6 +4626,9 @@ class CollectionBuilder:
         total = len(items)
         max_length = len(str(total))
         found_before = len(self.found_items)
+        # PlexPartialObject equality compares metadata keys. Reuse the index
+        # across builder entries; the ordered list remains the source of output.
+        found_item_keys = self.found_item_keys
         if self.filters and (self.details["show_filtered"] is True or self.details["show_unfiltered"] is True):
             logger.info("")
             logger.info("Filtering Builders:")
@@ -4524,7 +4638,7 @@ class CollectionBuilder:
         if mdb_value_filters:
             value_filter_items = []
             for i, item in enumerate(items, 1):
-                if not isinstance(item, (Movie, Show, Season, Episode, Artist, Album, Track)) or item in self.found_items or item.ratingKey in self.filtered_keys:
+                if not isinstance(item, (Movie, Show, Season, Episode, Artist, Album, Track)) or item.key in found_item_keys or item.ratingKey in self.filtered_keys:
                     continue
                 passed = self.check_filters(item, f"{(' ' * (max_length - len(str(i))))}{i}/{total}")
                 standard_filter_results[item.ratingKey] = passed
@@ -4535,7 +4649,7 @@ class CollectionBuilder:
             if not isinstance(item, (Movie, Show, Season, Episode, Artist, Album, Track)):
                 logger.error(f"{self.Type} Error: Item: {item} is an invalid type")
                 continue
-            if item not in self.found_items:
+            if item.key not in found_item_keys:
                 if item.ratingKey in self.filtered_keys:
                     if self.details["show_filtered"] is True:
                         logger.info(f"{name} {self.Type} | X | {self.filtered_keys[item.ratingKey]}")
@@ -4544,6 +4658,7 @@ class CollectionBuilder:
                     standard_filters_passed = standard_filter_results[item.ratingKey] if mdb_value_filters else self.check_filters(item, f"{(' ' * (max_length - len(str(i))))}{i}/{total}")
                     if standard_filters_passed and self.check_value_filter(item):
                         self.found_items.append(item)
+                        found_item_keys.add(item.key)
                         if self.details["show_unfiltered"] is True:
                             logger.info(f"{name} {self.Type} | = | {current_title}")
                     else:
@@ -4576,13 +4691,15 @@ class CollectionBuilder:
         if "any" in filter_alias and "all" in filter_alias:
             raise BuilderValidationError(f"{self.Type} Error: Cannot have more than one base")
 
-        if self.builder_level == "item":
+        if self.builder_level == "item" or self.music_playlist:
             if "type" in filter_alias:
                 if plex_filter[filter_alias["type"]] is None:
                     raise BuilderValidationError(f"{self.Type} Error: type attribute is blank")
                 if plex_filter[filter_alias["type"]] not in plex.sort_types:
                     raise BuilderValidationError(f"{self.Type} Error: type '{plex_filter[filter_alias['type']]}' is invalid. Options: {', '.join(plex.sort_types)}")
                 sort_type = plex_filter[filter_alias["type"]]
+            elif self.music_playlist and self.library.is_music:
+                sort_type = "track"
             elif self.library.is_show:
                 sort_type = "show"
             elif self.library.is_music:
@@ -4592,9 +4709,17 @@ class CollectionBuilder:
         else:
             sort_type = self.builder_level
 
+        if self.music_playlist and sort_type not in ["artist", "album", "track"]:
+            raise BuilderValidationError(f"{self.Type} Error: Music playlist smart filters must use type 'artist', 'album', or 'track'")
+        if self.music_playlist_smart and sort_type == "album" and display:
+            self._warn_smart_playlist_album_tracks()
+
         ms = method.split("_")
         filter_details = f"{ms[0].capitalize()} {sort_type.capitalize()} {ms[1].capitalize()}\n"
         type_default_sort, type_key, sorts = plex.sort_types[sort_type]
+        if self.music_playlist_smart:
+            # Music smart playlists contain tracks even when their rules target artist- or album-level metadata.
+            type_key = plex.sort_types["track"][1]
 
         sort = []
         if "sort_by" in filter_alias:
@@ -4644,9 +4769,15 @@ class CollectionBuilder:
             conjunction = f"{'and' if is_all else 'or'}=1&"
             for _key, _data in filter_dict.items():
                 attr, modifier, final_attr = self.library.split(_key)
+                if self.library.is_music and attr == "label":
+                    attr = f"{sort_type}_label"
+                    final_attr = f"{attr}{modifier}"
 
                 def build_url_arg(arg, mod=None, arg_s=None, mod_s=None):
-                    arg_key = self.library.get_search_key(attr, libtype=sort_type) if attr in ["folder_location", "audio_codec"] else plex.search_translation[attr] if attr in plex.search_translation else attr
+                    if self.library.is_music and attr in ["year", "unmatched", "trash", "record_label"]:
+                        arg_key = {"year": "album.year", "unmatched": "artist.unmatched", "trash": "track.trash", "record_label": "album.studio"}[attr]
+                    else:
+                        arg_key = self.library.get_search_key(attr, libtype=sort_type) if attr in ["folder_location", "audio_codec"] else plex.search_translation[attr] if attr in plex.search_translation else attr
                     arg_key = plex.show_translation[arg_key] if self.library.is_show and arg_key in plex.show_translation else arg_key
                     if mod is None:
                         mod = plex.modifier_translation[modifier] if modifier in plex.modifier_translation else modifier
@@ -4691,9 +4822,10 @@ class CollectionBuilder:
                         validation = self.validate_attribute(attr, modifier, final_attr, _data, validate, plex_search=True, plex_search_type=sort_type)
                         if validation is not False and validation != 0 and not validation:
                             continue
-                        elif attr in plex.date_attributes and modifier in ["", ".not"]:
-                            last_text = "is not in the last" if modifier == ".not" else "is in the last"
-                            last_mod = "%3E%3E" if modifier == "" else "%3C%3C"
+                        elif attr in plex.date_attributes and modifier in ["", ".not", ".last", ".notlast"]:
+                            is_not_last = modifier in [".not", ".notlast"]
+                            last_text = "is not in the last" if is_not_last else "is in the last"
+                            last_mod = "%3C%3C" if is_not_last else "%3E%3E"
                             search_mod = validation[-1]  # type: ignore[index]
                             if search_mod == "o":
                                 validation = f"{validation[:-1]}mon"  # type: ignore[index]
@@ -4768,6 +4900,13 @@ class CollectionBuilder:
                 raise BuilderValidationError(f"{self.Type} Error: {base} must be a dictionary: {plex_filter[filter_alias[base]]}")
             base_dict = plex_filter[filter_alias[base]]
         built_filter, filter_text = _filter(base_dict, is_all=base_all)
+        if self.music_playlist_smart:
+            if "artist." in built_filter:
+                self.smart_filter_result_type = "artist"
+            elif "album." in built_filter:
+                self.smart_filter_result_type = "album"
+            else:
+                self.smart_filter_result_type = sort_type
         filter_details = f"{filter_details}Filter:{filter_text}"
         if len(built_filter) > 0:
             final_filter = built_filter[:-1] if base_all else f"push=1&{built_filter}pop=1"
@@ -4811,6 +4950,12 @@ class CollectionBuilder:
         elif attribute in string_attributes and modifier in ["", ".not", ".is", ".isnot", ".begins", ".ends"]:
             return smart_pair(util.get_list(data, split=False))
         elif attribute in year_attributes and modifier in ["", ".not", ".gt", ".gte", ".lt", ".lte"]:
+
+            def _parse_year(value, minimum: int | None = None):
+                if attribute in ["decade", "album_decade"] and str(value).lower().endswith("s"):
+                    value = str(value)[:-1]
+                return util.parse(self.Type, final, value, datatype="int", minimum=minimum)  # pyright: ignore[reportArgumentType]  # parse supports None as an unbounded minimum.
+
             if modifier in ["", ".not"]:
                 final_years = []
                 values = util.get_list(data) or []
@@ -4822,7 +4967,7 @@ class CollectionBuilder:
                         except ValueError:
                             raise BuilderValidationError(f"{self.Type} Error: {final} attribute modifier invalid '{year_values[1]}'")
                     else:
-                        final_years.append(util.parse(self.Type, final, value, datatype="int"))
+                        final_years.append(_parse_year(value))
                 return smart_pair(final_years)
             else:
                 if str(data).startswith("current_year"):
@@ -4831,8 +4976,8 @@ class CollectionBuilder:
                         return datetime.now().year - (0 if len(year_values) == 1 else int(year_values[1].strip()))
                     except ValueError:
                         raise BuilderValidationError(f"{self.Type} Error: {final} attribute modifier invalid '{year_values[1]}'")
-                return util.parse(self.Type, final, data, datatype="int", minimum=0)
-        elif (attribute in number_attributes and modifier in ["", ".not", ".gt", ".gte", ".lt", ".lte"]) or (attribute in tag_attributes and modifier in [".count_gt", ".count_gte", ".count_lt", ".count_lte"]):
+                return _parse_year(data, minimum=0)
+        elif (attribute in number_attributes and modifier in ["", ".is", ".isnot", ".not", ".gt", ".gte", ".lt", ".lte"]) or (attribute in tag_attributes and modifier in [".count_gt", ".count_gte", ".count_lt", ".count_lte"]):
             return util.parse(self.Type, final, data, datatype="int", minimum=None if attribute == "stinger_rating" else 0)  # pyright: ignore[reportArgumentType]  # parse/check_int support None bounds; the default infers int.
         elif attribute == "origin_country":
             return util.get_list(data, upper=True)
@@ -4929,14 +5074,44 @@ class CollectionBuilder:
                 return util.validate_date(datetime.now() if data == "today" else data, return_as="%Y-%m-%d")
             except Failed as e:
                 raise Failed(f"{self.Type} Error: {final}: {e}")
-        elif attribute in date_attributes and modifier in ["", ".not"]:
+        elif attribute in date_attributes and modifier in ["", ".not", ".last", ".notlast"]:
             search_mod = "d"
-            if plex_search and data and str(data)[-1] in ["s", "m", "h", "d", "w", "o", "y"]:
-                search_mod = str(data)[-1]
-                data = str(data)[:-1]
+            if plex_search and data:
+                duration = str(data).lower().strip()
+                duration_modifiers = [
+                    ("months", "o"),
+                    ("month", "o"),
+                    ("seconds", "s"),
+                    ("second", "s"),
+                    ("minutes", "m"),
+                    ("minute", "m"),
+                    ("hours", "h"),
+                    ("hour", "h"),
+                    ("days", "d"),
+                    ("day", "d"),
+                    ("weeks", "w"),
+                    ("week", "w"),
+                    ("years", "y"),
+                    ("year", "y"),
+                    ("min", "m"),
+                    ("mon", "o"),
+                    ("s", "s"),
+                    ("h", "h"),
+                    ("d", "d"),
+                    ("w", "w"),
+                    ("m", "o"),
+                    ("o", "o"),
+                    ("y", "y"),
+                ]
+                for suffix, modifier_value in duration_modifiers:
+                    if duration.endswith(suffix):
+                        search_mod = modifier_value
+                        duration = duration[: -len(suffix)].strip()
+                        break
+                data = duration
             search_data = util.parse(self.Type, final, data, datatype="int", minimum=0)
             return f"{search_data}{search_mod}" if plex_search else search_data
-        elif attribute in float_attributes and modifier in ["", ".not", ".gt", ".gte", ".lt", ".lte"]:
+        elif attribute in float_attributes and modifier in ["", ".not", ".is", ".isnot", ".gt", ".gte", ".lt", ".lte"]:
             return util.parse(self.Type, final, data, datatype="float", minimum=0, maximum=None if attribute == "duration" else 10)
         elif attribute in boolean_attributes or (attribute in float_attributes and modifier in [".rated"]):
             return util.parse(self.Type, attribute, data, datatype="bool")
@@ -5037,6 +5212,7 @@ class CollectionBuilder:
             if self.limit and amount_added + self.beginning_count - len([r for _, r in self.remove_item_map.items() if r is not None]) >= self.limit:
                 logger.info(f"{self.Type} Limit reached")
                 self.found_items = self.found_items[: i - 1]
+                self.found_item_keys = {item.key for item in self.found_items}
                 break
             current_operation = "=" if item.ratingKey in collection_item_keys else "+"
             number_text = f"{i}/{total}"
@@ -5578,7 +5754,9 @@ class CollectionBuilder:
 
     @timings.timed("load_collection_items")
     def load_collection_items(self):
-        if self.build_collection and self.obj is not None:
+        if self.music_playlist_smart:
+            self.items = []
+        elif self.build_collection and self.obj is not None:
             self.items = self.library.get_collection_items(self.obj, self.smart_label_collection)
         elif not self.build_collection:
             logger.info("")
@@ -5587,6 +5765,22 @@ class CollectionBuilder:
             self.items = self.found_items
         if not self.items and self.mdb_list_arr_ids is None:
             raise Failed(f"Plex Error: No {self.Type} items found")
+
+    def _music_playlist_result_count(self, filter_url):
+        result_type = self.smart_filter_result_type
+        if result_type is None:
+            if "artist." in filter_url or "unmatched=" in filter_url:
+                result_type = "artist"
+            elif "album." in filter_url:
+                result_type = "album"
+            else:
+                result_type = "track"
+        result_type_key = plex.sort_types[result_type][1]
+        query_parts = filter_url.split("?", 1)
+        if len(query_parts) == 2:
+            query = "&".join(f"type={result_type_key}" if part.startswith("type=") else part for part in query_parts[1].split("&"))
+            filter_url = f"?{query}"
+        return len(self.library.fetchItems(filter_url))
 
     def _safe_tmdb_lookup(self, getter, tmdb_id, item_type):
         try:
@@ -5920,7 +6114,10 @@ class CollectionBuilder:
 
     @timings.timed("load_collection")
     def load_collection(self):
-        if self.obj is None and self.smart_url:
+        if self.obj is None and self.music_playlist_smart:
+            self.library.create_smart_playlist(self.name, self.smart_url)
+            logger.debug(f"Smart Playlist Created: {self.smart_url}")
+        elif self.obj is None and self.smart_url:
             self.library.create_smart_collection(self.name, self.smart_type_key, self.smart_url, self.ignore_blank_results)
             logger.debug(f"Smart Collection Created: {self.smart_url}")
         elif self.obj is None and self.blank_collection:
@@ -5948,6 +6145,8 @@ class CollectionBuilder:
             summary = ("summary", self.summaries["summary"])
         elif "translation" in self.summaries:
             summary = ("translation", self.summaries["translation"])
+        elif "ytmusic_list" in self.summaries:
+            summary = ("ytmusic_list", self.summaries["ytmusic_list"])
         elif "tmdb_description" in self.summaries:
             summary = ("tmdb_description", self.summaries["tmdb_description"])
         elif "tvdb_description" in self.summaries:
@@ -6175,9 +6374,14 @@ class CollectionBuilder:
         logger.info("")
         logger.separator(f"Sorting {self.name} {self.Type}", space=False, border=False)
         logger.info("")
+        if self.music_playlist_smart:
+            logger.info("Plex manages the order of smart playlist results")
+            return
         if not isinstance(self.custom_sort, list):
             items = self.found_items
-            if self.custom_sort == "custom.desc":
+            if any(method in (*spotify_chart.builders, *apple_chart.builders) for method, _ in self.builders) and self.details.get("collection_order") in ("custom", "custom.desc"):
+                items = sorted(items, key=lambda item: self.spotify_chart_order.get(item.ratingKey, float("inf")))
+            elif self.custom_sort == "custom.desc":
                 items = items[::-1]
         else:
             plex_search = {"sort_by": self.custom_sort}
