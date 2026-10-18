@@ -23,6 +23,7 @@ class Library(ABC):
         self.session = None
         self.Radarr = None
         self.Sonarr = None
+        self.Seerr = None
         self.Lidarr = None
         self.Tautulli = None
         self.Tracearr = None
