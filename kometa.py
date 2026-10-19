@@ -21,7 +21,7 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import parse
 
 from modules.integrity import log_integrity, log_integrity_summary
-from modules.log_summary import SEVERITIES, RunLogSummary
+from modules.log_summary import SEVERITIES, RunLogSummary, print_status
 from modules.logs import MyLogger
 
 # Increase file descriptor limit to prevent exhaustion with large libraries.
@@ -114,6 +114,7 @@ arguments = {
     "run-libraries": {"args": ["rl", "l", "library", "libraries", "run-library"], "type": "str", "help": "Process only specified libraries (pipe-separated list '|')"},
     "run-files": {"args": ["rf", "rm", "m", "run-file", "metadata", "metadata-files", "run-metadata-files"], "type": "str", "help": "Process only specified Files (pipe-separated list '|')"},
     "run-items": {"args": ["ri", "item", "items", "run-item"], "type": "str", "help": "Run library operations against only these Plex rating keys (pipe-separated list '|')"},
+    "mode": {"args": [], "type": "str", "help": "Override library schedule modes for this run"},
     "ignore-schedules": {"args": "is", "type": "bool", "help": "Run ignoring collection schedules"},
     "ignore-ghost": {"args": "ig", "type": "bool", "help": "Run ignoring ghost logging"},
     "delete-collections": {"args": ["dc", "delete", "delete-collection"], "type": "bool", "help": "Deletes all Collections in the Plex Library before running"},
@@ -195,6 +196,10 @@ for arg_key, arg_data in arguments.items():
     temp_args = arg_data["args"] if isinstance(arg_data["args"], list) else [arg_data["args"]]
     final_vars = [f"KOMETA_{arg_key.replace('-', '_').upper()}"] + [f"KOMETA_{a.replace('-', '_').upper()}" for a in temp_args if len(a) > 2]
     run_args[arg_key] = get_env(final_vars, getattr(args, arg_key.replace("-", "_")), arg_bool=arg_data["type"] == "bool", arg_int=arg_data["type"] == "int")
+if run_args["mode"] is not None:
+    run_args["mode"] = run_args["mode"].strip().lower()
+    if not run_args["mode"]:
+        parser.error("--mode / KOMETA_MODE must specify a schedule mode")
 env_branch = get_env("BRANCH_NAME", "master")
 is_docker = get_env("KOMETA_DOCKER", False, arg_bool=True)
 is_linuxserver = get_env("KOMETA_LINUXSERVER", False, arg_bool=True)
@@ -464,7 +469,13 @@ def _process(attrs):
 
 
 def should_sync_collection(builder):
-    return builder.sync and builder.build_collection and bool(builder.remove_item_map) and (not builder.found_items or len(builder.found_items) + builder.beginning_count >= builder.minimum)
+    return (
+        not getattr(getattr(builder, "library", None), "has_schedule_scope", False) is True
+        and builder.sync
+        and builder.build_collection
+        and bool(builder.remove_item_map)
+        and (not builder.found_items or len(builder.found_items) + builder.beginning_count >= builder.minimum)
+    )
 
 
 def missing_item_counts(builder):
@@ -618,6 +629,7 @@ def start(attrs):
         attrs["time_obj"] = start_time
         attrs["config_file"] = run_args["config"]
         attrs["ignore_schedules"] = run_args["ignore-schedules"]
+        attrs["mode"] = run_args["mode"]
         attrs["read_only"] = run_args["read-only-config"]
         attrs["no_missing"] = run_args["no-missing"]
         attrs["no_report"] = run_args["no-report"]
@@ -895,19 +907,6 @@ def run_config(config, stats):
             if len(title) > longest:
                 longest = len(title)
 
-    def print_status(status):
-        if not status:
-            return
-        logger.info(f"{'Title':^{longest}} |   +   |   =   |   -   | Run Time | {'Status'}")
-        breaker = f"{logger.separating_character * longest}|{logger.separating_character * 7}|{logger.separating_character * 7}|{logger.separating_character * 7}|{logger.separating_character * 10}|"
-        logger.separator(breaker, space=False, border=False, side_space=False, left=True)
-        for name, data in status.items():
-            logger.info(f"{name:<{longest}} | {data['added']:>5} | {data['unchanged']:>5} | {data['removed']:>5} | {data['run_time']:>8} | {data['status']}")
-            if data["errors"]:
-                for error in data["errors"]:
-                    logger.info(error)
-                logger.info("")
-
     logger.info("")
     logger.separator("Summary")
     for library in config.libraries:
@@ -920,12 +919,12 @@ def run_config(config, stats):
             for text, value in library_status[library.name].items():
                 logger.info(f"{text:<27} | {value:>8} |")
         logger.info("")
-        print_status(library.status)
+        print_status(library.status, longest, logger)
     if playlist_status:
         logger.info("")
         logger.separator("Playlists Summary", space=False, border=False)
         logger.info("")
-        print_status(playlist_status)
+        print_status(playlist_status, longest, logger)
 
     if collections_ran:
         report_duplicate_collections(config)
@@ -1051,14 +1050,24 @@ def run_libraries(config) -> tuple[LibraryRunStatus, bool]:
 
             time_start = datetime.now()
             temp_items = None
-            list_key = None
+            schedule_list_key = None
             if config.Cache:
-                list_key, _ = config.Cache.query_list_cache("library", library.mapping_name, 1)
+                schedule_list_key, _ = config.Cache.query_list_cache("library_schedule", library.mapping_name, 0)
+                if schedule_list_key:
+                    library.scheduled_cached_keys = {int(key) for key, _ in config.Cache.query_list_ids(schedule_list_key)}
 
             if not temp_items:
                 temp_items = library.cache_items()
-                if config.Cache and list_key:
-                    config.Cache.delete_list_ids(list_key)
+                library.scheduled_item_keys = library._schedule_item_keys(temp_items)
+                if library.has_schedule_scope:
+                    temp_items = [item for item in temp_items if item.ratingKey in library.scheduled_item_keys]
+                    logger.info(f"Library Schedule Mode: {library.schedule_mode} ({len(temp_items)} items in scope)")
+                if config.Cache:
+                    schedule_list_key = config.Cache.update_list_cache("library_schedule", library.mapping_name, True, 0)
+                    config.Cache.delete_list_ids(schedule_list_key)
+                    config.Cache.update_list_ids(schedule_list_key, [(item.ratingKey, "ratingKey") for item in library.get_cached_items()])
+                    if library.schedule_mode == "diff" and library.is_show and library.xml_library_id is not None:
+                        config.Cache.update_xml_updated_at(library.xml_library_id, library.xml_updates)
             timings.registry.meta.setdefault("library_item_counts", {})[library.name] = len(temp_items) if temp_items else 0
             if not library.is_music:
                 logger.info("")
