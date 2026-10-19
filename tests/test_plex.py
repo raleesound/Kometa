@@ -23,70 +23,11 @@ import modules.builder  # noqa: F401 — pre-import to break circular deps
 from modules.plex import MusicMatcher, Plex, TracedPlexServer
 from modules.util import Failed
 from tests.conftest import FakeLogger
+from tests.factories import make_plex, make_plex_item
 
 # ═══════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════
-
-
-def make_plex(**attrs) -> Plex:
-    """Create a minimal Plex instance with ``Plex.__new__``.
-
-    Defaults provide enough for basic method calls.  Override any
-    attribute via keyword arguments.
-
-    Sets ``Plex.logger`` and ``plex_module.logger`` to FakeLogger.
-    """
-    import modules.plex as plex_module
-
-    plex = Plex.__new__(Plex)
-
-    # Required by Library base class
-    plex.name = attrs.pop("name", "Test Library")
-    plex.is_movie = attrs.pop("is_movie", True)
-    plex.is_show = attrs.pop("is_show", False)
-    plex.type = attrs.pop("type", "Movie")
-    plex.cached_items = attrs.pop("cached_items", {})
-    plex.filter_attr_cache = attrs.pop("filter_attr_cache", {})
-    plex.collection_names = attrs.pop("collection_names", [])
-    plex.collection_files = attrs.pop("collection_files", [])
-    plex.stats = attrs.pop("stats", {"deleted": 0})
-    plex.config = attrs.pop("config", SimpleNamespace(notify=MagicMock(), notify_delete=MagicMock()))
-
-    # Required by Plex class
-    plex.collection_asset_directory = attrs.pop("collection_asset_directory", [])
-    plex.plex = attrs.pop("plex", None)
-    plex.url = attrs.pop("url", "http://localhost:32400")
-    plex.token = attrs.pop("token", "fake-token")
-    plex.PlexServer = attrs.pop("PlexServer", MagicMock())
-    plex.Plex = attrs.pop("Plex", MagicMock())
-    plex.session = attrs.pop("session", MagicMock())
-    plex.timeout = attrs.pop("timeout", 30)
-    plex._language_choice_cache = attrs.pop("_language_choice_cache", {})
-
-    # Apply any remaining overrides
-    for key, value in attrs.items():
-        setattr(plex, key, value)
-
-    plex_module.logger = FakeLogger()
-    return plex
-
-
-def make_plex_item(
-    rating_key: int = 1,
-    title: str = "Test Item",
-    year: int = 2023,
-    **extras,
-) -> MagicMock:
-    """Return a MagicMock that looks like a Plex video object."""
-    item = MagicMock()
-    item.ratingKey = rating_key
-    item.title = title
-    item.year = year
-    item.type = extras.pop("type", "movie")
-    for key, value in extras.items():
-        setattr(item, key, value)
-    return item
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1123,6 +1064,8 @@ class TestRefreshItemCacheAndMappings:
         fresh_item = make_plex_item(rating_key=202)
         plex = make_plex(is_movie=False, is_show=True)
         plex.is_music = False
+        plex.schedule_mode = "full"
+        plex.scheduled_item_keys = set()
         plex.get_all = MagicMock(return_value=[fresh_item])
         plex.map_guids = MagicMock()
         for attr in [
@@ -1146,7 +1089,7 @@ class TestRefreshItemCacheAndMappings:
         result = plex.refresh_item_cache_and_mappings()
 
         assert result == [fresh_item]
-        plex.get_all.assert_called_once_with(load=True)
+        plex.get_all.assert_called_once_with(load=True, ignore_schedule_scope=True)
         plex.map_guids.assert_called_once_with([fresh_item])
         assert plex.cached_items == {202: (fresh_item, False)}
         assert plex.filter_attr_cache == {}
@@ -1189,9 +1132,14 @@ class TestImdbRatingCacheOnLibraryLoad:
         Plex.cache_imdb_ratings(library)
         imdb.cache_library_ratings.assert_called_once_with(["tt0111161", "tt0068646"])
 
-    def test_cache_imdb_ratings_skips_when_imdb_is_not_configured(self):
+    def test_cache_imdb_ratings_skips_silently_when_imdb_is_not_configured(self, monkeypatch):
+        # Without the guard, the None.cache_library_ratings AttributeError would be swallowed and only show up as a logged error.
+        logs = FakeLogger()
+        monkeypatch.setattr("modules.library.logger", logs)
         library = SimpleNamespace(name="Movies", imdb_map={"tt0111161": [1]}, config=SimpleNamespace(IMDb=None))
         Plex.cache_imdb_ratings(library)
+        assert library.imdb_map == {"tt0111161": [1]}
+        assert logs.error_messages == []
 
     def test_cache_imdb_ratings_logs_and_continues_when_caching_fails(self, monkeypatch):
         logger = FakeLogger()
@@ -1276,43 +1224,25 @@ class TestCheckFilterForceReloadParam:
         item.labels = labels if labels is not None else [MagicMock(tag="Test")]
         return item
 
-    def test_force_reload_true_passed_through_to_reload(self):
-        plex = make_plex()
-        item = self._movie_item()
-        plex.reload = MagicMock(return_value=item)
-
-        plex.check_filter(item, "genre", "", "genre", ["Action"], None, force_reload=True)
-
-        plex.reload.assert_called_once_with(item, force=True)
-
-    def test_force_reload_false_passed_through_to_reload(self):
-        plex = make_plex()
-        item = self._movie_item()
-        plex.reload = MagicMock(return_value=item)
-
-        plex.check_filter(item, "genre", "", "genre", ["Action"], None, force_reload=False)
-
-        plex.reload.assert_called_once_with(item, force=False)
-
-    def test_force_reload_none_falls_back_to_old_always_force_behavior(self):
-        """Only a direct caller that bypasses check_filters would hit this - kept for safety."""
-        plex = make_plex()
-        item = self._movie_item()
-        plex.reload = MagicMock(return_value=item)
-
-        plex.check_filter(item, "genre", "", "genre", ["Action"], None, force_reload=None)
-
-        plex.reload.assert_called_once_with(item, force=True)
-
-    def test_force_reload_none_for_non_tag_filter_does_not_force(self):
+    @pytest.mark.parametrize(
+        ("attribute", "values", "force_reload", "expected_force"),
+        [
+            ("genre", ["Action"], True, True),
+            ("genre", ["Action"], False, False),
+            ("genre", ["Action"], None, True),  # a direct caller that bypasses check_filters keeps the old always-force behaviour
+            ("title", ["Something"], None, False),  # a non-tag filter never forces a reload
+        ],
+        ids=["true_is_passed_through", "false_is_passed_through", "none_on_a_tag_filter_forces", "none_on_a_non_tag_filter_does_not_force"],
+    )
+    def test_force_reload_decides_whether_check_filter_forces_the_reload(self, attribute, values, force_reload, expected_force):
         plex = make_plex()
         item = self._movie_item()
         item.title = "Something"
         plex.reload = MagicMock(return_value=item)
 
-        plex.check_filter(item, "title", "", "title", ["Something"], None, force_reload=None)
+        plex.check_filter(item, attribute, "", attribute, values, None, force_reload=force_reload)
 
-        plex.reload.assert_called_once_with(item, force=False)
+        plex.reload.assert_called_once_with(item, force=expected_force)
 
 
 # ═══════════════════════════════════════════════════════════════════════
