@@ -433,6 +433,8 @@ sub_filters = [
     "audio_language",
     "subtitle_language",
     "has_dolby_vision",
+    "dovi_level",
+    "dovi_profile",
     "channels",
     "height",
     "width",
@@ -467,6 +469,8 @@ filters_by_type = {
         "audio_language",
         "subtitle_language",
         "has_dolby_vision",
+        "dovi_level",
+        "dovi_profile",
         "channels",
         "height",
         "width",
@@ -610,6 +614,8 @@ number_filters = [
     "width",
     "aspect",
     "versions",
+    "dovi_level",
+    "dovi_profile",
     "stinger_rating",
 ]
 number_modifiers = ["", ".not", ".gt", ".gte", ".lt", ".lte"]
@@ -636,7 +642,7 @@ all_filters = (
 )
 date_attributes = plex.date_attributes + ["first_episode_aired", "last_episode_aired", "last_episode_aired_or_never"]
 year_attributes = plex.year_attributes + ["tmdb_year"]
-number_attributes = plex.number_attributes + ["channels", "height", "width", "tmdb_vote_count", "stinger_rating"]
+number_attributes = plex.number_attributes + ["channels", "height", "width", "tmdb_vote_count", "stinger_rating", "dovi_level", "dovi_profile"]
 tag_attributes = plex.tag_attributes
 string_attributes = plex.string_attributes + string_filters
 float_attributes = plex.float_attributes + ["aspect", "tmdb_vote_average"]
@@ -4590,9 +4596,16 @@ class CollectionBuilder:
                             logger.warning(f"{self.Type} Warning: Numeric ID: {input_id} not found in the defined libraries")
                             self.add_budget_blocker(f"ID {input_data} could not be resolved")
                             continue
-                    elif id_type == "tvdb_season" and (self.builder_level in ["season", "episode"] or self.playlist):
-                        tvdb_id, season_num = input_id.split("_")
-                        tvdb_id = int(tvdb_id)
+                    elif id_type in ["tvdb_season", "tmdb_season"] and (self.builder_level in ["season", "episode"] or self.playlist):
+                        show_id, season_num = input_id.split("_")
+                        if id_type == "tmdb_season":
+                            try:
+                                tvdb_id = self.config.Convert.tmdb_to_tvdb(int(show_id), fail=True)
+                            except Failed as e:
+                                logger.warning(e)
+                                continue
+                        else:
+                            tvdb_id = int(show_id)
                         found = False
                         for pl_library in self.libraries:
                             if tvdb_id in pl_library.show_map:
@@ -4605,7 +4618,7 @@ class CollectionBuilder:
                                     else:
                                         items.append(season_obj)
                                 except NotFound:
-                                    self._log_missing_part(f"tvdb_season:{input_id}", f"{show_item.title} Season: {season_num} Missing")
+                                    self._log_missing_part(f"{id_type}:{input_id}", f"{show_item.title} Season: {season_num} Missing")
                                 break
                         if not found and tvdb_id not in self.missing_shows:
                             self.missing_shows.append(tvdb_id)
@@ -4878,7 +4891,13 @@ class CollectionBuilder:
                     final_attr = f"{attr}{modifier}"
 
                 def build_url_arg(arg, mod=None, arg_s=None, mod_s=None):
-                    if self.library.is_music and attr in ["year", "unmatched", "trash", "record_label"]:
+                    if attr in ["hdr10plus", "atmos"]:
+                        available_filters = {f.filter for f in self.library.Plex.listFilters(sort_type)}
+                        candidates = (f"episode.{attr}", attr) if sort_type in ["show", "season"] else (attr, f"episode.{attr}")
+                        arg_key = next((key for key in candidates if key in available_filters), None)
+                        if arg_key is None:
+                            raise BuilderValidationError(f"{self.Type} Error: {method} attribute '{attr}' is not supported by Plex for {sort_type} searches")
+                    elif self.library.is_music and attr in ["year", "unmatched", "trash", "record_label"]:
                         arg_key = {"year": "album.year", "unmatched": "artist.unmatched", "trash": "track.trash", "record_label": "album.studio"}[attr]
                     else:
                         arg_key = self.library.get_search_key(attr, libtype=sort_type) if attr in ["folder_location", "audio_codec"] else plex.search_translation[attr] if attr in plex.search_translation else attr
@@ -5082,6 +5101,12 @@ class CollectionBuilder:
                         raise BuilderValidationError(f"{self.Type} Error: {final} attribute modifier invalid '{year_values[1]}'")
                 return _parse_year(data, minimum=0)
         elif (attribute in number_attributes and modifier in ["", ".is", ".isnot", ".not", ".gt", ".gte", ".lt", ".lte"]) or (attribute in tag_attributes and modifier in [".count_gt", ".count_gte", ".count_lt", ".count_lte"]):
+            if attribute in ["dovi_level", "dovi_profile"]:
+                valid_values = set(range(1, 14)) if attribute == "dovi_level" else {5, 7, 8, 9, 10, 20}
+                value = util.parse(self.Type, final, data, datatype="int", minimum=1)
+                if value not in valid_values:
+                    raise BuilderValidationError(f"{self.Type} Error: {final} must be one of: {', '.join(str(v) for v in sorted(valid_values))}")
+                return value
             return util.parse(self.Type, final, data, datatype="int", minimum=None if attribute == "stinger_rating" else 0)  # pyright: ignore[reportArgumentType]  # parse/check_int support None bounds; the default infers int.
         elif attribute == "origin_country":
             return util.get_list(data, upper=True)

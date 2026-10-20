@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Drop support for python 3.10 due to it going end of life. Python 3.11 or above is now required.
+- Add `dovi_level` and `dovi_profile` filters for use with `plex_all` builders.
+- Add `hdr10plus` and `atmos` boolean attributes for `plex_search` and `smart_filter` builders
 - Support minute, hour, and explicit day durations in `added(...)` library modes while keeping bare integers as days.
 - Add library schedule modes for full, added, changed, alphabetical, and explicitly selected items, plus a `--mode` / `KOMETA_MODE` override for a run.
 - Add Release Notes to Kometa website, available under `Useful Links` section of navigation
@@ -25,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Resolve MDBList season and episode entries through their parent show in mixed playlists, preventing unrelated shows from being added.
 - Preserve smart-label collection filters during initialization so existing shows count toward `minimum_items`, preventing streaming collections from alternating between deletion and recreation. #3739
 - Resolve `label` filters in Music libraries to the selected artist, album, or track label field.
 - Accept a Kometa Utilities "Use Kometa App" MyAnimeList block that omits `client_secret`, and refresh that official app without sending a client secret.
