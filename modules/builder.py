@@ -1148,6 +1148,13 @@ class CollectionBuilder:
         self.added_to_sonarr = []
         self.held_back_radarr = []
         self.held_back_sonarr = []
+        # Live collection record (modules/live_record.py): which missing ids run_missing() filtered
+        # out, whether it ran at all, the builders' raw id order, and whether the custom sort finished.
+        self.missing_filtered_movies = []
+        self.missing_filtered_shows = []
+        self.missing_checked = False
+        self.gathered_ids = []
+        self.sort_completed = False
         self.budget_blockers = []
         self.builders = []
         self.filters = []
@@ -4893,6 +4900,7 @@ class CollectionBuilder:
     def run_missing(self):
         added_to_radarr = 0
         added_to_sonarr = 0
+        self.missing_checked = True
         i = 0
         total_ids = len(self.missing_movies)
         if len(self.missing_movies) > 0 and (self.library.is_movie or self.is_playlist):
@@ -4916,6 +4924,7 @@ class CollectionBuilder:
                         logger.ghost(f"Parsing ID {i}/{total_ids}")
                 else:
                     filtered_movies_with_names.append((current_title, missing_id))
+                    self.missing_filtered_movies.append(missing_id)
                     if self.details["show_filtered"] is True and self.details["show_missing"] is True:
                         logger.info(f"{i}/{total_ids} {self.name} {self.Type} | ? | {current_title} (TMDb: {missing_id})")
                     else:
@@ -4989,6 +4998,7 @@ class CollectionBuilder:
                         logger.ghost(f"Parsing ID {i}/{total_ids}")
                 else:
                     filtered_shows_with_names.append((title, missing_id))
+                    self.missing_filtered_shows.append(missing_id)
                     if self.details["show_filtered"] is True and self.details["show_missing"] is True:
                         logger.info(f"{i}/{total_ids} {self.name} {self.Type} | ? | {title} (TVDb: {missing_id})")
                     else:
@@ -5054,6 +5064,8 @@ class CollectionBuilder:
             ids = pending.result() if pending is not None else self.gather_ids(method, value)
             if not ids:
                 self.add_budget_blocker(f"Builder {method} returned no items")
+            if ids and isinstance(self.custom_sort, str) and self.custom_sort.startswith("custom"):
+                self.gathered_ids.extend(ids)
             self.filter_and_save_items(ids)
         except (BuilderValidationError, OverlayError, MappingConvertError, ServiceError):
             raise
@@ -5756,6 +5768,7 @@ class CollectionBuilder:
         total_items = len(items)
         previous = None
         sort_edit = False
+        move_failed = False
         for i, item in enumerate(items, 0):
             try:
                 if len(self.items) <= i or item.ratingKey != self.items[i].ratingKey:
@@ -5767,6 +5780,8 @@ class CollectionBuilder:
             except Failed:
                 logger.error(f"Failed to Move {util.item_title(item)}")
                 sort_edit = True
+                move_failed = True
+        self.sort_completed = not move_failed
         if not sort_edit:
             logger.info("No Sorting Required")
 

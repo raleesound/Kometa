@@ -292,7 +292,7 @@ logger = MyLogger("Kometa", default_dir, run_args["width"], run_args["divider"][
 from modules import util  # noqa: E402
 
 util.logger = logger
-from modules import timings  # noqa: E402
+from modules import live_record, timings  # noqa: E402
 
 # Must be set before modules.cache/modules.request are imported below - both read this at import/decoration time, not per-call.
 timings.ENABLED = run_args["timings"]
@@ -447,6 +447,45 @@ def _process(attrs):
 
 def should_sync_collection(builder):
     return builder.sync and builder.build_collection and bool(builder.remove_item_map) and (not builder.found_items or len(builder.found_items) + builder.beginning_count >= builder.minimum)
+
+
+def record_live_collection(config, library, metadata, builder, add_ran, sync_ran):
+    """Write this collection's membership, wanted ids and order to the live record (#5634).
+
+    A per-item run (--run-items) never touches the record: it does not rebuild collections.
+    A record failure is logged loudly but never fails the collection run.
+    """
+    if config.run_items:
+        return
+    try:
+        snapshot = live_record.build_snapshot(builder, library, metadata, add_ran, sync_ran)
+        conn = live_record.connect(live_record.db_path(config.default_dir))
+        try:
+            events = live_record.write_collection(conn, snapshot)
+        finally:
+            conn.close()
+        members = "untracked" if snapshot["members"] is None else len(snapshot["members"])
+        logger.info(f"Live Record: {builder.name} | members: {members} | wanted: {len(snapshot['wanted'])} | changes: {len(events)}")
+    except Exception as e:
+        logger.stacktrace()
+        logger.error(f"Live Record Error: {builder.name}: {e}")
+
+
+def prune_live_record(config, library):
+    """After a full collections run, drop records of collections no longer configured in this library."""
+    if config.run_items:
+        return
+    try:
+        conn = live_record.connect(live_record.db_path(config.default_dir))
+        try:
+            dropped = live_record.prune_library(conn, library.name, library.collection_names)
+        finally:
+            conn.close()
+        for name in dropped:
+            logger.info(f"Live Record: dropped {name}, no longer configured in {library.name}")
+    except Exception as e:
+        logger.stacktrace()
+        logger.error(f"Live Record Error: pruning {library.name}: {e}")
 
 
 def collection_count_after_run(beginning_count, items_added, items_removed):
@@ -1230,6 +1269,8 @@ def run_libraries(config) -> tuple[LibraryRunStatus, bool]:
                     library_status[library.name]["Library Collection Files"] = str(datetime.now() - time_start).split(".")[0]
                     # Skip hub sorting on a targeted -rc or -rf run: only the requested collections/files are rebuilt, so hub_priorities only reflects those collections, not every pinned collection.
                     targeted_run = config.requested_collections or config.requested_files
+                    if not targeted_run and not run_args["tests"]:
+                        prune_live_record(config, library)
                     if not targeted_run and (library.hub_priorities or library.auto_sort_hubs):
                         library.sort_collection_hubs(library.hub_priorities, library.auto_sort_hubs, library.hub_config_order, library.hub_title_sorts)
                         library.hub_priorities = {}
@@ -1314,6 +1355,7 @@ def run_collection(config, library, metadata, requested_collections):
             collection_log_name, output_str = util.validate_filename(mapping_name)
         # logger.add_collection_handler(library.mapping_name, collection_log_name)
         library.status[str(mapping_name)] = {"status": "Unchanged", "errors": [], "added": 0, "unchanged": 0, "removed": 0, "radarr": 0, "sonarr": 0}
+        live_ran = None
 
         try:
             builder = CollectionBuilder(config, metadata, mapping_name, collection_attrs, library=library, extra=output_str)
@@ -1335,6 +1377,8 @@ def run_collection(config, library, metadata, requested_collections):
 
             items_added = 0
             items_removed = 0
+            add_ran = False
+            sync_ran = False
             if not builder.smart_url and builder.builders and not builder.blank_collection:
                 logger.info("")
                 logger.info(f"Sync Mode: {'sync' if builder.sync else 'append'}")
@@ -1351,12 +1395,14 @@ def run_collection(config, library, metadata, requested_collections):
                 items_removed = 0
                 if len(builder.found_items) > 0 and len(builder.found_items) + builder.beginning_count >= builder.minimum and builder.build_collection:
                     items_added, items_unchanged = builder.add_to_collection()
+                    add_ran = True
                     library.stats["added"] += items_added
                     library.status[str(mapping_name)]["added"] = items_added
                     library.stats["unchanged"] += items_unchanged
                     library.status[str(mapping_name)]["unchanged"] = items_unchanged
                 if should_sync_collection(builder):
                     items_removed = builder.sync_collection()
+                    sync_ran = True
                     library.stats["removed"] += items_removed
                     library.status[str(mapping_name)]["removed"] = items_removed
 
@@ -1371,6 +1417,10 @@ def run_collection(config, library, metadata, requested_collections):
 
                 if not builder.found_items and not builder.ignore_blank_results and not builder.obj and builder.mdb_list_arr_ids is None:
                     raise NonExisting(f"{builder.Type} Warning: No items found")
+
+            # From here the collection's membership is settled; record it even if a later step
+            # (minimum delete, details, sort) fails. The write happens after the except chain below.
+            live_ran = (builder, add_ran, sync_ran)
 
             valid = True
             final_collection_count = collection_count_after_run(builder.beginning_count, items_added, items_removed)
@@ -1479,6 +1529,8 @@ def run_collection(config, library, metadata, requested_collections):
             logger.error(f"Unknown Error: {e}")
             library.status[str(mapping_name)]["status"] = "Unknown Error"
             library.status[str(mapping_name)]["errors"].append(e)
+        if live_ran is not None:
+            record_live_collection(config, library, metadata, *live_ran)
         collection_run_time = str(datetime.now() - collection_start).split(".")[0]
         library.status[str(mapping_name)]["run_time"] = collection_run_time
         logger.info("")

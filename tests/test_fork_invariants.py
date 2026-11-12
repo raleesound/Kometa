@@ -30,6 +30,21 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MUST_BE_PRESENT = [
     (
         "kometa.py",
+        "record_live_collection(config, library, metadata, *live_ran)",
+        "every collection run writes the live membership record that the live import path reads (#5634)",
+    ),
+    (
+        "modules/builder.py",
+        "self.sort_completed = not move_failed",
+        "the live record stores a custom order only when the sort step finished (#5634)",
+    ),
+    (
+        "modules/live_record.py",
+        "def find_waiting(",
+        "the import trigger asks the live record which collections wait on an id (#5634)",
+    ),
+    (
+        "kometa.py",
         '"run-items"',
         "--run-items scopes operations to specific rating keys; the import trigger depends on it",
     ),
