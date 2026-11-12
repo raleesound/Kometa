@@ -38,3 +38,11 @@ collections:
     file_poster: config/movies/assets/gremlin-gremlin-deep-cuts.png
     sync_mode: sync
     radarr_add_missing: true
+  "The Cinema Gremlins' Bottom 50":
+    letterboxd_list: https://letterboxd.com/thisnames2long/list/the-cinema-gremlins-bottom-50/
+    sort_title: "!020_LB_!05_the_cinema_gremlins_bottom_50"
+    collection_order: custom
+    summary: "The films the Cinema Gremlins rate worst, from every star each of us has given on Letterboxd. Our Top 100, upside down.\n\nHow it's ranked: a film needs at least three Gremlins' ratings to place. Its score starts from our average, pulled toward the group's overall average as if it had five more ratings, so three half-stars can't sink a film below one six of us panned. Lowest score first."
+    file_poster: config/movies/assets/gremlin-the-cinema-gremlins-bottom-50.png
+    sync_mode: sync
+    radarr_add_missing: true
