@@ -470,13 +470,19 @@ def record_live_deleted(config, library, mapping_name):
     live_recorder.deleted(library.name, mapping_name)
 
 
-def prune_live_record(config, library):
-    """After a full collections run, drop records only for collections whose file loaded cleanly and no
-    longer defines them. A file that failed to load is absent from collection_files, so its records stay."""
+def record_live_skipped(config, library, mapping_name):
+    """The collection's schedule skipped it this run: it is still configured, so keep its record fresh."""
     if config.run_items or live_recorder is None:
         return
-    loaded_files = {metadata.path: set(metadata.collections or {}) for metadata in library.collection_files}
-    live_recorder.prune(library.name, loaded_files)
+    live_recorder.skipped(library.name, mapping_name)
+
+
+def expire_live_record(config):
+    """After a full sweep, delete records not synced for live_record.EXPIRE_AFTER. Nothing is deleted
+    for being absent from a run: absence is not evidence a collection was removed."""
+    if config.run_items or live_recorder is None:
+        return
+    live_recorder.expire()
 
 
 def collection_count_after_run(beginning_count, items_added, items_removed):
@@ -1262,8 +1268,6 @@ def run_libraries(config) -> tuple[LibraryRunStatus, bool]:
                     library_status[library.name]["Library Collection Files"] = str(datetime.now() - time_start).split(".")[0]
                     # Skip hub sorting on a targeted -rc or -rf run: only the requested collections/files are rebuilt, so hub_priorities only reflects those collections, not every pinned collection.
                     targeted_run = config.requested_collections or config.requested_files
-                    if not targeted_run and not run_args["tests"]:
-                        prune_live_record(config, library)
                     if not targeted_run and (library.hub_priorities or library.auto_sort_hubs):
                         library.sort_collection_hubs(library.hub_priorities, library.auto_sort_hubs, library.hub_config_order, library.hub_title_sorts)
                         library.hub_priorities = {}
@@ -1311,6 +1315,10 @@ def run_libraries(config) -> tuple[LibraryRunStatus, bool]:
         except Exception as e:
             library.notify(get_critical_error_message(e))
             log_critical_exception(e)
+    # Only a full sweep: every library, every file, every collection, for real.
+    full_sweep = collections_ran and not (config.requested_libraries or config.requested_collections or config.requested_files or run_args["tests"] or run_args["resume"])
+    if full_sweep:
+        expire_live_record(config)
     return library_status, collections_ran
 
 
@@ -1495,6 +1503,8 @@ def run_collection(config, library, metadata, requested_collections):
                 library.status[str(mapping_name)]["status"] = "Skipped Run Definition"
             else:
                 library.status[str(mapping_name)]["status"] = "Not Scheduled"
+                if str(e).endswith("not scheduled to run") or str(e).startswith("Skipped because only_run_on_create"):
+                    record_live_skipped(config, library, mapping_name)
         except FilterFailed:
             pass
         except BuilderValidationError as e:

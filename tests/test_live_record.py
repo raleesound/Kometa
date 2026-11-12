@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import multiprocessing
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -99,6 +100,13 @@ def fake_builder(**attrs):
     for key, value in defaults.items():
         setattr(b, key, value)
     return b
+
+
+def _age(conn, name, days, library="Movies"):
+    """Pretend ``name`` was last synced ``days`` ago."""
+    stamp = live_record._stamp(datetime.now(timezone.utc) - timedelta(days=days))
+    conn.execute("UPDATE collections SET last_synced = ? WHERE library = ? AND name = ?", (stamp, library, name))
+    conn.commit()
 
 
 METADATA = SimpleNamespace(get_file_name=lambda: "picks", path="/config/movies/picks.yml")
@@ -262,29 +270,70 @@ class TestPartialRuns:
         assert [m["rating_key"] for m in live_record.get_members(db, "Movies", "A")] == [1]
         assert [m["rating_key"] for m in live_record.get_members(db, "Movies", "B")] == [3]
 
-    def test_prune_drops_only_collections_removed_from_a_cleanly_loaded_file(self, db):
-        live_record.write_collection(db, snapshot(name="Keep", wanted=[(1, False, False, None)]))
-        live_record.write_collection(db, snapshot(name="Gone", wanted=[(2, False, False, None)], previous_members=[]))
-        live_record.write_collection(db, snapshot(name="Gone", library="TV Shows", id_type="tvdb"))
-        assert live_record.prune_library(db, "Movies", {"/config/movies/picks.yml": {"Keep"}}) == ["Gone"]
-        assert live_record.get_collection(db, "Movies", "Gone") is None
-        assert live_record.get_history(db, "Movies", "Gone") == []
-        assert live_record.find_waiting(db, "tmdb", 2) == []
-        assert live_record.get_collection(db, "Movies", "Keep") is not None
-        assert live_record.get_collection(db, "TV Shows", "Gone") is not None
+    def test_a_collection_missing_from_a_run_keeps_its_record(self, db):
+        # A file can report "Loaded Successfully" after a dynamic section failed (a transient
+        # TMDb/Plex/Trakt error): that run never records the dropped collections. Nothing deletes them.
+        live_record.write_collection(db, snapshot(name="Static", wanted=[(8, False, False, None)]))
+        live_record.write_collection(db, snapshot(name="Dynamic 1999", mapping_name="dyn_1999", wanted=[(9, False, False, 0)], collection_order="custom.asc", order_recorded=True))
+        # Next sweep: the dynamic section failed, only Static ran; then the janitor runs.
+        live_record.write_collection(db, snapshot(name="Static", wanted=[(8, False, False, None)]))
+        assert live_record.expire(db) == []
+        assert [r["name"] for r in live_record.find_waiting(db, "tmdb", 9)] == ["Dynamic 1999"]
+        assert live_record.get_position(db, "Movies", "Dynamic 1999", 9) == 0
 
-    def test_prune_keeps_everything_from_a_file_that_failed_to_load(self, db):
-        live_record.write_collection(db, snapshot(name="Remote", source_path="https://example.invalid/list.yml", wanted=[(9, False, False, 0)]))
-        live_record.write_collection(db, snapshot(name="Local", wanted=[(8, False, False, None)]))
-        # The remote file failed this run, so it is absent from collection_files and the map.
-        assert live_record.prune_library(db, "Movies", {"/config/movies/picks.yml": {"Local"}}) == []
-        assert [r["name"] for r in live_record.find_waiting(db, "tmdb", 9)] == ["Remote"]
-        assert live_record.get_position(db, "Movies", "Remote", 9) == 0
+    def test_renamed_collection_goes_stale_then_expires(self, db):
+        now = datetime.now(timezone.utc)
+        live_record.write_collection(db, snapshot(name="Old Title", mapping_name="picks", members=[(1, 10, None)], wanted=[(5, False, False, None)], previous_members=[]))
+        _age(db, "Old Title", days=1)
+        # The `name:` changed, the mapping key did not: the new title gets its own row.
+        live_record.write_collection(db, snapshot(name="New Title", mapping_name="picks", wanted=[(5, False, False, None)]))
+        assert [r["name"] for r in live_record.find_waiting(db, "tmdb", 5)] == ["New Title", "Old Title"]
+        # Within STALE_AFTER the old row stops being returned; New Title keeps syncing.
+        later = now + live_record.STALE_AFTER
+        live_record.write_collection(db, snapshot(name="New Title", mapping_name="picks", wanted=[(5, False, False, None)]))
+        _age(db, "New Title", days=0)
+        assert [r["name"] for r in live_record.find_waiting(db, "tmdb", 5, now=later)] == ["New Title"]
+        assert live_record.get_collection(db, "Movies", "Old Title") is not None
+        # Past EXPIRE_AFTER the janitor deletes it, history included.
+        assert live_record.expire(db, now=now + live_record.EXPIRE_AFTER) == [("Movies", "Old Title")]
+        assert live_record.get_collection(db, "Movies", "Old Title") is None
+        assert live_record.get_history(db, "Movies", "Old Title") == []
+        assert live_record.get_collection(db, "Movies", "New Title") is not None
 
-    def test_prune_matches_on_mapping_name_not_display_name(self, db):
-        live_record.write_collection(db, snapshot(name="Best of 1999", mapping_name="best_1999"))
-        assert live_record.prune_library(db, "Movies", {"/config/movies/picks.yml": {"best_1999"}}) == []
-        assert live_record.get_collection(db, "Movies", "Best of 1999") is not None
+    def test_schedule_skip_keeps_only_the_current_title_fresh(self, db):
+        live_record.write_collection(db, snapshot(name="Old Title", mapping_name="weekly", wanted=[(5, False, False, None)]))
+        _age(db, "Old Title", days=10)
+        live_record.write_collection(db, snapshot(name="New Title", mapping_name="weekly", wanted=[(5, False, False, None)]))
+        _age(db, "New Title", days=6)
+        # Off-schedule days touch the newest row for the mapping key, nothing else.
+        assert live_record.touch(db, "Movies", "weekly") == "New Title"
+        assert [r["name"] for r in live_record.find_waiting(db, "tmdb", 5)] == ["New Title"]
+        assert live_record.touch(db, "Movies", "never_recorded") is None
+        assert not db.in_transaction
+
+    def test_find_waiting_reports_age_and_honours_stale_after(self, db):
+        live_record.write_collection(db, snapshot(wanted=[(5, False, False, None)]))
+        _age(db, "Picks", days=2)
+        (row,) = live_record.find_waiting(db, "tmdb", 5)
+        assert 2 * 86400 - 60 <= row["age_seconds"] <= 2 * 86400 + 60
+        assert row["last_synced"]
+        assert live_record.find_waiting(db, "tmdb", 5, stale_after=timedelta(days=1)) == []
+
+    def test_expire_only_touches_old_rows(self, db):
+        live_record.write_collection(db, snapshot(name="Fresh", wanted=[(1, False, False, None)]))
+        live_record.write_collection(db, snapshot(name="Month", members=[(2, 20, None)], wanted=[(3, False, False, None)], previous_members=[]))
+        _age(db, "Fresh", days=29)
+        _age(db, "Month", days=31)
+        assert live_record.expire(db) == [("Movies", "Month")]
+        for table in ("members", "wanted", "history"):
+            assert db.execute(f"SELECT COUNT(*) FROM {table} WHERE name = 'Month'").fetchone()[0] == 0  # nosec B608
+        assert live_record.get_collection(db, "Movies", "Fresh") is not None
+
+    def test_nothing_but_the_janitor_deletes_records(self):
+        tree = ast.parse((REPO_ROOT / "modules" / "live_record.py").read_text(encoding="utf-8"))
+        functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+        deleters = {n.name for n in functions if "DELETE FROM {table}" in ast.unparse(n) or "DELETE FROM collections" in ast.unparse(n)}
+        assert deleters == {"expire"}
 
     def test_mark_deleted_empties_the_record(self, db):
         live_record.write_collection(db, snapshot(name="Xmas", mapping_name="xmas", members=[(1, 10, None)], wanted=[(20, False, False, None)], previous_members=[]))
@@ -516,7 +565,7 @@ class TestRunIntegration:
     def _ns(self, tmp_path, run_items=False, **recorder_kwargs):
         log = StackLogger()
         recorder = live_record.RunRecorder(str(tmp_path), log, **recorder_kwargs)
-        ns = _kometa_functions("record_live_collection", "record_live_deleted", "prune_live_record", live_recorder=recorder, live_record=live_record)
+        ns = _kometa_functions("record_live_collection", "record_live_deleted", "record_live_skipped", "expire_live_record", live_recorder=recorder, live_record=live_record)
         config = SimpleNamespace(run_items=run_items, default_dir=str(tmp_path))
         return ns, config, log, recorder
 
@@ -533,7 +582,7 @@ class TestRunIntegration:
         ns, config, log, _ = self._ns(tmp_path, run_items=True)
         ns["record_live_collection"](config, fake_library(), METADATA, fake_builder(), "picks", False, False)
         ns["record_live_deleted"](config, fake_library(), "picks")
-        ns["prune_live_record"](config, SimpleNamespace(name="Movies", collection_files=[]))
+        ns["expire_live_record"](config)
         assert not Path(live_record.db_path(str(tmp_path))).exists()
 
     def test_broken_snapshot_is_logged_and_the_run_continues(self, tmp_path):
@@ -574,19 +623,32 @@ class TestRunIntegration:
         assert recorder.record(fake_library(), METADATA, fake_builder(), "picks", False, False) is True
         assert recorder.failures == 0
 
-    def test_prune_wrapper_uses_only_cleanly_loaded_files(self, tmp_path):
+    def test_expire_wrapper_keeps_rows_absent_from_this_run(self, tmp_path):
         ns, config, log, _ = self._ns(tmp_path)
         conn = live_record.connect(live_record.db_path(str(tmp_path)))
-        live_record.write_collection(conn, snapshot(name="Old", source_path="/config/a.yml"))
-        live_record.write_collection(conn, snapshot(name="Remote", source_path="https://x.invalid/b.yml"))
+        live_record.write_collection(conn, snapshot(name="Skipped This Run"))
+        live_record.write_collection(conn, snapshot(name="Ancient"))
+        _age(conn, "Ancient", days=45)
         conn.close()
-        loaded = SimpleNamespace(path="/config/a.yml", collections={"New": {}})
-        ns["prune_live_record"](config, SimpleNamespace(name="Movies", collection_files=[loaded]))
+        ns["expire_live_record"](config)
         conn = live_record.connect(live_record.db_path(str(tmp_path)))
-        assert live_record.get_collection(conn, "Movies", "Old") is None
-        assert live_record.get_collection(conn, "Movies", "Remote") is not None
+        assert live_record.get_collection(conn, "Movies", "Skipped This Run") is not None
+        assert live_record.get_collection(conn, "Movies", "Ancient") is None
         conn.close()
-        assert "Live Record: dropped Old, no longer configured in Movies" in log.info_messages
+        assert "Live Record: expired Ancient (Movies), not synced for 30 days" in log.info_messages
+
+    def test_skipped_wrapper_refreshes_a_weekly_collection(self, tmp_path):
+        ns, config, log, recorder = self._ns(tmp_path)
+        conn = live_record.connect(live_record.db_path(str(tmp_path)))
+        live_record.write_collection(conn, snapshot(name="Weekly", mapping_name="weekly", wanted=[(5, False, False, None)]))
+        _age(conn, "Weekly", days=5)
+        conn.close()
+        ns["record_live_skipped"](config, SimpleNamespace(name="Movies"), "weekly")
+        ns["record_live_skipped"](config, SimpleNamespace(name="Movies"), "not_yet_recorded")
+        assert recorder.failures == 0
+        conn = live_record.connect(live_record.db_path(str(tmp_path)))
+        assert [r["name"] for r in live_record.find_waiting(conn, "tmdb", 5)] == ["Weekly"]
+        conn.close()
 
     def test_deleted_wrapper_marks_absent(self, tmp_path):
         ns, config, log, _ = self._ns(tmp_path)
@@ -723,18 +785,30 @@ class TestWiring:
         deleted_if = next(n for n in ast.walk(handler) if isinstance(n, ast.If) and "was deleted" in ast.unparse(n.test))
         assert _calls(deleted_if, "record_live_deleted")
 
+    def test_schedule_skips_refresh_the_record(self):
+        func = _function("run_collection")
+        handler = next(h for h in ast.walk(func) if isinstance(h, ast.ExceptHandler) and h.type is not None and ast.unparse(h.type) == "NotScheduled")
+        touch_if = next(n for n in ast.walk(handler) if isinstance(n, ast.If) and any(isinstance(stmt, ast.Expr) and _calls(stmt, "record_live_skipped") for stmt in n.body))
+        assert "not scheduled to run" in ast.unparse(touch_if.test) and "only_run_on_create" in ast.unparse(touch_if.test)
+
     def test_item_runs_never_touch_the_record(self):
-        for name in ("record_live_collection", "record_live_deleted", "prune_live_record"):
+        for name in ("record_live_collection", "record_live_deleted", "record_live_skipped", "expire_live_record"):
             first = _function(name).body[1]
             assert isinstance(first, ast.If) and "config.run_items" in ast.unparse(first.test)
         run_libraries = ast.unparse(_function("run_libraries"))
         assert "live_recorder = None if config.run_items else live_record.RunRecorder(config.default_dir, logger)" in run_libraries
 
-    def test_prune_only_on_full_runs(self):
+    def test_expiry_only_after_a_full_sweep(self):
         run_libraries = _function("run_libraries")
-        prune_ifs = [n for n in ast.walk(run_libraries) if isinstance(n, ast.If) and any(isinstance(stmt, ast.Expr) and _calls(stmt, "prune_live_record") for stmt in n.body)]
-        assert len(prune_ifs) == 1
-        assert ast.unparse(prune_ifs[0].test) == "not targeted_run and (not run_args['tests'])"
+        expire_ifs = [n for n in ast.walk(run_libraries) if isinstance(n, ast.If) and _calls(n, "expire_live_record")]
+        assert len(expire_ifs) == 1
+        assert ast.unparse(expire_ifs[0].test) == "full_sweep"
+        assert run_libraries.body[-1] is not expire_ifs[0] and run_libraries.body[-2] is expire_ifs[0]
+        full_sweep = next(n for n in run_libraries.body if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "full_sweep")
+        condition = ast.unparse(full_sweep.value)
+        for guard in ("collections_ran", "config.requested_libraries", "config.requested_collections", "config.requested_files", "run_args['tests']", "run_args['resume']"):
+            assert guard in condition
+        assert not [n for n in ast.walk(_function("run_collection")) if isinstance(n, ast.Name) and "prune" in n.id]
 
 
 def test_connect_rejects_a_non_database(tmp_path):

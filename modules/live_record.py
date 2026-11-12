@@ -13,7 +13,7 @@ Only the stdlib sqlite3 module is used.
 import os
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 DB_NAME = "live-collections.db"
 SCHEMA_VERSION = 1
@@ -23,6 +23,12 @@ BUSY_TIMEOUT_MS = 30000
 RUN_WRITE_TIMEOUT_MS = 2000
 RUN_FAILURE_LIMIT = 3
 HISTORY_KEEP = 1000
+# Nothing is ever deleted because a collection was absent from one run: a file can report "Loaded
+# Successfully" after dropping a collection (a failed dynamic section, a duplicate name, a bad entry).
+# Instead every row carries last_synced. The scheduled sweep is daily, so a configured collection is
+# never older than a day; past STALE_AFTER it stops being returned, past EXPIRE_AFTER it is deleted.
+STALE_AFTER = timedelta(days=3)
+EXPIRE_AFTER = timedelta(days=30)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS collections (
@@ -40,7 +46,7 @@ CREATE TABLE IF NOT EXISTS collections (
     collection_order TEXT,
     order_recorded INTEGER NOT NULL,
     order_recorded_at TEXT,
-    recorded_at TEXT NOT NULL,
+    last_synced TEXT NOT NULL,
     PRIMARY KEY (library, name)
 );
 CREATE TABLE IF NOT EXISTS members (
@@ -131,7 +137,12 @@ def connect(path, timeout_ms=BUSY_TIMEOUT_MS):
 
 
 def _now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return _stamp(datetime.now(timezone.utc))
+
+
+def _stamp(moment):
+    # One fixed UTC format so stamps compare correctly as text in SQL.
+    return moment.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
 def _trim_history(conn, library, name):
@@ -204,7 +215,7 @@ def write_collection(conn, snapshot):
             events.extend((WANTED_REMOVED, None, ext_id) for ext_id in sorted(old_wanted - new_wanted))
 
         conn.execute(
-            "INSERT OR REPLACE INTO collections (library, name, mapping_name, source_file, source_path, id_type, built, present, kind, members_tracked, missing_checked, collection_order, order_recorded, order_recorded_at, recorded_at) "
+            "INSERT OR REPLACE INTO collections (library, name, mapping_name, source_file, source_path, id_type, built, present, kind, members_tracked, missing_checked, collection_order, order_recorded, order_recorded_at, last_synced) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 library,
@@ -251,7 +262,7 @@ def mark_deleted(conn, library, mapping_name):
         for name in names:
             events = [(MEMBER_REMOVED, row["rating_key"], row["ext_id"]) for row in conn.execute("SELECT rating_key, ext_id FROM members WHERE library = ? AND name = ? ORDER BY rating_key", (library, name))]
             events += [(WANTED_REMOVED, None, row["ext_id"]) for row in conn.execute("SELECT ext_id FROM wanted WHERE library = ? AND name = ? ORDER BY ext_id", (library, name))]
-            conn.execute("UPDATE collections SET present = 0, members_tracked = 1, recorded_at = ? WHERE library = ? AND name = ?", (now, library, name))
+            conn.execute("UPDATE collections SET present = 0, members_tracked = 1, last_synced = ? WHERE library = ? AND name = ?", (now, library, name))
             conn.execute("DELETE FROM members WHERE library = ? AND name = ?", (library, name))
             conn.execute("DELETE FROM wanted WHERE library = ? AND name = ?", (library, name))
             conn.executemany("INSERT INTO history (library, name, recorded_at, event, rating_key, ext_id) VALUES (?, ?, ?, ?, ?, ?)", [(library, name, now, event, rk, ext_id) for event, rk, ext_id in events])
@@ -263,35 +274,44 @@ def mark_deleted(conn, library, mapping_name):
     return names
 
 
-def prune_library(conn, library, loaded_files):
-    """Drop records only for collections positively removed from config.
-
-    ``loaded_files`` maps each collection file that loaded cleanly this run (its path) to the
-    collection mapping names it defines. A record is dropped when its source file is in that map
-    and no longer defines it. Records whose file failed to load, was skipped, or is gone are kept:
-    a failed load is not evidence that the collection was removed. Returns the dropped names.
-    """
+def touch(conn, library, mapping_name):
+    """The run reached this collection but its schedule skipped it today: it is still configured, so
+    refresh last_synced on its newest record and change nothing else. Only the newest row per mapping
+    name is touched, so a renamed collection's old row still goes stale once the new title syncs.
+    Returns the record name touched, or None."""
     conn.execute("BEGIN IMMEDIATE")
     try:
-        stale = []
-        for row in conn.execute("SELECT name, mapping_name, source_path FROM collections WHERE library = ?", (library,)).fetchall():
-            names = loaded_files.get(row["source_path"])
-            if names is not None and (row["mapping_name"] or row["name"]) not in names:
-                stale.append(row["name"])
-        for name in stale:
+        row = conn.execute("SELECT name FROM collections WHERE library = ? AND mapping_name = ? ORDER BY last_synced DESC, name LIMIT 1", (library, mapping_name)).fetchone()
+        if row is not None:
+            conn.execute("UPDATE collections SET last_synced = ? WHERE library = ? AND name = ?", (_now(), library, row["name"]))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return None if row is None else row["name"]
+
+
+def expire(conn, max_age=EXPIRE_AFTER, now=None):
+    """Delete records (with their members, wanted ids and history) not synced for ``max_age``.
+    Kometa calls this only at the end of a full sweep. Returns the (library, name) pairs deleted."""
+    cutoff = _stamp((now or datetime.now(timezone.utc)) - max_age)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        expired = [(row["library"], row["name"]) for row in conn.execute("SELECT library, name FROM collections WHERE last_synced < ? ORDER BY library, name", (cutoff,)).fetchall()]
+        for library, name in expired:
             for table in ("collections", "members", "wanted", "history"):
                 conn.execute(f"DELETE FROM {table} WHERE library = ? AND name = ?", (library, name))  # nosec B608 - table names are constants
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    return stale
+    return expired
 
 
 # ── Read API (used by the arrival handler, S3) ─────────────────────────
 
 
-def find_waiting(conn, id_type, ext_id, include_unknown=True):
+def find_waiting(conn, id_type, ext_id, include_unknown=True, stale_after=STALE_AFTER, now=None):
     """Every built collection still waiting on this TMDb ('tmdb') or TVDb ('tvdb') id.
 
     An id run_missing filtered out is never returned. ``filter_state`` is 'passed' when run_missing
@@ -300,17 +320,27 @@ def find_waiting(conn, id_type, ext_id, include_unknown=True):
     filters, so callers that rebuild the collection can act on 'unknown'; pass
     ``include_unknown=False`` to get only confirmed ids.
 
+    A collection not synced within ``stale_after`` is never returned: it is no longer configured,
+    or its run keeps failing, and either way the record is no longer evidence of what it wants.
+
     Rows: library, name, mapping_name, source_file, source_path, present (the Plex collection
-    exists), collection_order, order_recorded, position, held_back, filter_state.
+    exists), collection_order, order_recorded, position, held_back, filter_state, last_synced,
+    age_seconds (since last_synced).
     """
+    moment = now or datetime.now(timezone.utc)
     rows = conn.execute(
-        "SELECT c.library, c.name, c.mapping_name, c.source_file, c.source_path, c.present, c.collection_order, c.order_recorded, w.position, w.held_back, "
+        "SELECT c.library, c.name, c.mapping_name, c.source_file, c.source_path, c.present, c.collection_order, c.order_recorded, c.last_synced, w.position, w.held_back, "
         "CASE WHEN w.filtered IS NULL THEN 'unknown' ELSE 'passed' END AS filter_state "
         "FROM wanted w JOIN collections c ON c.library = w.library AND c.name = w.name "
-        "WHERE w.ext_id = ? AND c.id_type = ? AND c.built = 1 AND (w.filtered = 0 OR (w.filtered IS NULL AND ?)) ORDER BY c.library, c.name",
-        (int(ext_id), id_type, int(bool(include_unknown))),
+        "WHERE w.ext_id = ? AND c.id_type = ? AND c.built = 1 AND c.last_synced >= ? AND (w.filtered = 0 OR (w.filtered IS NULL AND ?)) ORDER BY c.library, c.name",
+        (int(ext_id), id_type, _stamp(moment - stale_after), int(bool(include_unknown))),
     )
-    return [dict(row) for row in rows]
+    found = []
+    for row in rows:
+        entry = dict(row)
+        entry["age_seconds"] = max(0, int((moment - datetime.fromisoformat(entry["last_synced"])).total_seconds()))
+        found.append(entry)
+    return found
 
 
 def get_position(conn, library, name, ext_id):
@@ -514,8 +544,12 @@ class RunRecorder:
             self.log.info(f"Live Record: {name} deleted from Plex, recorded as absent")
         return names is not None
 
-    def prune(self, library_name, loaded_files):
-        dropped = self._run(f"pruning {library_name}", lambda conn: prune_library(conn, library_name, loaded_files))
-        for name in dropped or []:
-            self.log.info(f"Live Record: dropped {name}, no longer configured in {library_name}")
-        return dropped is not None
+    def skipped(self, library_name, mapping_name):
+        # Wrapped so "no record yet" (touch returns None) is not mistaken for a failure.
+        return self._run(mapping_name, lambda conn: (touch(conn, library_name, mapping_name),)) is not None
+
+    def expire(self):
+        expired = self._run("expiring old records", lambda conn: expire(conn))
+        for library, name in expired or []:
+            self.log.info(f"Live Record: expired {name} ({library}), not synced for {EXPIRE_AFTER.days} days")
+        return expired is not None
