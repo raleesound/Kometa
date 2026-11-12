@@ -292,7 +292,7 @@ logger = MyLogger("Kometa", default_dir, run_args["width"], run_args["divider"][
 from modules import util  # noqa: E402
 
 util.logger = logger
-from modules import arrivals, live_record, timings  # noqa: E402
+from modules import arrivals, live_record, live_watch, timings  # noqa: E402
 
 # Must be set before modules.cache/modules.request are imported below - both read this at import/decoration time, not per-call.
 timings.ENABLED = run_args["timings"]
@@ -524,6 +524,20 @@ def expire_live_record(config):
     if config.run_items or live_recorder is None:
         return
     live_recorder.expire()
+
+
+def push_live_watch(config):
+    """After a full sweep, tell the Letterboxd bridge which third-party lists live_watch collections
+    are built from (replace-set). Never raises; an unreadable record pushes nothing, so a bad read
+    cannot clear the bridge's set."""
+    if config.run_items or live_recorder is None:
+        return
+    try:
+        urls = live_recorder.watched()
+        if urls is not None:
+            live_watch.push(urls, logger)
+    except Exception as e:
+        logger.error(f"Live Watch: not pushed: {e}")
 
 
 def is_partial_run(config, args):
@@ -1374,6 +1388,7 @@ def run_libraries(config) -> tuple[LibraryRunStatus, bool]:
                 item_run_failed = True
     if collections_ran and not partial_run:
         expire_live_record(config)
+        push_live_watch(config)
     return library_status, collections_ran
 
 

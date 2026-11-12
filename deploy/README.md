@@ -133,7 +133,9 @@ tagged `kometa-fork:<sha>` locally on the host, so a rollback needs no rebuild.
 - network `media-net`, restart `unless-stopped`, `TZ` from `.env` (required:
   KOMETA_TIMES is interpreted in the container's zone; a UTC container once
   ran inside Plex's butler window and deadlocked Plex on 2026-09-03)
-- `kometa`: `DATA_DIR` → `/data`, `CONFIG_DIR` → `/config`
+- `kometa`: `DATA_DIR` → `/data`, `CONFIG_DIR` → `/config`, `LB_BRIDGE_URL`,
+  `--env-file .env.bridge` (the bridge bearer token, mode 0600, `LB_BRIDGE_TOKEN=...`;
+  full sweeps PUT the `live_watch` list URLs to `/watched-lists`)
 - `kometa-import-trigger`: `CONFIG_DIR` → `/config`, `./trigger` → `/trigger:ro`,
   `--env-file .env.nats` (the NATS nkey seed), `NATS_URL`, no published port (it
   connects out to Plex's websocket and to NATS)
