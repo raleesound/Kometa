@@ -105,7 +105,9 @@ source .env && flock -n -s "$CONFIG_DIR/.kometa.run.lock" true && echo idle || e
 
 Only recreate when it says `idle`. "idle" means no run is in progress; the
 scheduler container itself stays up and sleeps until the next `KOMETA_TIMES`
-slot (host TZ). `deploy.sh` does not check this for you.
+slot (host TZ). `deploy.sh` runs this check itself, before the build and again
+right before it recreates anything, and refuses while a run holds the lock.
+`FORCE=1` overrides it (kills the run in progress).
 
 ### Containers are recreated by hand, never by compose
 
@@ -133,7 +135,25 @@ tagged `kometa-fork:<sha>` locally on the host, so a rollback needs no rebuild.
   ran inside Plex's butler window and deadlocked Plex on 2026-09-03)
 - `kometa`: `DATA_DIR` → `/data`, `CONFIG_DIR` → `/config`
 - `kometa-import-trigger`: `CONFIG_DIR` → `/config`, `./trigger` → `/trigger:ro`,
-  publishes `TRIGGER_PORT`
+  no published port (it connects out to Plex's websocket)
+
+## The import trigger
+
+`trigger/import_trigger.py` listens on Plex's local websocket
+(`/:/websockets/notifications`, URL and token from `config.yml`) and runs
+`kometa.py --operations-only --run-items <keys>` for new imports, so a new film
+or episode gets its operations within minutes instead of at the next sweep.
+
+- A library timeline entry in state 5 ("processed") counts as an import only if
+  Plex added the item within `NEW_ITEM_WINDOW_SECONDS` (default 6h) and it is not
+  already in the seen-set. Refreshes, edits and the 2097-pinned films are ignored.
+- Episodes queue their show. Keys are debounced (`TRIGGER_DEBOUNCE_SECONDS`) into
+  one run per library; `local://` (unmatched) items are retried on a backoff.
+- Queue and seen-set persist in `CONFIG_DIR/.kometa-trigger-queue.json`. Every
+  (re)connect sweeps the libraries for items added inside the window, so a
+  restart or a dropped socket loses nothing.
+- Plex's `library.new` webhook never fired on this server; the old `:9596`
+  receiver and its plex.tv webhook registration were removed.
 
 ## Why config.yml is host-owned
 

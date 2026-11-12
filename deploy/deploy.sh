@@ -45,6 +45,24 @@ if [[ -z "$REF" ]]; then
   exit 1
 fi
 
+# Every Kometa run (scheduled sweep or the trigger's item-scoped run) holds an
+# exclusive flock on this file while it runs. Recreating a container mid-run
+# kills that run, so refuse unless FORCE=1. Checked before the (slow) build and
+# again right before the recreate, since a scheduled run can start in between.
+RUN_LOCK="${CONFIG_DIR}/.kometa.run.lock"
+require_idle() {
+  if [[ -e "$RUN_LOCK" ]] && ! flock -n -s "$RUN_LOCK" true; then
+    if [[ "${FORCE:-0}" == "1" ]]; then
+      echo "    FORCE=1 -- Kometa is mid-run; recreating anyway"
+    else
+      echo "FATAL: Kometa is mid-run (${RUN_LOCK} is locked). Recreating now would kill it." >&2
+      echo "       Wait for the run to finish, or re-run with FORCE=1." >&2
+      exit 1
+    fi
+  fi
+}
+require_idle
+
 echo "==> Fetching fork at ${REF}"
 if [[ ! -d "$SRC_DIR/.git" ]]; then
   git clone "$FORK_URL" "$SRC_DIR"
@@ -156,6 +174,7 @@ for d in movies tv playlists overlays; do
 done
 echo "    recorded $(wc -l < "$MANIFEST") files in $MANIFEST"
 
+require_idle
 echo "==> Recreating container"
 docker rm -f kometa >/dev/null 2>&1 || true
 docker run -d \
@@ -170,18 +189,16 @@ docker run -d \
 
 echo "==> Recreating import trigger"
 # Same image as the scheduler, so the trigger is always version-locked to the fork it
-# shells out to. It refuses to start if that build has no --run-items (Kometa ignores
+# shells out to. It listens on Plex's websocket (outbound only, no published port). It refuses to start if that build has no --run-items (Kometa ignores
 # unknown flags and would run a full sweep per import instead).
 docker rm -f kometa-import-trigger >/dev/null 2>&1 || true
 docker run -d \
   --name kometa-import-trigger \
   --restart unless-stopped \
   --network "${NETWORK}" \
-  -p "${TRIGGER_PORT}:${TRIGGER_PORT}" \
   -v "${CONFIG_DIR}:/config:rw" \
   -v "$(pwd)/trigger:/trigger:ro" \
   -e TZ="${TZ}" \
-  -e LISTEN_PORT="${TRIGGER_PORT}" \
   -e DEBOUNCE_SECONDS="${TRIGGER_DEBOUNCE_SECONDS}" \
   --entrypoint python3 \
   "${IMAGE}:local" /trigger/import_trigger.py
