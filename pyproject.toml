@@ -46,6 +46,7 @@ dependencies = [
     "setuptools==84.0.0",
     "tenacity==9.1.4",
     "tmdbapis==1.2.30",
+    "websocket-client==1.9.2",
 ]
 
 [tool.pytest.ini_options]
@@ -158,4 +159,5 @@ dev = [
     "setuptools==84.0.0",
     "tenacity==9.1.4",
     "tmdbapis==1.2.30",
+    "websocket-client==1.9.2",
 ]
