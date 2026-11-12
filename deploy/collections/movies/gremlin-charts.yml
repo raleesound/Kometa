@@ -22,3 +22,19 @@ collections:
     file_poster: config/movies/assets/gremlin-gremlins-trending.png
     sync_mode: sync
     radarr_add_missing: true
+  "The Divisive 50":
+    letterboxd_list: https://letterboxd.com/thisnames2long/list/the-divisive-50/
+    sort_title: "!020_LB_!03_the_divisive_50"
+    collection_order: custom
+    summary: "The films that split the Cinema Gremlins, from every star each of us has given on Letterboxd.\n\nHow it's ranked: pick any two Gremlins who rated a film and count how many stars apart they are. A film's gap is that distance, averaged over every pair of us who rated it. A film needs at least four of us to place, and the gap is pulled toward the gap a typical film gets, so a film four of us argued over can't outrank one a dozen of us did. Only the distance counts, not whether the stars are high or low: a film we all gave half a star isn't divisive, it's unanimous."
+    file_poster: config/movies/assets/gremlin-the-divisive-50.png
+    sync_mode: sync
+    radarr_add_missing: true
+  "Gremlin Deep Cuts":
+    letterboxd_list: https://letterboxd.com/thisnames2long/list/gremlin-deep-cuts/
+    sort_title: "!020_LB_!04_gremlin_deep_cuts"
+    collection_order: custom
+    summary: "The films the Cinema Gremlins love that hardly anyone else has found, from every star each of us has given on Letterboxd.\n\nHow it's ranked: a film needs at least three Gremlins' ratings, and fewer Letterboxd ratings than 9 in 10 films we've rated. Then it's scored like our Top 100: our average, pulled toward the group's overall average as if it had five more ratings, so a couple of perfect scores can't carry it. The line is worked out again as we rate more, so a film can age out when the rest of Letterboxd catches up with it."
+    file_poster: config/movies/assets/gremlin-gremlin-deep-cuts.png
+    sync_mode: sync
+    radarr_add_missing: true
