@@ -202,8 +202,39 @@ class TestHandleNotification:
     def test_vanished_item_and_lookup_errors_do_not_raise(self, trig, pending):
         server = FakeServer(sections=[FakeSection(2, "Movies", "movie")], items=[movie(12)])
         # 99 is gone (NotFound); section 7 does not exist (KeyError) - neither may break the rest.
-        trig.handle_notification(server, pending, timeline(entry(99), entry(12, section="7"), entry(12)))
+        failed = trig.handle_notification(server, pending, timeline(entry(99), entry(12, section="7"), entry(12)))
         assert pending.items == {"Movies": {"12": 0}}
+        # A vanished item is not a failure (nothing to apply); an unknown section is, and is retried.
+        assert [e["sectionID"] for e in failed] == ["7"]
+
+    def test_failed_live_lookup_is_retried_not_dropped(self, trig, pending, monkeypatch):
+        monkeypatch.setattr(trig, "RETRY_SECONDS", 0.01)
+        server = FakeServer(sections=[FakeSection(2, "Movies", "movie")], items=[movie(10)])
+        real, calls = server.fetchItem, []
+
+        def flaky(key):
+            calls.append(key)
+            if len(calls) == 1:
+                raise ConnectionResetError("plex busy")
+            return real(key)
+
+        server.fetchItem = flaky
+        inbox = trig.queue.Queue()
+        threading.Thread(target=trig.resolve_forever, args=(inbox, pending), daemon=True).start()
+        inbox.put((server, timeline(entry(10)), 0))
+        deadline = time.time() + 5
+        while not pending.items and time.time() < deadline:
+            time.sleep(0.01)
+        assert pending.items == {"Movies": {"10": 0}} and calls == [10, 10]
+
+    def test_lookup_retries_are_bounded(self, trig, monkeypatch):
+        monkeypatch.setattr(trig, "MAX_ATTEMPTS", 3)
+        started = []
+        monkeypatch.setattr(trig.threading, "Timer", lambda *a, **k: SimpleNamespace(start=lambda: started.append(k["args"]), daemon=False))
+        inbox = trig.queue.Queue()
+        trig.retry_lookup(inbox, None, [entry(10)], 1)
+        trig.retry_lookup(inbox, None, [entry(10)], 2)
+        assert len(started) == 1 and started[0][0][2] == 2
 
     def test_library_comes_from_the_item_first(self, trig, pending):
         # A library created after connect is missing from the cached section map.
@@ -224,7 +255,7 @@ class TestHandleNotification:
         monkeypatch.setattr(trig, "handle_notification", slow)
         inbox = trig.queue.Queue()
         threading.Thread(target=trig.resolve_forever, args=(inbox, pending), daemon=True).start()
-        inbox.put((None, timeline()))  # what the Listener callback does: returns at once
+        inbox.put((None, timeline(), 0))  # what the Listener callback does: returns at once
         assert not handled.wait(timeout=0.2)
         release.set()
         assert handled.wait(timeout=10)
@@ -368,6 +399,47 @@ class TestListenForever:
         trig.listen_forever(pending, connect=connect, listener_cls=FakeListener, stop=stop)
         return events
 
+    def test_handler_never_runs_on_the_socket_thread(self, trig, monkeypatch, pending):
+        # Plex lookups can take seconds; if they ran inside the websocket callback
+        # the read loop (and its pings) would stall. The callback must only enqueue.
+        monkeypatch.setattr(trig, "RECONNECT_MIN_SECONDS", 0)
+        release, socket_threads, handler_threads = threading.Event(), [], []
+
+        def slow(server, pending, data):
+            handler_threads.append(threading.current_thread().name)
+            release.wait(timeout=5)
+            return []
+
+        monkeypatch.setattr(trig, "handle_notification", slow)
+        monkeypatch.setattr(trig, "catch_up", lambda *a, **k: 0)
+        stop, calls, returned = threading.Event(), iter([1]), []
+
+        def connect():
+            if next(calls, None) is None:
+                stop.set()
+                raise ConnectionError("done")
+            return FakeServer()
+
+        class Fast:
+            def __init__(self, server, on_message):
+                self.on_message = on_message
+                self.ready, self.opened = threading.Event(), True
+                self.ready.set()
+
+            def run(self):
+                socket_threads.append(threading.current_thread().name)
+                t0 = time.time()
+                self.on_message(timeline(entry(1)))
+                returned.append(time.time() - t0)
+
+        trig.listen_forever(pending, connect=connect, listener_cls=Fast, stop=stop)
+        release.set()
+        assert returned and returned[0] < 1  # did not wait on the 5s handler
+        deadline = time.time() + 5
+        while not handler_threads and time.time() < deadline:
+            time.sleep(0.01)
+        assert handler_threads and handler_threads[0] != socket_threads[0]
+
     def test_reconnects_after_drop_and_catches_up(self, trig, monkeypatch, pending):
         events = self._harness(trig, monkeypatch, ["ok", "ok"], pending)
         assert events == [("connect", "ok"), ("socket-open",), ("socket-closed",)] * 2
@@ -440,6 +512,43 @@ class TestListenForever:
         trig.listen_forever(pending, connect=connect, listener_cls=Refused, stop=stop)
         assert sweeps == [] and pending.horizon is None
 
+    def test_hung_handshake_is_abandoned_and_retried(self, trig, monkeypatch, pending):
+        monkeypatch.setattr(trig, "RECONNECT_MIN_SECONDS", 0)
+        monkeypatch.setattr(trig, "OPEN_TIMEOUT_SECONDS", 0.05)
+        stop, connects, hung = threading.Event(), [], []
+        monkeypatch.setattr(trig, "catch_up", lambda *a, **k: None)
+
+        def connect():
+            connects.append(1)
+            if len(connects) > 2:
+                stop.set()
+                raise ConnectionError("done")
+            return FakeServer()
+
+        class Hangs(trig.Listener):
+            def run(self):
+                hung.append(self)
+                stop.wait(timeout=5)  # the handshake never completes
+
+        loop = threading.Thread(target=trig.listen_forever, args=(pending, connect, Hangs, stop), daemon=True)
+        loop.start()
+        loop.join(timeout=5)
+        stop.set()
+        assert len(connects) == 3  # it did not wait forever on the first socket
+        assert all(listener.abandoned for listener in hung)
+
+    def test_abandoned_listener_delivers_nothing(self, trig):
+        got = []
+        listener = trig.Listener(FakeServer(), got.append)
+        hung = []
+        listener.ws = SimpleNamespace(close=lambda: hung.append(1))
+        listener.abandon()
+        assert hung == [1]  # the hung socket is closed, not leaked
+        listener._message(None, json.dumps({"NotificationContainer": timeline(entry(1))}))
+        closed = []
+        listener._open(SimpleNamespace(close=lambda: closed.append(1)))
+        assert got == [] and closed == [1] and not listener.opened
+
     def test_backoff_doubles_and_caps(self, trig, monkeypatch, pending):
         monkeypatch.setattr(trig, "RECONNECT_MAX_SECONDS", 20)
         waits = []
@@ -479,6 +588,12 @@ class TestQueue:
         assert recovered.items == {"Movies": {"10": 0}}
         assert recovered.inflight == {}
 
+    def test_requeue_does_not_pull_a_later_deadline_forward(self, trig, pending):
+        pending.due_at = time.time() + 10 * trig.RETRY_SECONDS
+        later = pending.due_at
+        pending.requeue("Movies", "10", 1)
+        assert pending.due_at == later
+
     def test_new_arrival_does_not_cut_a_retry_backoff_short(self, trig, pending):
         pending.requeue("Movies", "10", 1)
         retry_at = pending.due_at
@@ -502,9 +617,23 @@ class TestQueue:
         assert recovered.items == {"Movies": {"10": 2}}
         assert recovered.due_at <= time.time() + trig.DEBOUNCE_SECONDS
 
-    def test_corrupt_queue_file_starts_empty(self, trig, tmp_path):
+    @pytest.mark.parametrize("content", ["{not json", "", "[1, 2]", '{"items": {"Movies": ["10"]}}', '{"items": {"Movies": {"10": "x"}}}'])
+    def test_bad_queue_file_starts_empty_and_says_so(self, trig, tmp_path, caplog, content):
         path = tmp_path / "queue.json"
-        path.write_text("{not json")
+        path.write_text(content)
+        with caplog.at_level("ERROR"):
+            loaded = trig.Pending(str(path))
+        assert loaded.items == {} and loaded.seen == {} and loaded.horizon is None
+        assert "starting with an empty queue" in caplog.text
+
+    def test_missing_queue_file_is_a_quiet_first_start(self, trig, tmp_path, caplog):
+        with caplog.at_level("WARNING"):
+            assert trig.Pending(str(tmp_path / "none.json")).items == {}
+        assert caplog.text == ""
+
+    def test_live_queue_file_from_the_old_trigger_loads(self, trig, tmp_path):
+        path = tmp_path / "queue.json"
+        path.write_text('{"items": {}}')  # what the webhook trigger left on the host
         assert trig.Pending(str(path)).items == {}
 
 
@@ -587,7 +716,18 @@ class TestWorker:
 
         monkeypatch.setattr(trig, "process_due", boom)
         trig.worker_step(pending)  # must not raise: it is the only thread that runs Kometa
-        assert pending.items == {"Movies": {"10": 0}} and pending.inflight == {}
+        assert pending.items == {"Movies": {"10": 1}} and pending.inflight == {}
+
+    def test_a_batch_that_keeps_crashing_is_given_up(self, trig, pending, monkeypatch):
+        monkeypatch.setattr(trig, "MAX_ATTEMPTS", 3)
+        admit(pending, 10)
+        admit(pending, 11)
+        pending.items["Movies"]["10"] = 2
+        pending.due_at = time.time() - 1
+        pending.take_due()
+        pending.restore_inflight()
+        assert pending.items == {"Movies": {"11": 1}}  # 10 hit the cap; 11 retries
+        assert "10" not in pending.seen and "11" in pending.seen
 
 
 class TestRunKometa:

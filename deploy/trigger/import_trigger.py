@@ -17,8 +17,11 @@ What makes it more than a shell-out:
 
 * **New items only.** A timeline entry in state 5 ("processed") fires on every
   refresh and edit too, not just on import. An item counts as new only if Plex
-  added it within NEW_ITEM_WINDOW_SECONDS (stretched back to the last catch-up
-  sweep after an outage) and we have not queued it before (a persisted seen-set).
+  added it after the earlier of (now - NEW_ITEM_WINDOW_SECONDS) and the start of
+  the last catch-up sweep, never more than MAX_CATCH_UP_SECONDS ago, and we have
+  not queued it before (a persisted seen-set). The sweep runs on every reconnect,
+  so on a long-lived socket that window can span days; the seen-set spans the
+  same window, so a refresh of anything already queued is still ignored.
 * **Shows, not episodes.** Library operations are defined per top-level item;
   an episode or season is queued as its show.
 * **Debounce.** Kometa costs ~17s of startup per invocation regardless of how
@@ -69,6 +72,8 @@ RECONNECT_MIN_SECONDS = int(os.environ.get("RECONNECT_MIN_SECONDS", "5"))
 RECONNECT_MAX_SECONDS = int(os.environ.get("RECONNECT_MAX_SECONDS", "300"))
 # A connection that stayed up this long was healthy; reset the backoff after it.
 STABLE_CONNECTION_SECONDS = 60
+# A websocket handshake that has not finished by then is treated as hung.
+OPEN_TIMEOUT_SECONDS = 60
 PLEX_TIMEOUT_SECONDS = 30
 CLOCK_SKEW_SECONDS = 300
 
@@ -116,17 +121,25 @@ class Pending:
         try:
             with open(self.path, encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            return  # first start
+        except (OSError, ValueError) as e:
+            log.error("queue file %s is unreadable (%s: %s); starting with an empty queue - the catch-up sweep re-finds recent arrivals", self.path, type(e).__name__, e)
             return
-        for part in ("items", "inflight"):
-            for lib, keys in (data.get(part) or {}).items():
-                for key, attempts in keys.items():
-                    self.items.setdefault(lib, {})[str(key)] = max(int(attempts), self.items.get(lib, {}).get(str(key), 0))
-        for source, value in (data.get("seen") or {}).items():
-            if isinstance(value, list) and len(value) == 2:
-                self.seen[str(source)] = [float(value[0]), str(value[1])]
-        if isinstance(data.get("horizon"), (int, float)):
-            self.horizon = float(data["horizon"])
+        try:
+            for part in ("items", "inflight"):
+                for lib, keys in (data.get(part) or {}).items():
+                    for key, attempts in keys.items():
+                        self.items.setdefault(str(lib), {})[str(key)] = max(int(attempts), self.items.get(str(lib), {}).get(str(key), 0))
+            for source, value in (data.get("seen") or {}).items():
+                if isinstance(value, list) and len(value) == 2:
+                    self.seen[str(source)] = [float(value[0]), str(value[1])]
+            if isinstance(data.get("horizon"), (int, float)):
+                self.horizon = float(data["horizon"])
+        except (AttributeError, TypeError, ValueError) as e:
+            log.error("queue file %s is malformed (%s: %s); starting with an empty queue - the catch-up sweep re-finds recent arrivals", self.path, type(e).__name__, e)
+            self.items, self.seen, self.horizon = {}, {}, None
+            return
         if self.items:
             # Anything recovered from disk was already accepted (or was mid-run when
             # the process died); send it promptly rather than waiting for an event.
@@ -138,6 +151,8 @@ class Pending:
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump({"items": self.items, "inflight": self.inflight, "seen": self.seen, "horizon": self.horizon}, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, self.path)
         except (OSError, TypeError, ValueError) as e:
             log.warning("could not persist queue: %s", e)
@@ -214,11 +229,22 @@ class Pending:
             self._save_locked()
 
     def restore_inflight(self) -> None:
-        """Put an unfinished batch back in the queue (the worker hit an unexpected error)."""
+        """Put an unfinished batch back in the queue (the worker hit an unexpected error).
+
+        Each key is charged an attempt, so a batch that keeps hitting the same bug
+        is given up on after MAX_ATTEMPTS instead of blocking the queue forever.
+        """
         with self.cond:
             for lib, keys in self.inflight.items():
                 for key, attempts in keys.items():
-                    self.items.setdefault(lib, {})[key] = max(attempts, self.items.get(lib, {}).get(key, 0))
+                    attempts = max(attempts, self.items.get(lib, {}).get(key, 0)) + 1
+                    if attempts >= MAX_ATTEMPTS:
+                        log.warning("giving up on %s: batch failed %d times", key, attempts)
+                        self.items.get(lib, {}).pop(key, None)
+                        self.seen = {k: v for k, v in self.seen.items() if v[1] != key}
+                        continue
+                    self.items.setdefault(lib, {})[key] = attempts
+            self.items = {lib: keys for lib, keys in self.items.items() if keys}
             self.inflight = {}
             if self.items:
                 self.due_at = max(self.due_at, time.time() + RETRY_SECONDS)
@@ -313,7 +339,9 @@ def fetch_item(server: Any, rating_key: str) -> Any | None:
         return None
 
 
-def handle_notification(server: Any, pending: Pending, data: dict) -> None:
+def handle_notification(server: Any, pending: Pending, data: dict) -> list[dict]:
+    """Queue the new imports in a notification. Returns the entries whose lookup failed."""
+    failed = []
     for entry in processed_entries(data):
         try:
             item = fetch_item(server, str(entry["itemID"]))
@@ -324,8 +352,10 @@ def handle_notification(server: Any, pending: Pending, data: dict) -> None:
             library = getattr(item, "librarySectionTitle", None) or server.library.sectionByID(int(entry["sectionID"])).title
         except Exception as e:  # one bad entry must not stop the rest
             log.warning("could not look up %s %s: %s", TIMELINE_TYPES[entry["type"]], entry["itemID"], e)
+            failed.append(entry)
             continue
         consider(pending, library, item)
+    return failed
 
 
 def resolve_forever(inbox: queue.Queue, pending: Pending) -> None:
@@ -335,11 +365,26 @@ def resolve_forever(inbox: queue.Queue, pending: Pending) -> None:
     callback would stall the read loop (and its ping/pong) during a bulk import.
     """
     while True:
-        server, data = inbox.get()
+        server, data, attempt = inbox.get()
         try:
-            handle_notification(server, pending, data)
+            failed = handle_notification(server, pending, data)
         except Exception as e:
             log.exception("notification handler failed: %s", e)
+            failed = processed_entries(data)
+        if failed:
+            retry_lookup(inbox, server, failed, attempt)
+
+
+def retry_lookup(inbox: queue.Queue, server: Any, entries: list[dict], attempt: int) -> None:
+    """Look failed entries up again after a backoff (a one-shot timer, not a poll)."""
+    keys = ", ".join(str(e["itemID"]) for e in entries)
+    if attempt + 1 >= MAX_ATTEMPTS:
+        log.error("giving up looking up %s after %d attempts; the next reconnect sweep still covers them", keys, attempt + 1)
+        return
+    log.info("retrying lookup of %s in %ds (attempt %d)", keys, RETRY_SECONDS, attempt + 1)
+    timer = threading.Timer(RETRY_SECONDS, inbox.put, args=((server, {"type": "timeline", "TimelineEntry": entries}, attempt + 1),))
+    timer.daemon = True
+    timer.start()
 
 
 def catch_up(server: Any, pending: Pending, now: float | None = None) -> int:
@@ -376,12 +421,27 @@ class Listener:
         # Set once the handshake succeeds or the attempt ends; ``opened`` says which.
         self.ready = threading.Event()
         self.opened = False
+        self.abandoned = False
 
-    def _open(self, _ws: Any) -> None:
+    def _open(self, ws: Any) -> None:
+        if self.abandoned:  # opened after we gave up on it: a newer session owns events
+            ws.close()
+            return
         self.opened = True
         self.ready.set()
 
+    def abandon(self) -> None:
+        """Give up on a hung handshake: drop anything it delivers and close it if it can be."""
+        self.abandoned = True
+        try:
+            if self.ws is not None:
+                self.ws.close()
+        except Exception as e:
+            log.warning("could not close hung websocket: %s", e)
+
     def _message(self, _ws: Any, message: str) -> None:
+        if self.abandoned:
+            return
         try:
             data = json.loads(message)["NotificationContainer"]
         except (ValueError, KeyError, TypeError) as e:
@@ -423,15 +483,19 @@ def listen_forever(
         started = time.time()
         try:
             server = connect()
-            listener = listener_cls(server, lambda data, server=server: inbox.put((server, data)))
+            listener = listener_cls(server, lambda data, server=server: inbox.put((server, data, 0)))
             thread = threading.Thread(target=listener.run, daemon=True, name="plex-websocket")
             thread.start()
             # Sweep only once the socket is open, so nothing added in between is
             # missed and the horizon never advances while we are deaf. A failed
             # sweep must not abandon the live socket (a second listener would
             # double-queue), so it is contained here.
-            listener.ready.wait()
-            if listener.opened:
+            if not listener.ready.wait(OPEN_TIMEOUT_SECONDS):
+                # Hung handshake. Reconnect rather than go deaf; the abandoned
+                # listener drops anything it might still deliver.
+                log.warning("Plex websocket did not open within %ds", OPEN_TIMEOUT_SECONDS)
+                listener.abandon()
+            elif listener.opened:
                 log.info("listening to Plex websocket (debounce %ds, new-item window %ds)", DEBOUNCE_SECONDS, NEW_ITEM_WINDOW_SECONDS)
                 try:
                     caught = catch_up(server, pending)
@@ -439,7 +503,7 @@ def listen_forever(
                         log.info("catch-up queued %d item(s) added while not listening", caught)
                 except Exception as e:
                     log.warning("catch-up sweep failed: %s: %s", type(e).__name__, e)
-            thread.join()
+                thread.join()
             log.warning("Plex websocket closed")
         except Exception as e:
             log.warning("Plex connection failed: %s: %s", type(e).__name__, e)
