@@ -496,7 +496,7 @@ def queue_watch_builds(conn, url, content_hash, now=None, stale_after=STALE_AFTE
             return None
         found = watchers(conn, url, stale_after=stale_after, now=now)
         for build in found:
-            queue_build(conn, build["library"], build["mapping_name"], build["source_file"], now=now)
+            queue_build(conn, build["library"], build["mapping_name"], build["source_file"], now=now, renew=True)
         if found:
             conn.execute("INSERT INTO watch_seen (url, hash, seen_at) VALUES (?, ?, ?) ON CONFLICT (url) DO UPDATE SET hash = excluded.hash, seen_at = excluded.seen_at", (url, content_hash, stamp))
         conn.execute("COMMIT")
@@ -694,16 +694,15 @@ def mark_published(conn, library, rating_key, raw=None, now=None):
     return row is not None and (raw is None or row["payload"] == raw)
 
 
-def queue_build(conn, library, mapping_name, source_file, now=None):
+def queue_build(conn, library, mapping_name, source_file, now=None, renew=False):
     """Ask the trigger for a scoped Kometa run of a collection (it is not in Plex yet and an arrival
-    waits on it, or a list it is built from changed). A request for a collection already queued is a
-    new one: its generation moves on and its failed attempts are forgiven, so a run that was already
-    in flight cannot settle it."""
-    conn.execute(
-        "INSERT INTO builds (library, mapping_name, source_file, requested_at, attempts, gen) VALUES (?, ?, ?, ?, 0, 0) "
-        "ON CONFLICT (library, mapping_name) DO UPDATE SET source_file = excluded.source_file, requested_at = excluded.requested_at, attempts = 0, gen = gen + 1",
-        (library, mapping_name, source_file, _stamp(now or datetime.now(timezone.utc))),
-    )
+    waits on it, or a list it is built from changed). ``renew`` (a changed list) makes a request for
+    a collection already queued a new one: its generation moves on and its failed attempts are
+    forgiven, so a run already in flight cannot settle it. Without it (arrivals) a queued request is
+    only refreshed."""
+    insert = "INSERT INTO builds (library, mapping_name, source_file, requested_at, attempts, gen) VALUES (?, ?, ?, ?, 0, 0) ON CONFLICT (library, mapping_name) DO UPDATE SET source_file = excluded.source_file, requested_at = excluded.requested_at"
+    renewed = insert + ", attempts = 0, gen = gen + 1"
+    conn.execute(renewed if renew else insert, (library, mapping_name, source_file, _stamp(now or datetime.now(timezone.utc))))
 
 
 def pending_builds(conn):

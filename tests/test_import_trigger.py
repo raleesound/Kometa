@@ -1339,6 +1339,20 @@ class TestArrivalsFirst:
                 except ProcessLookupError:
                     pass
 
+    def test_a_wake_while_the_worker_is_busy_never_counts_as_a_stop(self, trig, tmp_path, monkeypatch):
+        live_record, path = _db(trig, tmp_path)
+        gate = trig.BuildGate()  # never idle: nothing can start
+        monkeypatch.setattr(trig, "GATE", gate)
+        spawned = []
+        monkeypatch.setattr(trig, "_spawn", lambda cmd: spawned.append(cmd))
+        conn = live_record.connect(path)
+        live_record.queue_build(conn, "Movies", "Picks", "collections/picks.yml")
+        for _ in range(trig.BUILD_MAX_STOPS + 2):
+            trig.run_builds(path)
+        assert spawned == [] and gate.stops(("Movies", "Picks")) == 0
+        assert [(b["mapping_name"], b["attempts"]) for b in live_record.pending_builds(conn)] == [("Picks", 0)]
+        conn.close()
+
     def test_stops_are_counted_and_never_charged(self, trig, tmp_path, monkeypatch):
         live_record, path = _db(trig, tmp_path)
         gate = trig.BuildGate()
@@ -1752,6 +1766,24 @@ class TestWatchedLists:
         _, path = _watched(trig, tmp_path)
         return trig.WatchConsumer(path, "nats://x:4222", "seed", lambda: woke.append(1)), path
 
+    def test_a_failed_ack_after_the_commit_still_runs_the_build_on_redelivery(self, trig, tmp_path):
+        import asyncio
+
+        woke = []
+        consumer, path = self._consumer(trig, tmp_path, woke)
+        msg = FakeMsg(_event())
+
+        async def broken_ack():
+            raise ConnectionError("ack lost")
+
+        msg.ack = broken_ack
+        with pytest.raises(ConnectionError):
+            asyncio.run(consumer.handle(msg))
+        assert woke == []  # committed and queued, the builder never woken
+        again = FakeMsg(_event(), delivered=2)
+        asyncio.run(consumer.handle(again))
+        assert again.acked and woke == [1]
+
     def test_the_message_is_acked_only_after_the_run_is_queued_and_wakes_the_builder(self, trig, tmp_path):
         import asyncio
 
@@ -1762,7 +1794,7 @@ class TestWatchedLists:
         assert msg.acked and not msg.termed and woke == [1]
         again = FakeMsg(_event(), delivered=2)
         asyncio.run(consumer.handle(again))
-        assert again.acked and woke == [1]
+        assert again.acked and woke == [1, 1]  # a duplicate wakes the builder too
 
     def test_poison_is_terminated_not_redelivered(self, trig, tmp_path):
         import asyncio

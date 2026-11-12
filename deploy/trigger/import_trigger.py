@@ -676,8 +676,21 @@ class _Stopped:
         return False
 
 
-# A queued collection run that did not start, or was stopped, because an arrival was due.
+# A queued collection run that was stopped (SIGTERM/SIGKILL sent) because an arrival was due.
 RUN_STOPPED: Any = _Stopped()
+
+
+class _Deferred:
+    def __repr__(self) -> str:
+        return "RUN_DEFERRED"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+# A queued collection run that never started: the item worker had work. No process was signalled, so
+# it is not a stop and does not count toward BUILD_MAX_STOPS.
+RUN_DEFERRED: Any = _Deferred()
 # A stopped run gets SIGTERM; one still running this long after it gets SIGKILL.
 STOP_GRACE_SECONDS = 30
 # A queued collection run stopped this many times for arrivals runs to completion on its next pass:
@@ -773,12 +786,12 @@ GATE = BuildGate()
 
 
 def run_command(command: list[str], gate: BuildGate | None = None, protected: bool = False) -> Any:
-    """Run Kometa; the finished process (returncode, stdout, stderr), or RUN_STOPPED when ``gate``
-    kept it from starting or stopped it. A timeout kills the whole process group (the child holding
+    """Run Kometa; the finished process (returncode, stdout, stderr), RUN_DEFERRED when ``gate``
+    kept it from starting, or RUN_STOPPED when it stopped it. A timeout kills the whole process group (the child holding
     the run lock with it) and raises subprocess.TimeoutExpired."""
     proc = _spawn(command) if gate is None else gate.start(command, protected=protected)
     if proc is None:
-        return RUN_STOPPED
+        return RUN_DEFERRED
     try:
         try:
             stdout, stderr = proc.communicate(timeout=RUN_TIMEOUT_SECONDS)
@@ -818,7 +831,7 @@ def run_unless_busy(run: Callable[..., Any], *args: Any, wait: Callable[[], bool
     spurious = 0
     while True:
         result = run(*args)
-        if result is RUN_STOPPED:
+        if result is RUN_STOPPED or result is RUN_DEFERRED:
             return result
         if result is not RUN_BUSY:
             return bool(result)
@@ -1044,8 +1057,8 @@ def run_build(library: str, mapping_name: str, gate: BuildGate | None = None) ->
     except OSError as e:
         log.error("could not start Kometa for %s: %s", mapping_name, e)
         return False
-    if result is RUN_STOPPED:
-        return RUN_STOPPED
+    if result is RUN_STOPPED or result is RUN_DEFERRED:
+        return result
     if result.returncode == EXIT_LOCK_BUSY:
         return RUN_BUSY
     if result.returncode != 0:
@@ -1065,6 +1078,9 @@ def run_builds(record_path: str | None = None, run: Callable[[str, str], Any] = 
         for build in live_record.pending_builds(conn):
             library, mapping_name = build["library"], build["mapping_name"]
             result = run_unless_busy(run, library, mapping_name)
+            if result is RUN_DEFERRED:
+                log.info("arrivals first: running %s once the item runs are done", mapping_name)
+                return
             if result is RUN_STOPPED:
                 stops = GATE.note_stop((library, mapping_name))
                 log.info("arrivals first: running %s once the item runs are done (stopped %d of %d times)", mapping_name, stops, BUILD_MAX_STOPS)
@@ -1074,7 +1090,7 @@ def run_builds(record_path: str | None = None, run: Callable[[str, str], Any] = 
                 live_record.finish_build(conn, library, mapping_name, build["gen"])
                 log.info("built %s in %s", mapping_name, library)
             elif live_record.fail_build(conn, library, mapping_name, BUILD_MAX_ATTEMPTS, build["gen"]):
-                log.warning("giving up on running %s after %d attempts; the scheduled sweep builds it", mapping_name, BUILD_MAX_ATTEMPTS)
+                log.error("giving up on running %s after %d attempts; the scheduled sweep builds it", mapping_name, BUILD_MAX_ATTEMPTS)
     except Exception as e:
         log.exception("queued collection runs failed: %s", e)
     finally:
@@ -1419,7 +1435,8 @@ class WatchConsumer(NatsClient):
             await msg.term()
             return
         await msg.ack()
-        if outcome == WATCH_QUEUED:
+        # A duplicate is a redelivery after an ack that failed post-commit: its builds are queued but may never have woken the builder.
+        if outcome in (WATCH_QUEUED, WATCH_DUPLICATE):
             self.on_queued()
 
     async def consume(self, sub: Any, stop: threading.Event | None) -> None:
