@@ -16,7 +16,10 @@ import time
 from datetime import datetime, timedelta, timezone
 
 DB_NAME = "live-collections.db"
-SCHEMA_VERSION = 1
+# Bump on any schema change: an older record is dropped and rebuilt (it is derived data; the next
+# sweep repopulates it).
+SCHEMA_VERSION = 2
+TABLES = ("collections", "members", "wanted", "history")
 # Readers (the arrival handler) can afford to wait; a Kometa run must not stall on a held lock,
 # so its writes use a short timeout and give up for the rest of the run after repeated failures.
 BUSY_TIMEOUT_MS = 30000
@@ -47,6 +50,7 @@ CREATE TABLE IF NOT EXISTS collections (
     order_recorded INTEGER NOT NULL,
     order_recorded_at TEXT,
     last_synced TEXT NOT NULL,
+    last_status TEXT NOT NULL DEFAULT 'ok',
     PRIMARY KEY (library, name)
 );
 CREATE TABLE IF NOT EXISTS members (
@@ -110,8 +114,9 @@ def _set_wal(conn, timeout_ms):
             delay = min(delay * 2, 0.25)
 
 
-def connect(path, timeout_ms=BUSY_TIMEOUT_MS):
-    """Open the record, creating the schema on first use. Autocommit; callers open their own transactions."""
+def connect(path, timeout_ms=BUSY_TIMEOUT_MS, log=None):
+    """Open the record, creating the schema on first use. A record from an older schema version is
+    dropped and rebuilt (logged to ``log`` when given). Autocommit; callers open their own transactions."""
     conn = sqlite3.connect(path, timeout=timeout_ms / 1000, isolation_level=None)
     try:
         conn.row_factory = sqlite3.Row
@@ -121,7 +126,13 @@ def connect(path, timeout_ms=BUSY_TIMEOUT_MS):
             # executescript() would commit our BEGIN IMMEDIATE, so run the statements one by one.
             conn.execute("BEGIN IMMEDIATE")
             try:
-                if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                if version < SCHEMA_VERSION:
+                    if version > 0:
+                        for table in TABLES:
+                            conn.execute(f"DROP TABLE IF EXISTS {table}")  # nosec B608 - table names are constants
+                        if log is not None:
+                            log.warning(f"Live Record: schema v{version} is out of date, dropped the record and rebuilt it as v{SCHEMA_VERSION}; the next sweep repopulates it")
                     for statement in SCHEMA.split(";"):
                         if statement.strip():
                             conn.execute(statement)
@@ -215,8 +226,8 @@ def write_collection(conn, snapshot):
             events.extend((WANTED_REMOVED, None, ext_id) for ext_id in sorted(old_wanted - new_wanted))
 
         conn.execute(
-            "INSERT OR REPLACE INTO collections (library, name, mapping_name, source_file, source_path, id_type, built, present, kind, members_tracked, missing_checked, collection_order, order_recorded, order_recorded_at, last_synced) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO collections (library, name, mapping_name, source_file, source_path, id_type, built, present, kind, members_tracked, missing_checked, collection_order, order_recorded, order_recorded_at, last_synced, last_status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 library,
                 name,
@@ -233,6 +244,7 @@ def write_collection(conn, snapshot):
                 int(order_recorded),
                 order_recorded_at,
                 now,
+                "ok" if snapshot.get("sync_ok", True) else "failed",
             ),
         )
         conn.execute("DELETE FROM members WHERE library = ? AND name = ?", (library, name))
@@ -281,9 +293,26 @@ def touch(conn, library, mapping_name):
     Returns the record name touched, or None."""
     conn.execute("BEGIN IMMEDIATE")
     try:
-        row = conn.execute("SELECT name FROM collections WHERE library = ? AND mapping_name = ? ORDER BY last_synced DESC, name LIMIT 1", (library, mapping_name)).fetchone()
+        row = conn.execute("SELECT name, last_status FROM collections WHERE library = ? AND mapping_name = ? ORDER BY last_synced DESC, name LIMIT 1", (library, mapping_name)).fetchone()
+        if row is not None and row["last_status"] != "ok":
+            row = None  # its last real sync failed: let it go stale rather than vouch for it
         if row is not None:
             conn.execute("UPDATE collections SET last_synced = ? WHERE library = ? AND name = ?", (_now(), library, row["name"]))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return None if row is None else row["name"]
+
+
+def mark_failed(conn, library, mapping_name):
+    """The collection's run failed before its membership settled: flag its newest record so schedule
+    skips stop refreshing it. last_synced is left alone. Returns the record name flagged, or None."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT name FROM collections WHERE library = ? AND mapping_name = ? ORDER BY last_synced DESC, name LIMIT 1", (library, mapping_name)).fetchone()
+        if row is not None:
+            conn.execute("UPDATE collections SET last_status = 'failed' WHERE library = ? AND name = ?", (library, row["name"]))
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -299,7 +328,7 @@ def expire(conn, max_age=EXPIRE_AFTER, now=None):
     try:
         expired = [(row["library"], row["name"]) for row in conn.execute("SELECT library, name FROM collections WHERE last_synced < ? ORDER BY library, name", (cutoff,)).fetchall()]
         for library, name in expired:
-            for table in ("collections", "members", "wanted", "history"):
+            for table in TABLES:
                 conn.execute(f"DELETE FROM {table} WHERE library = ? AND name = ?", (library, name))  # nosec B608 - table names are constants
         conn.execute("COMMIT")
     except Exception:
@@ -508,7 +537,7 @@ class RunRecorder:
         if self.failures >= self.failure_limit:
             return None
         try:
-            conn = connect(self.path, timeout_ms=self.timeout_ms)
+            conn = connect(self.path, timeout_ms=self.timeout_ms, log=self.log)
             try:
                 result = action(conn)
             finally:
@@ -523,10 +552,11 @@ class RunRecorder:
         self.failures = 0
         return result
 
-    def record(self, library, metadata, builder, mapping_name, add_ran, sync_ran):
-        """Record one collection. Returns True when written."""
+    def record(self, library, metadata, builder, mapping_name, add_ran, sync_ran, sync_ok=True):
+        """Record one collection. ``sync_ok`` is False when a later step of its run failed. Returns True when written."""
         try:
             snapshot = build_snapshot(builder, library, metadata, add_ran, sync_ran, mapping_name=mapping_name)
+            snapshot["sync_ok"] = sync_ok
         except Exception as e:
             self.log.stacktrace()
             self.log.error(f"Live Record Error: {mapping_name}: {e}")
@@ -543,6 +573,9 @@ class RunRecorder:
         for name in names or []:
             self.log.info(f"Live Record: {name} deleted from Plex, recorded as absent")
         return names is not None
+
+    def failed(self, library_name, mapping_name):
+        return self._run(mapping_name, lambda conn: (mark_failed(conn, library_name, mapping_name),)) is not None
 
     def skipped(self, library_name, mapping_name):
         # Wrapped so "no record yet" (touch returns None) is not mistaken for a failure.

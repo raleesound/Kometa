@@ -301,7 +301,7 @@ timings.registry.enabled = run_args["timings"]
 from modules.builder import CollectionBuilder  # noqa: E402
 from modules.config import ConfigFile  # noqa: E402
 from modules.request import Requests  # noqa: E402
-from modules.util import BuilderValidationError, Deleted, Failed, FilterFailed, MappingConvertError, NonExisting, NotScheduled, OverlayError, ServiceError  # noqa: E402
+from modules.util import BuilderValidationError, Deleted, Failed, FilterFailed, MappingConvertError, NonExisting, NotScheduled, OverlayError, ScheduleSkip, ServiceError  # noqa: E402
 
 plex_maintenance_error = "Plex Critical Error: Response 503 (service_unavailable) received. Plex may be running startup or maintenance tasks. Kometa cannot proceed until this is complete"
 
@@ -452,7 +452,7 @@ def should_sync_collection(builder):
 live_recorder = None  # live_record.RunRecorder for the current run; set in run_libraries()
 
 
-def record_live_collection(config, library, metadata, builder, mapping_name, add_ran, sync_ran):
+def record_live_collection(config, library, metadata, builder, mapping_name, add_ran, sync_ran, sync_ok=True):
     """Write this collection's membership, wanted ids and order to the live record (#5634).
 
     A per-item run (--run-items) never touches the record: it does not rebuild collections.
@@ -460,7 +460,14 @@ def record_live_collection(config, library, metadata, builder, mapping_name, add
     """
     if config.run_items or live_recorder is None:
         return
-    live_recorder.record(library, metadata, builder, mapping_name, add_ran, sync_ran)
+    live_recorder.record(library, metadata, builder, mapping_name, add_ran, sync_ran, sync_ok=sync_ok)
+
+
+def record_live_failed(config, library, mapping_name):
+    """The collection's run failed before it settled: flag its record so schedule skips stop vouching for it."""
+    if config.run_items or live_recorder is None:
+        return
+    live_recorder.failed(library.name, mapping_name)
 
 
 def record_live_deleted(config, library, mapping_name):
@@ -471,7 +478,8 @@ def record_live_deleted(config, library, mapping_name):
 
 
 def record_live_skipped(config, library, mapping_name):
-    """The collection's schedule skipped it this run: it is still configured, so keep its record fresh."""
+    """The collection's schedule skipped it this run (a ScheduleSkip): it is still configured, so keep its
+    record fresh, unless its last real sync failed (live_record.touch checks)."""
     if config.run_items or live_recorder is None:
         return
     live_recorder.skipped(library.name, mapping_name)
@@ -483,6 +491,11 @@ def expire_live_record(config):
     if config.run_items or live_recorder is None:
         return
     live_recorder.expire()
+
+
+def is_partial_run(config, args):
+    """Anything short of a full sweep (every library, every file, every collection, for real)."""
+    return bool(config.requested_libraries or config.requested_collections or config.requested_files or args["tests"] or args["resume"])
 
 
 def collection_count_after_run(beginning_count, items_added, items_removed):
@@ -1117,6 +1130,8 @@ def run_config(config, stats):
 def run_libraries(config) -> tuple[LibraryRunStatus, bool]:
     global live_recorder
     live_recorder = None if config.run_items else live_record.RunRecorder(config.default_dir, logger)
+    # Decided now: run_collection clears run_args["resume"] once it reaches the resume target.
+    partial_run = is_partial_run(config, run_args)
     library_status: LibraryRunStatus = {}
     collections_ran = False
     config.run_libraries = []
@@ -1315,9 +1330,7 @@ def run_libraries(config) -> tuple[LibraryRunStatus, bool]:
         except Exception as e:
             library.notify(get_critical_error_message(e))
             log_critical_exception(e)
-    # Only a full sweep: every library, every file, every collection, for real.
-    full_sweep = collections_ran and not (config.requested_libraries or config.requested_collections or config.requested_files or run_args["tests"] or run_args["resume"])
-    if full_sweep:
+    if collections_ran and not partial_run:
         expire_live_record(config)
     return library_status, collections_ran
 
@@ -1503,7 +1516,9 @@ def run_collection(config, library, metadata, requested_collections):
                 library.status[str(mapping_name)]["status"] = "Skipped Run Definition"
             else:
                 library.status[str(mapping_name)]["status"] = "Not Scheduled"
-                if str(e).endswith("not scheduled to run") or str(e).startswith("Skipped because only_run_on_create"):
+                if str(e).endswith("and could not be found to delete"):
+                    record_live_deleted(config, library, mapping_name)
+                elif isinstance(e, ScheduleSkip):
                     record_live_skipped(config, library, mapping_name)
         except FilterFailed:
             pass
@@ -1535,8 +1550,11 @@ def run_collection(config, library, metadata, requested_collections):
             logger.error(f"Unknown Error: {e}")
             library.status[str(mapping_name)]["status"] = "Unknown Error"
             library.status[str(mapping_name)]["errors"].append(e)
+        sync_ok = not library.status[str(mapping_name)]["errors"]
         if live_ran is not None:
-            record_live_collection(config, library, metadata, live_ran[0], mapping_name, live_ran[1], live_ran[2])
+            record_live_collection(config, library, metadata, live_ran[0], mapping_name, live_ran[1], live_ran[2], sync_ok=sync_ok)
+        elif not sync_ok:
+            record_live_failed(config, library, mapping_name)
         collection_run_time = str(datetime.now() - collection_start).split(".")[0]
         library.status[str(mapping_name)]["run_time"] = collection_run_time
         logger.info("")

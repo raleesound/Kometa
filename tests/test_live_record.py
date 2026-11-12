@@ -112,6 +112,15 @@ def _age(conn, name, days, library="Movies"):
 METADATA = SimpleNamespace(get_file_name=lambda: "picks", path="/config/movies/picks.yml")
 
 
+V1_SCHEMA = """
+CREATE TABLE collections (library TEXT NOT NULL, name TEXT NOT NULL, source_file TEXT, source_path TEXT, id_type TEXT, built INTEGER NOT NULL, present INTEGER NOT NULL, kind TEXT NOT NULL,
+    members_tracked INTEGER NOT NULL, missing_checked INTEGER NOT NULL, collection_order TEXT, order_recorded INTEGER NOT NULL, recorded_at TEXT NOT NULL, PRIMARY KEY (library, name));
+CREATE TABLE members (library TEXT NOT NULL, name TEXT NOT NULL, rating_key INTEGER NOT NULL, ext_id INTEGER, position INTEGER, PRIMARY KEY (library, name, rating_key));
+CREATE TABLE wanted (library TEXT NOT NULL, name TEXT NOT NULL, ext_id INTEGER NOT NULL, filtered INTEGER NOT NULL, held_back INTEGER NOT NULL, position INTEGER, PRIMARY KEY (library, name, ext_id));
+CREATE TABLE history (id INTEGER PRIMARY KEY AUTOINCREMENT, library TEXT NOT NULL, name TEXT NOT NULL, recorded_at TEXT NOT NULL, event TEXT NOT NULL, rating_key INTEGER, ext_id INTEGER);
+"""
+
+
 class StackLogger(FakeLogger):
     def __init__(self):
         super().__init__()
@@ -161,6 +170,48 @@ class TestStorage:
         assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert db.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION
         assert db.execute("PRAGMA busy_timeout").fetchone()[0] == live_record.BUSY_TIMEOUT_MS
+
+    def test_an_older_schema_is_dropped_and_rebuilt_loudly(self, tmp_path):
+        # The v1 shape this branch first shipped (recorded_at, no mapping_name/last_synced).
+        path = live_record.db_path(str(tmp_path))
+        old = sqlite3.connect(path)
+        old.executescript(V1_SCHEMA)
+        old.execute("INSERT INTO collections VALUES ('Movies', 'Picks', 'picks', '/config/picks.yml', 'tmdb', 1, 1, 'manual', 1, 1, NULL, 0, '2026-11-01T00:00:00+00:00')")
+        old.execute("PRAGMA user_version = 1")
+        old.commit()
+        old.close()
+        log = StackLogger()
+        conn = live_record.connect(path, log=log)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION == 2
+        assert live_record.get_collection(conn, "Movies", "Picks") is None
+        assert any("schema v1 is out of date" in m for m in log.warning_messages)
+        live_record.write_collection(conn, snapshot(wanted=[(5, False, False, None)]))
+        assert [r["name"] for r in live_record.find_waiting(conn, "tmdb", 5)] == ["Picks"]
+        conn.close()
+
+    def test_the_recorder_survives_an_older_schema(self, tmp_path):
+        path = live_record.db_path(str(tmp_path))
+        old = sqlite3.connect(path)
+        old.executescript(V1_SCHEMA)
+        old.execute("PRAGMA user_version = 1")
+        old.commit()
+        old.close()
+        log = StackLogger()
+        recorder = live_record.RunRecorder(str(tmp_path), log)
+        assert recorder.record(fake_library(), METADATA, fake_builder(), "picks", False, False) is True
+        assert recorder.failures == 0
+        assert any("rebuilt it as v2" in m for m in log.warning_messages)
+
+    def test_a_current_record_is_not_rebuilt(self, tmp_path):
+        path = live_record.db_path(str(tmp_path))
+        conn = live_record.connect(path)
+        live_record.write_collection(conn, snapshot())
+        conn.close()
+        log = StackLogger()
+        conn = live_record.connect(path, log=log)
+        assert live_record.get_collection(conn, "Movies", "Picks") is not None
+        assert not log.warning_messages
+        conn.close()
 
     def test_reopen_keeps_data(self, tmp_path):
         path = live_record.db_path(str(tmp_path))
@@ -310,6 +361,26 @@ class TestPartialRuns:
         assert [r["name"] for r in live_record.find_waiting(db, "tmdb", 5)] == ["New Title"]
         assert live_record.touch(db, "Movies", "never_recorded") is None
         assert not db.in_transaction
+
+    def test_a_failed_sync_is_not_refreshed_by_schedule_skips(self, db):
+        live_record.write_collection(db, snapshot(name="Weekly", mapping_name="weekly", wanted=[(5, False, False, None)]))
+        _age(db, "Weekly", days=5)
+        assert live_record.mark_failed(db, "Movies", "weekly") == "Weekly"
+        assert live_record.touch(db, "Movies", "weekly") is None
+        assert live_record.find_waiting(db, "tmdb", 5) == []
+        assert live_record.get_collection(db, "Movies", "Weekly")["last_status"] == "failed"
+        # The next real sync that succeeds clears it.
+        live_record.write_collection(db, snapshot(name="Weekly", mapping_name="weekly", wanted=[(5, False, False, None)]))
+        assert live_record.get_collection(db, "Movies", "Weekly")["last_status"] == "ok"
+        _age(db, "Weekly", days=5)
+        assert live_record.touch(db, "Movies", "weekly") == "Weekly"
+        assert live_record.mark_failed(db, "Movies", "never_recorded") is None
+        assert not db.in_transaction
+
+    def test_a_sync_that_errored_after_snapshot_is_written_as_failed(self, db):
+        live_record.write_collection(db, snapshot(name="Weekly", mapping_name="weekly", sync_ok=False))
+        assert live_record.get_collection(db, "Movies", "Weekly")["last_status"] == "failed"
+        assert live_record.touch(db, "Movies", "weekly") is None
 
     def test_find_waiting_reports_age_and_honours_stale_after(self, db):
         live_record.write_collection(db, snapshot(wanted=[(5, False, False, None)]))
@@ -565,7 +636,7 @@ class TestRunIntegration:
     def _ns(self, tmp_path, run_items=False, **recorder_kwargs):
         log = StackLogger()
         recorder = live_record.RunRecorder(str(tmp_path), log, **recorder_kwargs)
-        ns = _kometa_functions("record_live_collection", "record_live_deleted", "record_live_skipped", "expire_live_record", live_recorder=recorder, live_record=live_record)
+        ns = _kometa_functions("record_live_collection", "record_live_deleted", "record_live_skipped", "record_live_failed", "expire_live_record", live_recorder=recorder, live_record=live_record)
         config = SimpleNamespace(run_items=run_items, default_dir=str(tmp_path))
         return ns, config, log, recorder
 
@@ -582,6 +653,8 @@ class TestRunIntegration:
         ns, config, log, _ = self._ns(tmp_path, run_items=True)
         ns["record_live_collection"](config, fake_library(), METADATA, fake_builder(), "picks", False, False)
         ns["record_live_deleted"](config, fake_library(), "picks")
+        ns["record_live_skipped"](config, fake_library(), "picks")
+        ns["record_live_failed"](config, fake_library(), "picks")
         ns["expire_live_record"](config)
         assert not Path(live_record.db_path(str(tmp_path))).exists()
 
@@ -648,6 +721,25 @@ class TestRunIntegration:
         assert recorder.failures == 0
         conn = live_record.connect(live_record.db_path(str(tmp_path)))
         assert [r["name"] for r in live_record.find_waiting(conn, "tmdb", 5)] == ["Weekly"]
+        conn.close()
+
+    def test_failed_run_stops_skips_refreshing_through_the_wrappers(self, tmp_path):
+        ns, config, log, recorder = self._ns(tmp_path)
+        movies = SimpleNamespace(name="Movies")
+        builder = fake_builder(missing_movies=[7])
+        ns["record_live_collection"](config, fake_library(), METADATA, builder, "picks", True, True, sync_ok=False)
+        conn = live_record.connect(live_record.db_path(str(tmp_path)))
+        assert live_record.get_collection(conn, "Movies", "Picks")["last_status"] == "failed"
+        live_record.write_collection(conn, snapshot(name="Weekly", mapping_name="weekly", wanted=[(5, False, False, None)]))
+        _age(conn, "Weekly", days=4)
+        conn.close()
+        ns["record_live_failed"](config, movies, "weekly")
+        ns["record_live_skipped"](config, movies, "weekly")
+        assert recorder.failures == 0
+        conn = live_record.connect(live_record.db_path(str(tmp_path)))
+        weekly = live_record.get_collection(conn, "Movies", "Weekly")
+        assert weekly["last_status"] == "failed"
+        assert live_record.find_waiting(conn, "tmdb", 5) == []
         conn.close()
 
     def test_deleted_wrapper_marks_absent(self, tmp_path):
@@ -789,25 +881,99 @@ class TestWiring:
         func = _function("run_collection")
         handler = next(h for h in ast.walk(func) if isinstance(h, ast.ExceptHandler) and h.type is not None and ast.unparse(h.type) == "NotScheduled")
         touch_if = next(n for n in ast.walk(handler) if isinstance(n, ast.If) and any(isinstance(stmt, ast.Expr) and _calls(stmt, "record_live_skipped") for stmt in n.body))
-        assert "not scheduled to run" in ast.unparse(touch_if.test) and "only_run_on_create" in ast.unparse(touch_if.test)
+        assert ast.unparse(touch_if.test) == "isinstance(e, ScheduleSkip)"
+        gone_if = next(n for n in ast.walk(handler) if isinstance(n, ast.If) and "could not be found to delete" in ast.unparse(n.test))
+        assert _calls(gone_if, "record_live_deleted")
+
+    def test_builder_raises_schedule_skip_only_for_configured_schedule_skips(self):
+        source = (REPO_ROOT / "modules" / "builder.py").read_text(encoding="utf-8")
+        raises = [n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call) and isinstance(n.exc.func, ast.Name)]
+        skips = sorted(ast.unparse(n.exc.args[0]) for n in raises if n.exc.func.id == "ScheduleSkip")
+        assert skips == sorted(
+            [
+                "'Skipped because only_run_on_create is True and the collection already exists'",
+                "f'{err}\\n\\n{self.Type} {self.name} not scheduled to run{suffix}'",
+                "f'{msg}{suffix}'",
+                "self.non_existing",
+            ]
+        )
+        # run_definition and a broken tmdb_person setup are not schedule skips: they stay plain NotScheduled.
+        plain = " ".join(ast.unparse(n.exc.args[0]) for n in raises if n.exc.func.id == "NotScheduled" and n.exc.args)
+        assert "run_definition" in plain and "tmdb_person" in plain
+
+    def test_schedule_skip_is_a_not_scheduled(self):
+        from modules.util import NotScheduled, ScheduleSkip
+
+        assert issubclass(ScheduleSkip, NotScheduled)
+
+    def test_errored_collections_are_marked_failed(self):
+        loop = next(n for n in ast.walk(_function("run_collection")) if isinstance(n, ast.For))
+        try_index = next(i for i, stmt in enumerate(loop.body) if isinstance(stmt, ast.Try))
+        after = loop.body[try_index + 1 :]
+        assert ast.unparse(after[0]) == "sync_ok = not library.status[str(mapping_name)]['errors']"
+        record_if = after[1]
+        assert "sync_ok=sync_ok" in ast.unparse(record_if.body[0])
+        assert ast.unparse(record_if.orelse[0].test) == "not sync_ok" and _calls(record_if.orelse[0], "record_live_failed")
 
     def test_item_runs_never_touch_the_record(self):
-        for name in ("record_live_collection", "record_live_deleted", "record_live_skipped", "expire_live_record"):
+        for name in ("record_live_collection", "record_live_deleted", "record_live_skipped", "record_live_failed", "expire_live_record"):
             first = _function(name).body[1]
             assert isinstance(first, ast.If) and "config.run_items" in ast.unparse(first.test)
         run_libraries = ast.unparse(_function("run_libraries"))
         assert "live_recorder = None if config.run_items else live_record.RunRecorder(config.default_dir, logger)" in run_libraries
 
-    def test_expiry_only_after_a_full_sweep(self):
-        run_libraries = _function("run_libraries")
-        expire_ifs = [n for n in ast.walk(run_libraries) if isinstance(n, ast.If) and _calls(n, "expire_live_record")]
-        assert len(expire_ifs) == 1
-        assert ast.unparse(expire_ifs[0].test) == "full_sweep"
-        assert run_libraries.body[-1] is not expire_ifs[0] and run_libraries.body[-2] is expire_ifs[0]
-        full_sweep = next(n for n in run_libraries.body if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "full_sweep")
-        condition = ast.unparse(full_sweep.value)
-        for guard in ("collections_ran", "config.requested_libraries", "config.requested_collections", "config.requested_files", "run_args['tests']", "run_args['resume']"):
-            assert guard in condition
+    def _sweep(self, run_collection_clears_resume=True, **overrides):
+        """Run the real run_libraries over one fake library; return whether it expired the record."""
+        args = {k: False for k in ("tests", "delete-collections", "delete-labels", "playlists-only", "operations-only", "overlays-only", "collections-only", "metadata-only")}
+        args["resume"] = overrides.pop("resume", None)
+        args["tests"] = overrides.pop("tests", False)
+        recorder = MagicMock()
+
+        def run_collection(config, library, metadata, requested):
+            if run_collection_clears_resume:
+                args["resume"] = None  # what the real run_collection does on reaching its target
+
+        metadata = MagicMock()
+        metadata.get_file_name.return_value = "picks"
+        metadata.get_collections.return_value = ["c1"]
+        library = MagicMock(skip_library=False, collection_files=[metadata], run_order=["collections"], collection_names=[], hub_priorities={}, auto_sort_hubs=False, is_music=False, timeout=60)
+        library.name = "Movies"
+        library.cache_items.return_value = []
+        config = SimpleNamespace(run_items=False, default_dir="/nowhere", libraries=[library], Cache=None, requested_libraries=None, requested_collections=None, requested_files=None)
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        ns = _kometa_functions(
+            "run_libraries",
+            "is_partial_run",
+            "expire_live_record",
+            run_args=args,
+            run_collection=run_collection,
+            live_record=SimpleNamespace(RunRecorder=lambda *_: recorder),
+            logger=MagicMock(),
+            plexapi=MagicMock(),
+            timings=MagicMock(),
+            os=__import__("os"),
+            datetime=datetime,
+            Failed=Exception,
+            NotFound=Exception,
+            log_critical_exception=lambda e: (_ for _ in ()).throw(e),
+            get_critical_error_message=str,
+        )
+        _, collections_ran = ns["run_libraries"](config)
+        assert collections_ran
+        return recorder.expire.called
+
+    def test_a_full_sweep_expires(self):
+        assert self._sweep() is True
+
+    def test_a_resumed_run_never_expires_even_after_resume_is_cleared(self):
+        assert self._sweep(resume="c1") is False
+
+    @pytest.mark.parametrize("override", [{"requested_collections": ["c1"]}, {"requested_files": ["picks"]}, {"requested_libraries": ["Movies"]}, {"tests": True}])
+    def test_a_partial_run_never_expires(self, override):
+        assert self._sweep(**override) is False
+
+    def test_no_prune_left_in_run_collection(self):
         assert not [n for n in ast.walk(_function("run_collection")) if isinstance(n, ast.Name) and "prune" in n.id]
 
 

@@ -15,7 +15,7 @@ from modules import add_budget, anidb, anilist, floppy, icheckmovies, imdb, lett
 from modules.overlay import Overlay, rating_sources
 from modules.poster import KometaImage
 from modules.request import quote
-from modules.util import BuilderValidationError, Deleted, Failed, FilterFailed, MappingConvertError, NonExisting, NotScheduled, NotScheduledRange, OverlayError, ServiceError
+from modules.util import BuilderValidationError, Deleted, Failed, FilterFailed, MappingConvertError, NonExisting, NotScheduled, NotScheduledRange, OverlayError, ScheduleSkip, ServiceError
 
 logger = util.logger
 
@@ -974,7 +974,7 @@ class CollectionBuilder:
             logger.debug(f"Value: {data[methods['only_run_on_create']]}")
             self.only_run_on_create = util.parse(self.Type, "only_run_on_create", self.data, datatype="bool", methods=methods, default=False)
         if self.obj and self.only_run_on_create:
-            raise NotScheduled("Skipped because only_run_on_create is True and the collection already exists")
+            raise ScheduleSkip("Skipped because only_run_on_create is True and the collection already exists")
 
         if "allowed_library_types" in methods and "run_definition" not in methods:
             logger.warning(f"{self.Type} Warning: allowed_library_types will run as run_definition")
@@ -1277,7 +1277,7 @@ class CollectionBuilder:
                             suffix = " and was deleted"
                         except Failed:
                             suffix = " and could not be found to delete"
-                    raise NotScheduled(f"{err}\n\n{self.Type} {self.name} not scheduled to run{suffix}")
+                    raise ScheduleSkip(f"{err}\n\n{self.Type} {self.name} not scheduled to run{suffix}")
 
         if "delete_collections_named" in methods and not self.overlay and not self.playlist:
             logger.debug("")
@@ -1476,7 +1476,7 @@ class CollectionBuilder:
                             suffix = " and was deleted"
                         except Failed:
                             suffix = " and could not be found to delete"
-                    raise NotScheduled(f"{msg}{suffix}")
+                    raise ScheduleSkip(f"{msg}{suffix}")
 
         self.smart_url = None
         self.smart_type_key = None
@@ -1808,7 +1808,7 @@ class CollectionBuilder:
                 self.sync = False
             self.run_again = False
         if self.non_existing is not False and self.obj:
-            raise NotScheduled(self.non_existing)
+            raise ScheduleSkip(self.non_existing)
 
         logger.info("")
         logger.info("Validation Successful")
