@@ -182,7 +182,7 @@ class TestStorage:
         old.close()
         log = StackLogger()
         conn = live_record.connect(path, log=log)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION == 5
         assert live_record.get_collection(conn, "Movies", "Picks") is None
         assert any("schema v1 is out of date" in m for m in log.warning_messages)
         live_record.write_collection(conn, snapshot(wanted=[(5, False, False, None)]))
@@ -200,7 +200,7 @@ class TestStorage:
         recorder = live_record.RunRecorder(str(tmp_path), log)
         assert recorder.record(fake_library(), METADATA, fake_builder(), "picks", False, False) is True
         assert recorder.failures == 0
-        assert any("rebuilt it as v4" in m for m in log.warning_messages)
+        assert any("rebuilt it as v5" in m for m in log.warning_messages)
 
     def test_a_current_record_is_not_rebuilt(self, tmp_path):
         path = live_record.db_path(str(tmp_path))
@@ -1266,3 +1266,90 @@ def test_watch_urls_only_for_opted_in_letterboxd_list_builders():
     lists = [("letterboxd_list", {"url": LIST_B}), ("tmdb_popular", 5), ("letterboxd_list", {"url": LIST_A})]
     assert live_record._watch_urls(fake(True, lists)) == [LIST_A, LIST_B]
     assert live_record._watch_urls(fake(False, lists)) == []
+
+
+# ── watched list changes (epic #5634 S6) ──────────────────────────────
+
+
+def test_a_watched_list_change_queues_every_collection_built_from_it(db):
+    live_record.write_collection(db, snapshot("One", watch_urls=[LIST_A, LIST_B]))
+    live_record.write_collection(db, snapshot("Two", library="TV", watch_urls=[LIST_B]))
+    live_record.write_collection(db, snapshot("Plain"))
+    queued = live_record.queue_watch_builds(db, LIST_A, "h1")
+    assert [(b["library"], b["mapping_name"]) for b in queued] == [("Movies", "One")]
+    assert [(b["library"], b["mapping_name"]) for b in live_record.pending_builds(db)] == [("Movies", "One")]
+    live_record.finish_build(db, "Movies", "One")
+    both = live_record.queue_watch_builds(db, LIST_B, "h2")
+    assert sorted(b["mapping_name"] for b in both) == ["One", "Two"]
+
+
+def test_the_same_url_and_hash_again_queues_nothing_but_a_new_hash_does(db):
+    live_record.write_collection(db, snapshot("One", watch_urls=[LIST_A]))
+    assert live_record.queue_watch_builds(db, LIST_A, "h1")
+    live_record.finish_build(db, "Movies", "One")
+    assert live_record.queue_watch_builds(db, LIST_A, "h1") is None
+    assert live_record.pending_builds(db) == []
+    assert live_record.queue_watch_builds(db, LIST_A, "h2")
+    live_record.finish_build(db, "Movies", "One")
+    # The list changed back: that is a real change again.
+    assert live_record.queue_watch_builds(db, LIST_A, "h1")
+
+
+def test_an_unwatched_url_queues_nothing_and_is_not_remembered(db):
+    assert live_record.queue_watch_builds(db, LIST_A, "h1") == []
+    assert db.execute("SELECT COUNT(*) FROM watch_seen").fetchone()[0] == 0
+    live_record.write_collection(db, snapshot("One", watch_urls=[LIST_A]))
+    assert live_record.queue_watch_builds(db, LIST_A, "h1")
+
+
+def test_a_deleted_or_stale_collection_is_not_rebuilt_for_its_list(db):
+    live_record.write_collection(db, snapshot("Gone", watch_urls=[LIST_A]))
+    live_record.mark_deleted(db, "Movies", "Gone")
+    assert live_record.queue_watch_builds(db, LIST_A, "h1") == []
+    live_record.write_collection(db, snapshot("Old", watch_urls=[LIST_B]))
+    later = datetime.now(timezone.utc) + live_record.STALE_AFTER + timedelta(hours=1)
+    assert live_record.queue_watch_builds(db, LIST_B, "h1", now=later) == []
+
+
+def test_the_record_upgrades_from_v4_in_place_with_watch_seen(tmp_path):
+    path = live_record.db_path(str(tmp_path))
+    conn = live_record.connect(path)
+    conn.execute("DROP TABLE watch_seen")
+    conn.execute("ALTER TABLE builds DROP COLUMN gen")
+    conn.execute("PRAGMA user_version = 4")
+    conn.close()
+    conn = live_record.connect(path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION
+        assert conn.execute("SELECT COUNT(*) FROM watch_seen").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_a_request_made_while_its_run_is_in_flight_survives_that_run(db):
+    live_record.write_collection(db, snapshot("One", watch_urls=[LIST_A]))
+    live_record.queue_watch_builds(db, LIST_A, "h1")
+    served = live_record.pending_builds(db)[0]
+    # The run for h1 is going; h2 arrives and queues the same collection again.
+    assert live_record.queue_watch_builds(db, LIST_A, "h2")
+    assert live_record.finish_build(db, "Movies", "One", served["gen"]) is False
+    again = live_record.pending_builds(db)
+    assert len(again) == 1 and again[0]["gen"] == served["gen"] + 1
+    assert live_record.finish_build(db, "Movies", "One", again[0]["gen"]) is True
+    assert live_record.pending_builds(db) == []
+
+
+def test_a_new_request_forgives_failed_attempts_and_a_stale_failure_is_not_charged(db):
+    live_record.write_collection(db, snapshot("One", watch_urls=[LIST_A]))
+    live_record.queue_watch_builds(db, LIST_A, "h1")
+    first = live_record.pending_builds(db)[0]
+    assert live_record.fail_build(db, "Movies", "One", 3, first["gen"]) is False
+    assert live_record.fail_build(db, "Movies", "One", 3, first["gen"]) is False
+    live_record.queue_watch_builds(db, LIST_A, "h2")
+    assert live_record.pending_builds(db)[0]["attempts"] == 0
+    # The run that served h1 fails now: the h2 request is not charged for it, nor dropped.
+    assert live_record.fail_build(db, "Movies", "One", 3, first["gen"]) is False
+    assert live_record.pending_builds(db)[0]["attempts"] == 0
+    current = live_record.pending_builds(db)[0]
+    assert [live_record.fail_build(db, "Movies", "One", 3, current["gen"]) for _ in range(3)] == [False, False, True]
+    assert live_record.pending_builds(db) == []

@@ -1666,3 +1666,227 @@ class TestPublisher:
 
     def test_wake_before_the_loop_starts_is_harmless(self, trig, tmp_path):
         trig.Publisher(str(tmp_path / "db"), "nats://x:4222", "seed").wake()
+
+
+WATCH_URL = "https://letterboxd.com/someone/list/top/"
+
+
+def _watched(trig, tmp_path, urls=(WATCH_URL,), name="Top 100"):
+    from tests.test_live_record import snapshot
+
+    live_record, path = _db(trig, tmp_path)
+    conn = live_record.connect(path)
+    live_record.write_collection(conn, snapshot(name, watch_urls=list(urls)))
+    conn.close()
+    return live_record, path
+
+
+def _event(url=WATCH_URL, content_hash="abc123def456"):
+    return json.dumps({"type": "watchedlist.updated", "url": url, "hash": content_hash, "items": [], "changed_at": "2026-11-12T12:00:00.000Z"}).encode()
+
+
+class FakeMsg:
+    def __init__(self, data, delivered=1):
+        self.data = data
+        self.acked = self.termed = False
+        self.metadata = SimpleNamespace(num_delivered=delivered)
+
+    async def ack(self):
+        self.acked = True
+
+    async def term(self):
+        self.termed = True
+
+
+class FakeSub:
+    def __init__(self, batches):
+        self.batches = list(batches)
+
+    async def fetch(self, batch=1, timeout=None):
+        item = self.batches.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class TestWatchedLists:
+    def test_an_event_queues_a_scoped_run_of_the_collection_and_a_redelivery_does_not(self, trig, tmp_path):
+        live_record, path = _watched(trig, tmp_path)
+        assert trig.queue_watched_list(_event(), path) == trig.WATCH_QUEUED
+        conn = live_record.connect(path)
+        assert [(b["library"], b["mapping_name"]) for b in live_record.pending_builds(conn)] == [("Movies", "Top 100")]
+        # The builder runs it: exactly one scoped run, through the same lock-aware path.
+        runs = []
+        trig.run_builds(path, run=lambda library, name: runs.append((library, name)) or True)
+        assert runs == [("Movies", "Top 100")] and live_record.pending_builds(conn) == []
+        assert trig.queue_watched_list(_event(), path) == trig.WATCH_DUPLICATE
+        trig.run_builds(path, run=lambda library, name: runs.append((library, name)) or True)
+        assert runs == [("Movies", "Top 100")]
+        conn.close()
+
+    def test_a_busy_run_lock_requeues_without_losing_the_run(self, trig, tmp_path, monkeypatch):
+        live_record, path = _watched(trig, tmp_path)
+        monkeypatch.setattr(trig, "wait_for_run_lock", lambda path=None: True)  # a sweep held it, and let go
+        trig.queue_watched_list(_event(), path)
+        results = [trig.RUN_BUSY, True]
+        runs = []
+        trig.run_builds(path, run=lambda library, name: runs.append(1) or results.pop(0))
+        # exit 75: run_unless_busy waits for the lock to come free and runs it again, uncharged.
+        assert len(runs) == 2
+
+    def test_an_unknown_url_is_warned_about_and_queues_nothing(self, trig, tmp_path, caplog):
+        live_record, path = _watched(trig, tmp_path)
+        assert trig.queue_watched_list(_event(url="https://letterboxd.com/x/list/nope/"), path) == trig.WATCH_UNKNOWN
+        assert any(r.levelname == "WARNING" and "nope" in r.getMessage() for r in caplog.records)
+        conn = live_record.connect(path)
+        assert live_record.pending_builds(conn) == []
+        conn.close()
+
+    @pytest.mark.parametrize("body", [b"not json", b"[]", b"{}", json.dumps({"url": "u"}).encode(), json.dumps({"url": "", "hash": "h"}).encode(), json.dumps({"url": 3, "hash": "h"}).encode()])
+    def test_an_unreadable_event_is_poison_and_logs_error(self, trig, tmp_path, caplog, body):
+        _, path = _watched(trig, tmp_path)
+        assert trig.queue_watched_list(body, path) == trig.WATCH_POISON
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+
+    def _consumer(self, trig, tmp_path, woke):
+        _, path = _watched(trig, tmp_path)
+        return trig.WatchConsumer(path, "nats://x:4222", "seed", lambda: woke.append(1)), path
+
+    def test_the_message_is_acked_only_after_the_run_is_queued_and_wakes_the_builder(self, trig, tmp_path):
+        import asyncio
+
+        woke = []
+        consumer, path = self._consumer(trig, tmp_path, woke)
+        msg = FakeMsg(_event())
+        asyncio.run(consumer.handle(msg))
+        assert msg.acked and not msg.termed and woke == [1]
+        again = FakeMsg(_event(), delivered=2)
+        asyncio.run(consumer.handle(again))
+        assert again.acked and woke == [1]
+
+    def test_poison_is_terminated_not_redelivered(self, trig, tmp_path):
+        import asyncio
+
+        consumer, _ = self._consumer(trig, tmp_path, [])
+        msg = FakeMsg(b"garbage")
+        asyncio.run(consumer.handle(msg))
+        assert msg.termed and not msg.acked
+
+    def test_an_unwritable_record_leaves_the_message_unacked_and_the_last_delivery_logs_error(self, trig, tmp_path, caplog, monkeypatch):
+        import asyncio
+
+        woke = []
+        consumer, _ = self._consumer(trig, tmp_path, woke)
+
+        def boom(*_a, **_k):
+            raise OSError("disk gone")
+
+        monkeypatch.setattr(trig, "queue_watched_list", boom)
+        first = FakeMsg(_event(), delivered=1)
+        asyncio.run(consumer.handle(first))
+        assert not first.acked and not first.termed and woke == []
+        assert not any(r.levelname == "ERROR" for r in caplog.records)
+        last = FakeMsg(_event(), delivered=trig.WATCH_MAX_DELIVER)
+        asyncio.run(consumer.handle(last))
+        assert not last.acked and any(r.levelname == "ERROR" and "dropped" in r.getMessage() for r in caplog.records)
+
+    def test_an_idle_pull_asks_again_and_a_message_is_handled(self, trig, tmp_path):
+        import asyncio
+
+        woke = []
+        consumer, _ = self._consumer(trig, tmp_path, woke)
+        stop = threading.Event()
+        msg = FakeMsg(_event())
+
+        class Timeout(Exception):
+            pass
+
+        Timeout.__name__ = "TimeoutError"
+        sub = FakeSub([Timeout(), [msg], Timeout()])
+        orig = sub.fetch
+
+        async def fetch(batch=1, timeout=None):
+            if not sub.batches:
+                stop.set()
+                return []
+            return await orig(batch, timeout)
+
+        sub.fetch = fetch
+        asyncio.run(consumer.consume(sub, stop))
+        assert msg.acked and woke == [1]
+
+    def test_main_binds_the_bridge_durable_and_rebinds_when_it_does_not_exist_yet(self, trig, tmp_path, monkeypatch, caplog):
+        import asyncio
+
+        monkeypatch.setattr(trig, "PUBLISH_RETRY_MIN_SECONDS", 0.01)
+        woke = []
+        consumer, _ = self._consumer(trig, tmp_path, woke)
+        stop = threading.Event()
+        msg = FakeMsg(_event())
+        binds = []
+
+        class ServiceUnavailableError(Exception):
+            """nats-py: the first pull on a durable that does not exist gets a 503 (bind itself sends nothing)."""
+
+        unsubscribed = []
+
+        class Sub(FakeSub):
+            async def unsubscribe(self):
+                unsubscribed.append(1)
+
+        class Js:
+            async def pull_subscribe_bind(self, durable, stream=None):
+                binds.append((durable, stream))
+                if len(binds) == 1:
+                    return Sub([ServiceUnavailableError("503")])
+                return Sub([[msg]])
+
+        class Nc:
+            def jetstream(self):
+                return Js()
+
+            async def close(self):
+                pass
+
+        async def connect():
+            return Nc()
+
+        consumer._connect = connect
+        original = consumer.handle
+
+        async def handle(m):
+            await original(m)
+            stop.set()
+
+        consumer.handle = handle
+        asyncio.run(consumer.main(stop))
+        assert binds == [("kometa-trigger-watchedlists", "LETTERBOXD")] * 2
+        assert msg.acked and unsubscribed == [1]
+        assert any(r.levelname == "WARNING" and "binding again" in r.getMessage() for r in caplog.records)
+
+    def test_the_seed_is_shared_and_never_logged_and_no_seed_says_so(self, trig, monkeypatch, caplog):
+        started = threading.Event()
+        monkeypatch.setattr(trig.WatchConsumer, "run_forever", lambda self: started.set())
+        assert trig.start_watch_consumer("", lambda: None) is None
+        assert any(r.levelname == "ERROR" and "watchedlist" in r.getMessage() for r in caplog.records)
+        consumer = trig.start_watch_consumer("SUAMSEEDSEEDSEED", lambda: None)
+        assert consumer is not None and started.wait(10) and "SUAMSEEDSEEDSEED" not in caplog.text
+
+    def test_a_change_that_arrives_while_its_run_is_going_is_run_after_it(self, trig, tmp_path):
+        live_record, path = _watched(trig, tmp_path)
+        trig.queue_watched_list(_event(content_hash="h1"), path)
+        runs = []
+
+        def run(library, name):
+            runs.append(name)
+            if len(runs) == 1:
+                # h2 lands (and is acked) while h1's run is going.
+                assert trig.queue_watched_list(_event(content_hash="h2"), path) == trig.WATCH_QUEUED
+            return True
+
+        trig.run_builds(path, run=run)
+        conn = live_record.connect(path)
+        assert len(live_record.pending_builds(conn)) == 1  # h2 survived h1's run
+        trig.run_builds(path, run=run)
+        assert runs == ["Top 100", "Top 100"] and live_record.pending_builds(conn) == []
+        conn.close()
