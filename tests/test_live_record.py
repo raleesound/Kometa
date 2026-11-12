@@ -1353,3 +1353,12 @@ def test_a_new_request_forgives_failed_attempts_and_a_stale_failure_is_not_charg
     current = live_record.pending_builds(db)[0]
     assert [live_record.fail_build(db, "Movies", "One", 3, current["gen"]) for _ in range(3)] == [False, False, True]
     assert live_record.pending_builds(db) == []
+
+
+def test_an_arrival_requeue_keeps_attempts_and_generation(db):
+    live_record.queue_build(db, "Movies", "One", "one")
+    first = live_record.pending_builds(db)[0]
+    assert live_record.fail_build(db, "Movies", "One", 3, first["gen"]) is False
+    live_record.queue_build(db, "Movies", "One", "one")
+    again = live_record.pending_builds(db)[0]
+    assert (again["attempts"], again["gen"]) == (1, first["gen"])
