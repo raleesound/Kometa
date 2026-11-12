@@ -1339,6 +1339,9 @@ class TestArrivalsFirst:
                 except ProcessLookupError:
                     pass
 
+    def test_run_unless_busy_passes_a_deferred_run_through_uncharged(self, trig):
+        assert trig.run_unless_busy(lambda: trig.RUN_DEFERRED) is trig.RUN_DEFERRED
+
     def test_a_wake_while_the_worker_is_busy_never_counts_as_a_stop(self, trig, tmp_path, monkeypatch):
         live_record, path = _db(trig, tmp_path)
         gate = trig.BuildGate()  # never idle: nothing can start

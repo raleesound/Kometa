@@ -713,7 +713,7 @@ def _signal_group(proc: Any, sig: int) -> None:
 class BuildGate:
     """Arrivals first. A queued collection run (up to RUN_TIMEOUT_SECONDS under the run lock) starts
     only while the item worker is waiting for work, and the worker stops one it finds running before
-    it runs a batch. A stopped run stays queued, uncharged, and runs again once the worker is idle."""
+    it runs a batch. A stopped or deferred run stays queued, uncharged, and runs again once the worker is idle."""
 
     def __init__(self) -> None:
         self.woken = threading.Event()
@@ -826,7 +826,7 @@ def wait_for_run_lock(path: str | None = None) -> bool:
 
 def run_unless_busy(run: Callable[..., Any], *args: Any, wait: Callable[[], bool] | None = None) -> Any:
     """Run, and while the run reports the lock busy, wait for the lock and run again. A busy
-    result is never charged as a failed attempt. Passes RUN_STOPPED through; otherwise a bool."""
+    result is never charged as a failed attempt. Passes RUN_STOPPED and RUN_DEFERRED through; otherwise a bool."""
     wait = wait or wait_for_run_lock
     spurious = 0
     while True:
@@ -1028,7 +1028,7 @@ def process_due(
 def run_build(library: str, mapping_name: str, gate: BuildGate | None = None) -> Any:
     """A scoped Kometa run of one collection (an arrival is waiting for it and it is not in Plex, or a
     list it is built from changed).
-    RUN_STOPPED when an arrival came due first (``gate``, GATE by default)."""
+    RUN_STOPPED when an arrival stopped it, RUN_DEFERRED when it never started because the worker had work (``gate``, GATE by default)."""
     command = [
         "python3",
         KOMETA_PY,
