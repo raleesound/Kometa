@@ -532,10 +532,12 @@ def push_live_watch(config):
     cannot clear the bridge's set."""
     if config.run_items or live_recorder is None:
         return
-    urls = live_recorder.watched()
-    if urls is None:
-        return
-    live_watch.push(urls, logger)
+    try:
+        urls = live_recorder.watched()
+        if urls is not None:
+            live_watch.push(urls, logger)
+    except Exception as e:
+        logger.error(f"Live Watch: not pushed: {e}")
 
 
 def is_partial_run(config, args):

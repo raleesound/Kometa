@@ -1223,14 +1223,19 @@ def test_watched_urls_unions_live_watch_collections(db):
     assert live_record.watched_urls(db) == [LIST_A, LIST_B]
 
 
-def test_watched_urls_drops_deleted_failed_and_stale(db):
+def test_watched_urls_drops_deleted_and_stale_but_keeps_a_failed_sync(db):
     live_record.write_collection(db, snapshot("Gone", watch_urls=[LIST_A]))
     live_record.mark_deleted(db, "Movies", "Gone")
     live_record.write_collection(db, snapshot("Bad", watch_urls=[LIST_B], sync_ok=False))
-    assert live_record.watched_urls(db) == []
+    assert live_record.watched_urls(db) == [LIST_B]
     live_record.write_collection(db, snapshot("Old", watch_urls=[LIST_A]))
     later = datetime.now(timezone.utc) + live_record.STALE_AFTER + timedelta(hours=1)
     assert live_record.watched_urls(db, now=later) == []
+
+
+def test_watch_urls_only_passes_list_urls():
+    builder = MagicMock(live_watch=True, builders=[("letterboxd_list", {"url": LIST_A}), ("letterboxd_list", {"url": "https://letterboxd.com/someone/films/"}), ("tmdb_list", {"url": LIST_B})])
+    assert live_record._watch_urls(builder) == [LIST_A]
 
 
 def test_dropping_live_watch_stops_watching_on_the_next_record(db):

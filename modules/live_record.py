@@ -14,6 +14,7 @@ Only the stdlib sqlite3 module is used.
 
 import json
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -450,10 +451,11 @@ def expire(conn, max_age=EXPIRE_AFTER, now=None):
 def watched_urls(conn, stale_after=STALE_AFTER, now=None):
     """Every Letterboxd list URL a live_watch collection is currently built from, sorted. Collections
     not synced within ``stale_after`` or no longer present are left out, so deleting a collection (or
-    dropping live_watch) stops the bridge watching its lists at the next sweep."""
+    dropping live_watch) stops the bridge watching its lists at the next sweep. A collection whose last
+    sync failed stays watched until it goes stale: one bad run must not drop a list from a replace-set."""
     cutoff = _stamp((now or datetime.now(timezone.utc)) - stale_after)
     urls = set()
-    for row in conn.execute("SELECT watch_urls FROM collections WHERE watch_urls IS NOT NULL AND present = 1 AND last_status = 'ok' AND last_synced >= ?", (cutoff,)):
+    for row in conn.execute("SELECT watch_urls FROM collections WHERE watch_urls IS NOT NULL AND present = 1 AND last_synced >= ?", (cutoff,)):
         urls.update(json.loads(row["watch_urls"]))
     return sorted(urls)
 
@@ -711,11 +713,15 @@ def _list_order(builder, library):
     return {ext_id: index for index, ext_id in enumerate(order)}
 
 
+_LIST_URL = re.compile(r"^https?://(?:www\.)?letterboxd\.com/[^/\s?#]+/list/[^/\s?#]+/?$", re.IGNORECASE)
+
+
 def _watch_urls(builder):
     """The Letterboxd list URLs to watch for this collection: only when it opted in with live_watch."""
     if not getattr(builder, "live_watch", False):
         return []
-    return sorted({value["url"] for method, value in builder.builders if method == "letterboxd_list" and isinstance(value, dict) and value.get("url")})
+    # The bridge rejects the whole replace-set on one non-list URL, so only /user/list/slug/ URLs go out.
+    return sorted({value["url"] for method, value in builder.builders if method == "letterboxd_list" and isinstance(value, dict) and _LIST_URL.match(str(value.get("url") or ""))})
 
 
 def build_snapshot(builder, library, metadata, add_ran, sync_ran, mapping_name=None):
@@ -863,8 +869,9 @@ class RunRecorder:
 
     def watched(self):
         """The Letterboxd list URLs to watch (sorted), or None when the record could not be read."""
-        result = self._run("reading watched lists", lambda conn: (watched_urls(conn),))
-        return None if result is None else result[0]
+        result = self._run("reading watched lists", lambda conn: (watched_urls(conn), conn.execute("SELECT COUNT(*) FROM collections").fetchone()[0]))
+        # An empty record (fresh or rebuilt) says nothing about what is watched; never clear the bridge on it.
+        return None if result is None or (not result[0] and not result[1]) else result[0]
 
     def expire(self):
         expired = self._run("expiring old records", lambda conn: expire(conn))
