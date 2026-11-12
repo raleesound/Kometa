@@ -14,3 +14,11 @@ collections:
     file_poster: config/movies/assets/gremlin-the-cinema-gremlins-top-100.png
     sync_mode: sync
     radarr_add_missing: true
+  "Gremlins Trending":
+    letterboxd_list: https://letterboxd.com/thisnames2long/list/gremlins-trending/
+    sort_title: "!020_LB_!02_gremlins_trending"
+    collection_order: custom
+    summary: "What the Cinema Gremlins are watching right now, from every film we log on Letterboxd.\n\nHow it's ranked: the chart looks back over the group's last few hundred diary logs, somewhere between three days and three weeks depending on how busy we've been. A fresh log counts most: a log loses half its weight every third of that window. Each Gremlin counts once per film, so a rewatch doesn't stack, and a film needs at least two of us to make the chart. Higher stars give a film a small lift and lower stars a small drag."
+    file_poster: config/movies/assets/gremlin-gremlins-trending.png
+    sync_mode: sync
+    radarr_add_missing: true
