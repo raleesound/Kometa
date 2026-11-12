@@ -59,6 +59,7 @@
                 },
                 "delete_not_scheduled": { "type": "boolean" },
                 "hub_priority": { "type": "integer", "minimum": 1, "description": "Priority position for this collection's Recommendation Hub row. Lower numbers appear first." },
+                "live_watch": { "type": "boolean", "description": "Watch the Letterboxd list(s) behind this collection: the bridge tells Kometa when a list changes so the collection rebuilds." },
                 "ignore_blank_results": { "type": "boolean" },
                 "ignore_ids": {
                     "anyOf": [

@@ -137,6 +137,7 @@ ignored_details = [
     "test",
     "suppress_overlays",
     "delete_not_scheduled",
+    "live_watch",
     "tmdb_person",
     "build_collection",
     "collection_order",
@@ -1197,6 +1198,7 @@ class CollectionBuilder:
         self.non_existing = False
         self.created = False
         self.deleted = False
+        self.live_watch = False
 
         if self.playlist:
             server_check = None
@@ -1249,6 +1251,12 @@ class CollectionBuilder:
             logger.debug("Validating Method: delete_not_scheduled")
             logger.debug(f"Value: {data[methods['delete_not_scheduled']]}")
             self.details["delete_not_scheduled"] = util.parse(self.Type, "delete_not_scheduled", self.data, datatype="bool", methods=methods, default=False)
+
+        if "live_watch" in methods and not self.overlay:
+            logger.debug("")
+            logger.debug("Validating Method: live_watch")
+            logger.debug(f"Value: {data[methods['live_watch']]}")
+            self.live_watch = util.parse(self.Type, "live_watch", self.data, datatype="bool", methods=methods, default=False)
 
         if "schedule" in methods and not self.config.requested_collections and not self.overlay:
             logger.debug("")

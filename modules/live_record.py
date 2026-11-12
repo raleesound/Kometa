@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 DB_NAME = "live-collections.db"
 # Bump on any schema change: an older record is dropped and rebuilt (it is derived data; the next
 # sweep repopulates it).
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TABLES = ("collections", "members", "wanted", "history", "arrivals", "builds", "record_meta")
 # What an out-of-date record keeps when it is dropped and rebuilt: the outbox remembers which items
 # were announced, and losing it would announce them all again.
@@ -38,6 +38,8 @@ MIGRATIONS = {
         "ALTER TABLE members ADD COLUMN added_at TEXT",
         "ALTER TABLE history ADD COLUMN source TEXT",
     ),
+    # v4: the Letterboxd list URLs a live_watch collection is built from (JSON list, NULL = not watched).
+    3: ("ALTER TABLE collections ADD COLUMN watch_urls TEXT",),
 }
 # Readers (the arrival handler) can afford to wait; a Kometa run must not stall on a held lock,
 # so its writes use a short timeout and give up for the rest of the run after repeated failures.
@@ -70,6 +72,7 @@ CREATE TABLE IF NOT EXISTS collections (
     order_recorded_at TEXT,
     last_synced TEXT NOT NULL,
     last_status TEXT NOT NULL DEFAULT 'ok',
+    watch_urls TEXT,
     PRIMARY KEY (library, name)
 );
 CREATE TABLE IF NOT EXISTS members (
@@ -324,8 +327,9 @@ def write_collection(conn, snapshot):
             events.extend((WANTED_REMOVED, None, ext_id) for ext_id in sorted(old_wanted - new_wanted))
 
         conn.execute(
-            "INSERT OR REPLACE INTO collections (library, name, mapping_name, source_file, source_path, id_type, built, present, kind, members_tracked, missing_checked, collection_order, order_recorded, order_recorded_at, last_synced, last_status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO collections (library, name, mapping_name, source_file, source_path, id_type, built, present, kind, members_tracked, missing_checked, "
+            "collection_order, order_recorded, order_recorded_at, last_synced, last_status, watch_urls) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 library,
                 name,
@@ -343,6 +347,7 @@ def write_collection(conn, snapshot):
                 order_recorded_at,
                 now,
                 "ok" if snapshot.get("sync_ok", True) else "failed",
+                json.dumps(sorted(set(snapshot.get("watch_urls") or ()))) if snapshot.get("watch_urls") else None,
             ),
         )
         conn.execute("DELETE FROM members WHERE library = ? AND name = ?", (library, name))
@@ -375,7 +380,7 @@ def mark_deleted(conn, library, mapping_name):
         for name in names:
             events = [(MEMBER_REMOVED, row["rating_key"], row["ext_id"]) for row in conn.execute("SELECT rating_key, ext_id FROM members WHERE library = ? AND name = ? ORDER BY rating_key", (library, name))]
             events += [(WANTED_REMOVED, None, row["ext_id"]) for row in conn.execute("SELECT ext_id FROM wanted WHERE library = ? AND name = ? ORDER BY ext_id", (library, name))]
-            conn.execute("UPDATE collections SET present = 0, members_tracked = 1, last_synced = ? WHERE library = ? AND name = ?", (now, library, name))
+            conn.execute("UPDATE collections SET present = 0, members_tracked = 1, watch_urls = NULL, last_synced = ? WHERE library = ? AND name = ?", (now, library, name))
             conn.execute("DELETE FROM members WHERE library = ? AND name = ?", (library, name))
             conn.execute("DELETE FROM wanted WHERE library = ? AND name = ?", (library, name))
             conn.executemany("INSERT INTO history (library, name, recorded_at, event, rating_key, ext_id) VALUES (?, ?, ?, ?, ?, ?)", [(library, name, now, event, rk, ext_id) for event, rk, ext_id in events])
@@ -440,6 +445,17 @@ def expire(conn, max_age=EXPIRE_AFTER, now=None):
 
 
 # ── Read API (used by the arrival handler, S3) ─────────────────────────
+
+
+def watched_urls(conn, stale_after=STALE_AFTER, now=None):
+    """Every Letterboxd list URL a live_watch collection is currently built from, sorted. Collections
+    not synced within ``stale_after`` or no longer present are left out, so deleting a collection (or
+    dropping live_watch) stops the bridge watching its lists at the next sweep."""
+    cutoff = _stamp((now or datetime.now(timezone.utc)) - stale_after)
+    urls = set()
+    for row in conn.execute("SELECT watch_urls FROM collections WHERE watch_urls IS NOT NULL AND present = 1 AND last_status = 'ok' AND last_synced >= ?", (cutoff,)):
+        urls.update(json.loads(row["watch_urls"]))
+    return sorted(urls)
 
 
 def find_waiting(conn, id_type, ext_id, include_unknown=False, stale_after=STALE_AFTER, now=None):
@@ -695,6 +711,13 @@ def _list_order(builder, library):
     return {ext_id: index for index, ext_id in enumerate(order)}
 
 
+def _watch_urls(builder):
+    """The Letterboxd list URLs to watch for this collection: only when it opted in with live_watch."""
+    if not getattr(builder, "live_watch", False):
+        return []
+    return sorted({value["url"] for method, value in builder.builders if method == "letterboxd_list" and isinstance(value, dict) and value.get("url")})
+
+
 def build_snapshot(builder, library, metadata, add_ran, sync_ran, mapping_name=None):
     """Describe what ``builder`` left in Plex, reusing what the run already knows (no extra Plex calls
     except one membership read for an append-mode collection that was not loaded this run)."""
@@ -768,6 +791,7 @@ def build_snapshot(builder, library, metadata, add_ran, sync_ran, mapping_name=N
         "members": members,
         "previous_members": previous_members,
         "wanted": wanted,
+        "watch_urls": _watch_urls(builder),
     }
 
 
@@ -836,6 +860,11 @@ class RunRecorder:
     def skipped(self, library_name, mapping_name):
         # Wrapped so "no record yet" (touch returns None) is not mistaken for a failure.
         return self._run(mapping_name, lambda conn: (touch(conn, library_name, mapping_name),)) is not None
+
+    def watched(self):
+        """The Letterboxd list URLs to watch (sorted), or None when the record could not be read."""
+        result = self._run("reading watched lists", lambda conn: (watched_urls(conn),))
+        return None if result is None else result[0]
 
     def expire(self):
         expired = self._run("expiring old records", lambda conn: expire(conn))

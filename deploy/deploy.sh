@@ -81,6 +81,24 @@ if ! grep -q '^NATS_NKEY_SEED=.' "$NATS_ENV_FILE"; then
   exit 1
 fi
 
+# live_watch (#5634 S5): a full sweep PUTs the watched Letterboxd list URLs to the
+# bridge, bearer-authenticated. The token lives in its own env file, never in .env
+# and never on a command line. Checked before the slow build.
+BRIDGE_ENV_FILE="${BRIDGE_ENV_FILE:-$(pwd)/.env.bridge}"
+LB_BRIDGE_URL="${LB_BRIDGE_URL:-http://10.43.254.65/api}"
+if [[ ! -f "$BRIDGE_ENV_FILE" ]]; then
+  echo "FATAL: ${BRIDGE_ENV_FILE} is missing (LB_BRIDGE_TOKEN for PUT /watched-lists)" >&2
+  exit 1
+fi
+if [[ "$(stat -c %a "$BRIDGE_ENV_FILE")" != "600" ]]; then
+  echo "FATAL: ${BRIDGE_ENV_FILE} must be mode 0600 (it holds a bearer token)" >&2
+  exit 1
+fi
+if ! grep -q '^LB_BRIDGE_TOKEN=.' "$BRIDGE_ENV_FILE"; then
+  echo "FATAL: ${BRIDGE_ENV_FILE} has no LB_BRIDGE_TOKEN" >&2
+  exit 1
+fi
+
 echo "==> Fetching fork at ${REF}"
 if [[ ! -d "$SRC_DIR/.git" ]]; then
   git clone "$FORK_URL" "$SRC_DIR"
@@ -203,6 +221,8 @@ docker run -d \
   -v "${CONFIG_DIR}:/config:rw" \
   -e KOMETA_TIMES="${KOMETA_TIMES}" \
   -e TZ="${TZ}" \
+  -e LB_BRIDGE_URL="${LB_BRIDGE_URL}" \
+  --env-file "${BRIDGE_ENV_FILE}" \
   "${IMAGE}:local"
 
 echo "==> Recreating import trigger"

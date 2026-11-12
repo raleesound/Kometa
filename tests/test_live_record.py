@@ -182,7 +182,7 @@ class TestStorage:
         old.close()
         log = StackLogger()
         conn = live_record.connect(path, log=log)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION == 4
         assert live_record.get_collection(conn, "Movies", "Picks") is None
         assert any("schema v1 is out of date" in m for m in log.warning_messages)
         live_record.write_collection(conn, snapshot(wanted=[(5, False, False, None)]))
@@ -200,7 +200,7 @@ class TestStorage:
         recorder = live_record.RunRecorder(str(tmp_path), log)
         assert recorder.record(fake_library(), METADATA, fake_builder(), "picks", False, False) is True
         assert recorder.failures == 0
-        assert any("rebuilt it as v3" in m for m in log.warning_messages)
+        assert any("rebuilt it as v4" in m for m in log.warning_messages)
 
     def test_a_current_record_is_not_rebuilt(self, tmp_path):
         path = live_record.db_path(str(tmp_path))
@@ -930,6 +930,7 @@ class TestWiring:
         args["resume"] = overrides.pop("resume", None)
         args["tests"] = overrides.pop("tests", False)
         recorder = MagicMock()
+        live_watch = MagicMock()
 
         def run_collection(config, library, metadata, requested):
             if run_collection_clears_resume:
@@ -948,8 +949,10 @@ class TestWiring:
             "run_libraries",
             "is_partial_run",
             "expire_live_record",
+            "push_live_watch",
             "run_arrivals",
             run_args=args,
+            live_watch=live_watch,
             arrivals=MagicMock(),
             run_collection=run_collection,
             live_record=SimpleNamespace(RunRecorder=lambda *_: recorder),
@@ -965,10 +968,17 @@ class TestWiring:
         )
         _, collections_ran = ns["run_libraries"](config)
         assert collections_ran
+        self.pushed = live_watch.push.called
         return recorder.expire.called
 
     def test_a_full_sweep_expires(self):
         assert self._sweep() is True
+
+    def test_a_full_sweep_pushes_the_watched_lists_and_a_partial_run_does_not(self):
+        assert self._sweep() is True
+        assert self.pushed is True
+        assert self._sweep(requested_collections=["c1"]) is False
+        assert self.pushed is False
 
     def test_a_resumed_run_never_expires_even_after_resume_is_cleared(self):
         assert self._sweep(resume="c1") is False
@@ -1008,6 +1018,7 @@ class TestWiring:
 
     def _item_run(self, arrived_ok):
         calls = []
+        live_watch = MagicMock()
         args = {k: False for k in ("tests", "delete-collections", "delete-labels", "playlists-only", "operations-only", "overlays-only", "collections-only", "metadata-only")}
         args["resume"] = None
         library = MagicMock(skip_library=False, collection_files=[], run_order=["operations"], collection_names=[], hub_priorities={}, auto_sort_hubs=False, is_music=False, timeout=60)
@@ -1019,8 +1030,10 @@ class TestWiring:
             "run_libraries",
             "is_partial_run",
             "expire_live_record",
+            "push_live_watch",
             "run_arrivals",
             run_args=args,
+            live_watch=live_watch,
             arrivals=arrivals_module,
             run_collection=MagicMock(),
             live_record=SimpleNamespace(RunRecorder=lambda *_: pytest.fail("an item run opened the recorder")),
@@ -1066,7 +1079,7 @@ def test_connect_rejects_a_non_database(tmp_path):
 
 
 def _v2_schema():
-    schema = live_record.SCHEMA.replace("    source TEXT,\n    added_at TEXT,\n", "").replace(",\n    source TEXT\n", "\n")
+    schema = live_record.SCHEMA.replace("    source TEXT,\n    added_at TEXT,\n", "").replace(",\n    source TEXT\n", "\n").replace("    watch_urls TEXT,\n", "")
     assert "source TEXT" not in schema and "added_at" not in schema
     return schema
 
@@ -1088,7 +1101,7 @@ class TestUpgradeInPlace:
         old.close()
         log = StackLogger()
         conn = live_record.connect(path, log=log)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION
         assert not log.warning_messages  # upgraded, not dropped
         assert [r["name"] for r in live_record.find_waiting(conn, "tmdb", 511)] == ["Picks"]
         assert live_record.record_arrival(conn, "Movies", "Picks", 11, 511) is True
@@ -1194,3 +1207,57 @@ class TestBuildQueue:
         assert live_record.fail_build(db, "movies-key", "Picks", 2) is False
         assert live_record.fail_build(db, "movies-key", "Picks", 2) is True
         assert live_record.pending_builds(db) == []
+
+
+# ── live_watch (epic #5634 S5) ────────────────────────────────────────
+
+
+LIST_A = "https://letterboxd.com/someone/list/a/"
+LIST_B = "https://letterboxd.com/someone/list/b/"
+
+
+def test_watched_urls_unions_live_watch_collections(db):
+    live_record.write_collection(db, snapshot("One", watch_urls=[LIST_B, LIST_A]))
+    live_record.write_collection(db, snapshot("Two", watch_urls=[LIST_A]))
+    live_record.write_collection(db, snapshot("Plain"))
+    assert live_record.watched_urls(db) == [LIST_A, LIST_B]
+
+
+def test_watched_urls_drops_deleted_failed_and_stale(db):
+    live_record.write_collection(db, snapshot("Gone", watch_urls=[LIST_A]))
+    live_record.mark_deleted(db, "Movies", "Gone")
+    live_record.write_collection(db, snapshot("Bad", watch_urls=[LIST_B], sync_ok=False))
+    assert live_record.watched_urls(db) == []
+    live_record.write_collection(db, snapshot("Old", watch_urls=[LIST_A]))
+    later = datetime.now(timezone.utc) + live_record.STALE_AFTER + timedelta(hours=1)
+    assert live_record.watched_urls(db, now=later) == []
+
+
+def test_dropping_live_watch_stops_watching_on_the_next_record(db):
+    live_record.write_collection(db, snapshot("One", watch_urls=[LIST_A]))
+    live_record.write_collection(db, snapshot("One"))
+    assert live_record.watched_urls(db) == []
+
+
+def test_v3_record_upgrades_in_place_with_the_watch_column(tmp_path):
+    path = live_record.db_path(str(tmp_path))
+    conn = live_record.connect(path)
+    live_record.write_collection(conn, snapshot("One", members=[(1, 10, None)]))
+    conn.execute("ALTER TABLE collections DROP COLUMN watch_urls")
+    conn.execute("PRAGMA user_version = 3")
+    conn.close()
+    conn = live_record.connect(path)
+    try:
+        assert "watch_urls" in live_record._columns(conn, "collections")
+        assert conn.execute("SELECT COUNT(*) FROM members").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_watch_urls_only_for_opted_in_letterboxd_list_builders():
+    def fake(live, builders):
+        return SimpleNamespace(live_watch=live, builders=builders)
+
+    lists = [("letterboxd_list", {"url": LIST_B}), ("tmdb_popular", 5), ("letterboxd_list", {"url": LIST_A})]
+    assert live_record._watch_urls(fake(True, lists)) == [LIST_A, LIST_B]
+    assert live_record._watch_urls(fake(False, lists)) == []
