@@ -1098,12 +1098,16 @@ class TestPublisher:
         stop = threading.Event()
         js = FakeJetStream(failures=[StreamNotFound("no stream"), TimeoutError()])
         connects = []
+        closed = []
+
+        async def close():
+            closed.append(1)
 
         async def connect():
             connects.append(1)
             if len(connects) == 1:
                 raise ConnectionRefusedError("nats down")
-            return SimpleNamespace(jetstream=lambda: js)
+            return SimpleNamespace(jetstream=lambda: js, close=close)
 
         publisher = trig.Publisher(path, "nats://x:4222", "seed", connect=connect)
         original = js.publish
@@ -1117,6 +1121,7 @@ class TestPublisher:
         asyncio.run(asyncio.wait_for(publisher.main(stop), 10))
         assert len(connects) == 2
         assert [p["rating_key"] for _, p, _ in js.published] == [11]
+        assert closed == [1]  # main() leaving closes its connection, so a restart never leaks one
 
     def test_a_connect_error_never_logs_its_text(self, trig, tmp_path, monkeypatch, caplog):
         import asyncio
@@ -1132,6 +1137,23 @@ class TestPublisher:
         asyncio.run(asyncio.wait_for(publisher.main(stop), 10))
         assert "SUAMSEEDSEEDSEED" not in caplog.text
         assert "ValueError" in caplog.text
+
+    def test_a_held_arrival_is_not_published_until_released(self, trig, tmp_path, monkeypatch):
+        import asyncio
+
+        live_record, path = _db(trig, tmp_path)
+        monkeypatch.setattr(trig, "RECORD_PATH", path)
+        conn = live_record.connect(path)
+        live_record.queue_arrival(conn, "Movies", 11, {"v": 1, "rating_key": "11", "collections": []}, complete=False)
+        conn.close()
+        js = FakeJetStream()
+        publisher = trig.Publisher(path, "nats://x:4222", "seed")
+        assert asyncio.run(publisher.drain(js)) is True and js.published == []
+        # The trigger runs out of retries for the item: what its last run managed goes out.
+        pending = trig.Pending(str(tmp_path / "pending.json"))
+        trig.give_up_or_retry(pending, "Movies", "11", trig.MAX_ATTEMPTS - 1, "Kometa run failed")
+        assert asyncio.run(publisher.drain(js)) is True
+        assert [h["Nats-Msg-Id"] for _, _, h in js.published] == ["arrived:Movies:11"]
 
     def test_no_seed_keeps_the_outbox_and_says_so(self, trig, monkeypatch, caplog):
         monkeypatch.delenv("NATS_NKEY_SEED", raising=False)

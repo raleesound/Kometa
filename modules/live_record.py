@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS arrivals (
     payload TEXT NOT NULL,
     created_at TEXT NOT NULL,
     published_at TEXT,
+    complete INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (library, rating_key)
 );
 CREATE INDEX IF NOT EXISTS arrivals_unpublished ON arrivals (published_at, created_at);
@@ -153,10 +154,10 @@ def _set_wal(conn, timeout_ms):
             delay = min(delay * 2, 0.25)
 
 
-def connect(path, timeout_ms=BUSY_TIMEOUT_MS, log=None):
+def connect(path, timeout_ms=BUSY_TIMEOUT_MS, log=None, check_same_thread=True):
     """Open the record, creating the schema on first use. A record from an older schema version is
     upgraded in place when MIGRATIONS covers it, otherwise dropped and rebuilt (logged to ``log`` when given). Autocommit; callers open their own transactions."""
-    conn = sqlite3.connect(path, timeout=timeout_ms / 1000, isolation_level=None)
+    conn = sqlite3.connect(path, timeout=timeout_ms / 1000, isolation_level=None, check_same_thread=check_same_thread)
     try:
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout = {int(timeout_ms)}")
@@ -518,20 +519,41 @@ def record_arrival(conn, library, name, rating_key, ext_id, position=None, now=N
     return not exists or bool(dropped)
 
 
-def queue_arrival(conn, library, rating_key, payload, now=None):
+def _merge_attempts(old, new):
+    """A retry no longer sees what an earlier, failed attempt finished (those collections stopped
+    waiting, or it finds the item already a member). Keep the earlier attempt's collections and
+    its "added": the event reports what the trigger did across all attempts."""
+    if "collections" not in new:
+        return new
+    before = {entry["name"]: entry for entry in old.get("collections", [])}
+    merged = []
+    for entry in new.get("collections", []):
+        earlier = before.pop(entry["name"], None)
+        if earlier is not None and earlier.get("added"):
+            entry["added"] = True
+        merged.append(entry)
+    new["collections"] = list(before.values()) + merged
+    return new
+
+
+def queue_arrival(conn, library, rating_key, payload, now=None, complete=True):
     """Put one kometa.item.arrived event in the outbox. A re-run of an item that is still unpublished
-    replaces its payload; one that was already published is left alone (no second announcement).
-    Returns True when queued."""
+    replaces its payload (keeping what the earlier attempt added); one that was already published is
+    left alone (no second announcement). ``complete=False`` (a collection failed, the trigger runs the
+    item again) holds the row back from publishing until a later run completes it or
+    release_arrival gives up waiting. Returns True when queued."""
     stamp = _stamp(now or datetime.now(timezone.utc))
     conn.execute("BEGIN IMMEDIATE")
     try:
-        row = conn.execute("SELECT published_at FROM arrivals WHERE library = ? AND rating_key = ?", (library, int(rating_key))).fetchone()
+        row = conn.execute("SELECT payload, published_at FROM arrivals WHERE library = ? AND rating_key = ?", (library, int(rating_key))).fetchone()
         if row is not None and row["published_at"] is not None:
             conn.execute("COMMIT")
             return False
+        if row is not None:
+            payload = _merge_attempts(json.loads(row["payload"]), payload)
         conn.execute(
-            "INSERT OR REPLACE INTO arrivals (library, rating_key, payload, created_at, published_at) VALUES (?, ?, ?, ?, NULL)",
-            (library, int(rating_key), json.dumps(payload, sort_keys=True), stamp),
+            "INSERT OR REPLACE INTO arrivals (library, rating_key, payload, created_at, published_at, complete) VALUES (?, ?, ?, ?, NULL, ?)",
+            (library, int(rating_key), json.dumps(payload, sort_keys=True), stamp, 1 if complete else 0),
         )
         conn.execute("COMMIT")
     except Exception:
@@ -541,9 +563,17 @@ def queue_arrival(conn, library, rating_key, payload, now=None):
 
 
 def unpublished_arrivals(conn, limit=100):
-    """Outbox rows not yet acknowledged by JetStream, oldest first: library, rating_key, payload (dict)."""
-    rows = conn.execute("SELECT library, rating_key, payload FROM arrivals WHERE published_at IS NULL ORDER BY created_at, library, rating_key LIMIT ?", (limit,))
+    """Outbox rows ready to publish and not yet acknowledged by JetStream, oldest first: library,
+    rating_key, payload (dict). Rows held back by a failed run are not ready."""
+    rows = conn.execute("SELECT library, rating_key, payload FROM arrivals WHERE published_at IS NULL AND complete = 1 ORDER BY created_at, library, rating_key LIMIT ?", (limit,))
     return [{"library": row["library"], "rating_key": row["rating_key"], "payload": json.loads(row["payload"])} for row in rows]
+
+
+def release_arrival(conn, rating_key):
+    """The trigger stopped retrying an item: publish what its last run managed rather than nothing.
+    Plex ratingKeys are unique across a server's libraries. Returns True when a held row was released."""
+    cursor = conn.execute("UPDATE arrivals SET complete = 1 WHERE rating_key = ? AND published_at IS NULL AND complete = 0", (int(rating_key),))
+    return cursor.rowcount > 0
 
 
 def mark_published(conn, library, rating_key, now=None):

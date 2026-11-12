@@ -435,3 +435,34 @@ class TestContract:
     @pytest.mark.parametrize("name", ["item-arrived.json", "item-arrived-plain.json"])
     def test_the_fixtures_pass_the_value_checks(self, name):
         _check_values(_fixture(name))
+
+
+# ── a run that fails part-way ─────────────────────────────────────────
+
+
+class TestPartialFailure:
+    def test_a_failed_collection_holds_the_event_and_the_retry_sends_it_complete(self, db):
+        # Picks takes the film; the move in Top does not land. The event must not go out listing only
+        # Picks: the trigger runs the item again, and that run's event lists both, Top as added.
+        plex = FakePlex(ext_ids={1: 501, 11: 511}, collections={"Picks": {"sort": 0, "keys": []}, "Top": {"sort": arrivals.CUSTOM_SORT, "keys": [1]}}, move_lands=False)
+        record(db, name="Picks", wanted=[(511, False, None)])
+        record(db, name="Top", members=[(1, 501, 1)], wanted=[(511, False, 0)], order="custom.asc")
+        assert arrivals.handle_item(db, plex, 11, now=NOW) is False
+        assert outbox(db) == []
+        plex.move_lands = True
+        assert arrivals.handle_item(db, plex, 11, now=NOW + timedelta(minutes=3)) is True
+        [row] = outbox(db)
+        entries = {c["name"]: (c["added"], c["slotted"]) for c in row["payload"]["collections"]}
+        assert entries == {"Picks": (True, False), "Top": (True, True)}
+        assert plex.collections["Top"]["keys"] == [11, 1]
+
+    def test_giving_up_publishes_what_the_last_run_managed(self, db):
+        plex = FakePlex(ext_ids={1: 501, 11: 511}, collections={"Picks": {"sort": 0, "keys": []}, "Top": {"sort": arrivals.CUSTOM_SORT, "keys": [1]}}, move_lands=False)
+        record(db, name="Picks", wanted=[(511, False, None)])
+        record(db, name="Top", members=[(1, 501, 1)], wanted=[(511, False, 0)], order="custom.asc")
+        arrivals.handle_item(db, plex, 11, now=NOW)
+        assert live_record.release_arrival(db, 11) is True
+        [row] = outbox(db)
+        # Top has the film, out of its slot: the event says so rather than leaving it out.
+        assert {c["name"]: (c["added"], c["slotted"]) for c in row["payload"]["collections"]} == {"Picks": (True, False), "Top": (True, False)}
+        assert live_record.release_arrival(db, 11) is False

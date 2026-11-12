@@ -720,9 +720,23 @@ def run_kometa(library: str, rating_keys: list[str]) -> Any:
     return True
 
 
+def release_arrival(rating_key: str, record_path: str | None = None) -> None:
+    """Out of retries: let the publisher send what the item's last run managed. Never raises."""
+    try:
+        conn = live_record.connect(record_path or RECORD_PATH)
+        try:
+            if live_record.release_arrival(conn, rating_key):
+                log.warning("publishing the arrival of %s without the collections its runs could not finish", rating_key)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("could not release the held arrival of %s: %s: %s", rating_key, type(e).__name__, e)
+
+
 def give_up_or_retry(pending: Pending, library: str, rating_key: str, attempts: int, why: str) -> None:
     if attempts + 1 >= MAX_ATTEMPTS:
         log.warning("giving up on %s: %s after %d attempts", rating_key, why, attempts + 1)
+        release_arrival(rating_key)
         # Clear it from the seen-set (every episode queued as this show, too), so a
         # later processed event - Plex finally matching it, say - queues it again.
         pending.forget(rating_key)
@@ -922,14 +936,15 @@ class Publisher:
     async def drain(self, js: Any) -> bool:
         """Publish every unpublished arrival, oldest first. True when the outbox is empty; False
         when a publish failed (the row stays queued)."""
+        # sqlite calls go to a worker thread: a busy record must not stall the NATS client's loop.
         try:
-            conn = live_record.connect(self.record_path)
+            conn = await asyncio.to_thread(live_record.connect, self.record_path, check_same_thread=False)
         except Exception as e:
             log.warning("cannot open the live record to publish arrivals: %s: %s", type(e).__name__, e)
             return False
         try:
             while True:
-                rows = live_record.unpublished_arrivals(conn)
+                rows = await asyncio.to_thread(live_record.unpublished_arrivals, conn)
                 if not rows:
                     return True
                 for row in rows:
@@ -941,7 +956,7 @@ class Publisher:
                         # NoRespondersError / NotFoundError: no stream captures the subject yet.
                         log.warning("%s held in the outbox, will retry: %s: %s", msg_id, type(e).__name__, e)
                         return False
-                    live_record.mark_published(conn, row["library"], row["rating_key"])
+                    await asyncio.to_thread(live_record.mark_published, conn, row["library"], row["rating_key"])
                     log.info("published %s %s", ARRIVED_SUBJECT, msg_id)
         except Exception as e:
             log.warning("publishing arrivals failed, will retry: %s: %s", type(e).__name__, e)
@@ -964,15 +979,22 @@ class Publisher:
             if stop is not None and stop.is_set():
                 return
         log.info("connected to NATS at %s as %s", self.url, NATS_CLIENT_NAME)
-        js = self.nc.jetstream()
-        delay = PUBLISH_RETRY_MIN_SECONDS
-        while stop is None or not stop.is_set():
-            if await self.drain(js):
-                delay = PUBLISH_RETRY_MIN_SECONDS
-                await self._sleep(None)
-            else:
-                await self._sleep(delay)
-                delay = min(delay * 2, PUBLISH_RETRY_MAX_SECONDS)
+        try:
+            js = self.nc.jetstream()
+            delay = PUBLISH_RETRY_MIN_SECONDS
+            while stop is None or not stop.is_set():
+                if await self.drain(js):
+                    delay = PUBLISH_RETRY_MIN_SECONDS
+                    await self._sleep(None)
+                else:
+                    await self._sleep(delay)
+                    delay = min(delay * 2, PUBLISH_RETRY_MAX_SECONDS)
+        finally:
+            # A crash restarts main() on a new loop with a new connection: close this one.
+            try:
+                await self.nc.close()
+            except Exception as e:
+                log.warning("closing the NATS connection failed: %s", type(e).__name__)
 
     def run_forever(self) -> None:
         while True:

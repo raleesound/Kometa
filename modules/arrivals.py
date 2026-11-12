@@ -92,14 +92,19 @@ def _slot(conn, library, name, item, rating_key, position):
     return True
 
 
-def _add_to(conn, library, item, rating_key, ext_id, waiting, now):
-    """Put the item into one waiting collection. Returns its payload entry (the kometa-contract
-    arrivedCollectionSchema), or None when the collection is not in Plex and a run of it was queued
-    instead: the event lists only collections the item belongs to now."""
-    name = waiting["name"]
+def _entry(waiting):
+    """The collection's payload entry (kometa-contract arrivedCollectionSchema), before any change."""
     custom = live_record._is_custom_order(waiting["collection_order"]) and waiting["position"] is not None
     # The record counts from 0; the event's position is 1-based and only set for a custom order.
-    entry = {"name": name, "mapping_name": waiting["mapping_name"], "source_file": waiting["source_file"], "added": False, "position": waiting["position"] + 1 if custom else None, "slotted": False}
+    return {"name": waiting["name"], "mapping_name": waiting["mapping_name"], "source_file": waiting["source_file"], "added": False, "position": waiting["position"] + 1 if custom else None, "slotted": False}
+
+
+def _add_to(conn, library, item, rating_key, ext_id, waiting, now, entry):
+    """Put the item into one waiting collection, filling in ``entry`` as it goes (so a failure part-way
+    still says what happened). Returns the entry, or None when the collection is not in Plex and a
+    run of it was queued instead: the event lists only collections the item belongs to now."""
+    name = waiting["name"]
+    custom = entry["position"] is not None
     collection = None
     order = []
     if waiting["present"]:
@@ -149,11 +154,14 @@ def handle_item(conn, library, rating_key, now=None):
     for waiting in waiting_for:
         if waiting["library"] != library.name:
             continue
+        entry = _entry(waiting)
         try:
-            entry = _add_to(conn, library, item, rating_key, ext_id, waiting, moment)
-            if entry is not None:
+            if _add_to(conn, library, item, rating_key, ext_id, waiting, moment, entry) is not None:
                 collections.append(entry)
         except Exception as e:
+            if entry["added"]:
+                # In the collection, just not slotted: if the retries run out, the event still says so.
+                collections.append(entry)
             ok = False
             logger.stacktrace()
             logger.error(f"Arrival Error: {util.item_title(item)} into {waiting['name']}: {e}")
@@ -173,7 +181,9 @@ def handle_item(conn, library, rating_key, now=None):
         "arrived_at": _stamp(moment),
         "collections": collections,
     }
-    live_record.queue_arrival(conn, library.name, rating_key, payload, now=moment)
+    # A failed collection means the trigger runs the item again: hold the event until then, so it
+    # goes out once, complete.
+    live_record.queue_arrival(conn, library.name, rating_key, payload, now=moment, complete=ok)
     return ok
 
 
