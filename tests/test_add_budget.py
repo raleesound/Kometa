@@ -247,6 +247,8 @@ def _builder(monkeypatch, arr, plex_tmdb_by_key=None, found_keys=(), filtered_ke
     b.held_back_sonarr = []
     b.budget_blockers = []
     b.do_report = True
+    b.custom_sort = None
+    b.gathered_ids = []
     return b, library
 
 

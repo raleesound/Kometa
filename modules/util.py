@@ -72,6 +72,13 @@ class NotScheduledRange(NotScheduled):
     pass
 
 
+class ScheduleSkip(NotScheduled):
+    """A configured collection its schedule skipped this run (schedule, only_run_on_create, tmdb
+    person day/month window, non_existing). It is still configured, unlike other NotScheduled skips."""
+
+    pass
+
+
 class BuilderValidationError(Failed):
     pass
 
