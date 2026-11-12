@@ -15,7 +15,7 @@ from modules import add_budget, anidb, anilist, floppy, icheckmovies, imdb, lett
 from modules.overlay import Overlay, rating_sources
 from modules.poster import KometaImage
 from modules.request import quote
-from modules.util import BuilderValidationError, Deleted, Failed, FilterFailed, MappingConvertError, NonExisting, NotScheduled, NotScheduledRange, OverlayError, ServiceError
+from modules.util import BuilderValidationError, Deleted, Failed, FilterFailed, MappingConvertError, NonExisting, NotScheduled, NotScheduledRange, OverlayError, ScheduleSkip, ServiceError
 
 logger = util.logger
 
@@ -974,7 +974,7 @@ class CollectionBuilder:
             logger.debug(f"Value: {data[methods['only_run_on_create']]}")
             self.only_run_on_create = util.parse(self.Type, "only_run_on_create", self.data, datatype="bool", methods=methods, default=False)
         if self.obj and self.only_run_on_create:
-            raise NotScheduled("Skipped because only_run_on_create is True and the collection already exists")
+            raise ScheduleSkip("Skipped because only_run_on_create is True and the collection already exists")
 
         if "allowed_library_types" in methods and "run_definition" not in methods:
             logger.warning(f"{self.Type} Warning: allowed_library_types will run as run_definition")
@@ -1148,6 +1148,16 @@ class CollectionBuilder:
         self.added_to_sonarr = []
         self.held_back_radarr = []
         self.held_back_sonarr = []
+        # Live collection record (modules/live_record.py): which missing ids run_missing() filtered
+        # out or passed (an id in neither was never evaluated), whether it ran at all, the builders'
+        # raw id order, and whether the custom sort finished.
+        self.missing_filtered_movies = []
+        self.missing_filtered_shows = []
+        self.missing_passed_movies = []
+        self.missing_passed_shows = []
+        self.missing_checked = False
+        self.gathered_ids = []
+        self.sort_completed = False
         self.budget_blockers = []
         self.builders = []
         self.filters = []
@@ -1267,7 +1277,7 @@ class CollectionBuilder:
                             suffix = " and was deleted"
                         except Failed:
                             suffix = " and could not be found to delete"
-                    raise NotScheduled(f"{err}\n\n{self.Type} {self.name} not scheduled to run{suffix}")
+                    raise ScheduleSkip(f"{err}\n\n{self.Type} {self.name} not scheduled to run{suffix}")
 
         if "delete_collections_named" in methods and not self.overlay and not self.playlist:
             logger.debug("")
@@ -1466,7 +1476,7 @@ class CollectionBuilder:
                             suffix = " and was deleted"
                         except Failed:
                             suffix = " and could not be found to delete"
-                    raise NotScheduled(f"{msg}{suffix}")
+                    raise ScheduleSkip(f"{msg}{suffix}")
 
         self.smart_url = None
         self.smart_type_key = None
@@ -1798,7 +1808,7 @@ class CollectionBuilder:
                 self.sync = False
             self.run_again = False
         if self.non_existing is not False and self.obj:
-            raise NotScheduled(self.non_existing)
+            raise ScheduleSkip(self.non_existing)
 
         logger.info("")
         logger.info("Validation Successful")
@@ -4893,6 +4903,7 @@ class CollectionBuilder:
     def run_missing(self):
         added_to_radarr = 0
         added_to_sonarr = 0
+        self.missing_checked = True
         i = 0
         total_ids = len(self.missing_movies)
         if len(self.missing_movies) > 0 and (self.library.is_movie or self.is_playlist):
@@ -4910,12 +4921,14 @@ class CollectionBuilder:
                 current_title = f"{movie.title} ({movie.release_date.year})" if movie.release_date else movie.title
                 if self.check_missing_filters(missing_id, True, tmdb_item=movie, check_released=self.details["missing_only_released"]):
                     missing_movies_with_names.append((current_title, missing_id))
+                    self.missing_passed_movies.append(missing_id)
                     if self.details["show_missing"] is True:
                         logger.info(f"{i}/{total_ids} {self.name} {self.Type} | ? | {current_title} (TMDb: {missing_id})")
                     else:
                         logger.ghost(f"Parsing ID {i}/{total_ids}")
                 else:
                     filtered_movies_with_names.append((current_title, missing_id))
+                    self.missing_filtered_movies.append(missing_id)
                     if self.details["show_filtered"] is True and self.details["show_missing"] is True:
                         logger.info(f"{i}/{total_ids} {self.name} {self.Type} | ? | {current_title} (TMDb: {missing_id})")
                     else:
@@ -4983,12 +4996,14 @@ class CollectionBuilder:
                     continue
                 if self.check_missing_filters(missing_id, False, check_released=self.details["missing_only_released"]):
                     missing_shows_with_names.append((title, missing_id))
+                    self.missing_passed_shows.append(missing_id)
                     if self.details["show_missing"] is True:
                         logger.info(f"{i}/{total_ids} {self.name} {self.Type} | ? | {title} (TVDb: {missing_id})")
                     else:
                         logger.ghost(f"Parsing ID {i}/{total_ids}")
                 else:
                     filtered_shows_with_names.append((title, missing_id))
+                    self.missing_filtered_shows.append(missing_id)
                     if self.details["show_filtered"] is True and self.details["show_missing"] is True:
                         logger.info(f"{i}/{total_ids} {self.name} {self.Type} | ? | {title} (TVDb: {missing_id})")
                     else:
@@ -5054,6 +5069,8 @@ class CollectionBuilder:
             ids = pending.result() if pending is not None else self.gather_ids(method, value)
             if not ids:
                 self.add_budget_blocker(f"Builder {method} returned no items")
+            if ids and isinstance(self.custom_sort, str) and self.custom_sort.startswith("custom"):
+                self.gathered_ids.extend(ids)
             self.filter_and_save_items(ids)
         except (BuilderValidationError, OverlayError, MappingConvertError, ServiceError):
             raise
@@ -5756,6 +5773,7 @@ class CollectionBuilder:
         total_items = len(items)
         previous = None
         sort_edit = False
+        move_failed = False
         for i, item in enumerate(items, 0):
             try:
                 if len(self.items) <= i or item.ratingKey != self.items[i].ratingKey:
@@ -5767,6 +5785,8 @@ class CollectionBuilder:
             except Failed:
                 logger.error(f"Failed to Move {util.item_title(item)}")
                 sort_edit = True
+                move_failed = True
+        self.sort_completed = not move_failed
         if not sort_edit:
             logger.info("No Sorting Required")
 
