@@ -1,0 +1,14 @@
+# generated 2026-08-30T06:50:11-0400 by letterboxd-kometa-sync
+# source: letterboxd.com/thisnames2long/list/cyberpunk/ (TOP-UP over upstream)
+# 10 of 11 additions resolved (9 via Plex, 1 via TMDb); 1 unresolved
+
+tmdb:665251  # Altered Carbon: Resleeved (2020)
+tmdb:16248  # D.A.R.Y.L. (1985)
+tmdb:13282  # Death Race 2000 (1975)
+tmdb:10061  # Escape from L.A. (1996)
+tmdb:10803  # Logan's Run (1976)
+tmdb:53353  # Prototype (1983)
+tmdb:11484  # Rollerball (1975)
+tmdb:19959  # Surrogates (2009)
+tmdb:8452  # The 6th Day (2000)
+tmdb:9349  # Universal Soldier (1992)

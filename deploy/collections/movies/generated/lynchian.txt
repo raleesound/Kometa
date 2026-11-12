@@ -1,0 +1,6 @@
+# generated 2026-08-28T05:55:08-0400 by letterboxd-kometa-sync
+# source: letterboxd.com/thisnames2long/list/lynchian/ (TOP-UP over upstream)
+# 2 of 2 entries resolved; 0 not in the Plex library
+
+tmdb:103328  # Holy Motors (2012)
+tmdb:483  # Wild at Heart (1990)

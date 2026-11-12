@@ -1,0 +1,12 @@
+# generated 2026-08-30T06:50:11-0400 by letterboxd-kometa-sync
+# source: letterboxd.com/thisnames2long/list/car-chase/ (TOP-UP over upstream)
+# 8 of 8 additions resolved (8 via Plex, 0 via TMDb); 0 unresolved
+
+tmdb:13282  # Death Race 2000 (1975)
+tmdb:786892  # Furiosa: A Mad Max Saga (2024)
+tmdb:11006  # Smokey and the Bandit (1977)
+tmdb:280  # Terminator 2: Judgment Day (1991)
+tmdb:525  # The Blues Brothers (1980)
+tmdb:4108  # The Transporter (2002)
+tmdb:9335  # Transporter 2 (2005)
+tmdb:13387  # Transporter 3 (2008)

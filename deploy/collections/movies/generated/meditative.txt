@@ -1,0 +1,23 @@
+# generated 2026-08-30T06:50:11-0400 by letterboxd-kometa-sync
+# source: letterboxd.com/thisnames2long/list/meditative/ (TOP-UP over upstream)
+# 19 of 19 additions resolved (19 via Plex, 0 via TMDb); 0 unresolved
+
+tmdb:62  # 2001: A Space Odyssey (1968)
+tmdb:965150  # Aftersun (2022)
+tmdb:12516  # Dreams (1990)
+tmdb:466565  # Hagazussa (2017)
+tmdb:858017  # I Saw the TV Glow (2024)
+tmdb:3782  # Ikiru (1952)
+tmdb:9746  # Kundun (1997)
+tmdb:8392  # My Neighbor Totoro (1988)
+tmdb:426426  # Roma (2018)
+tmdb:1563  # Sans Soleil (1983)
+tmdb:593  # Solaris (1972)
+tmdb:129  # Spirited Away (2001)
+tmdb:1398  # Stalker (1979)
+tmdb:1381  # The Fountain (2006)
+tmdb:559907  # The Green Knight (2021)
+tmdb:490  # The Seventh Seal (1957)
+tmdb:404  # The Straight Story (1999)
+tmdb:8967  # The Tree of Life (2011)
+tmdb:38368  # Uncle Boonmee Who Can Recall His Past Lives (2010)

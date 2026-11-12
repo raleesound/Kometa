@@ -1,0 +1,13 @@
+# generated 2026-08-30T06:50:11-0400 by letterboxd-kometa-sync
+# source: letterboxd.com/thisnames2long/list/scariest-horror-movies/ (TOP-UP over upstream)
+# 9 of 9 additions resolved (8 via Plex, 1 via TMDb); 0 unresolved
+
+tmdb:25237  # Come and See (1985)
+tmdb:359246  # Hell House LLC (2015)
+tmdb:493922  # Hereditary (2018)
+tmdb:11838  # Ju-on: The Grudge (2002)
+tmdb:27324  # Pulse (2001)
+tmdb:9392  # The Descent (2005)
+tmdb:30497  # The Texas Chain Saw Massacre (1974)
+tmdb:293670  # The Wailing (2016)
+tmdb:17835  # Threads (1984)

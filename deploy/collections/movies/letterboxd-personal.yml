@@ -1,0 +1,466 @@
+collections:
+  Spoof Movies:
+    sort_title: "!030_spoof"
+    letterboxd_list: https://letterboxd.com/quarkdpn/list/spoof/
+    text_file: /config/movies/generated/spoof.txt
+    file_poster: /config/movies/assets/spoof.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Dog Movies:
+    sort_title: "!030_dog"
+    letterboxd_list: https://letterboxd.com/beroofficial30/list/dog-movies/
+    file_poster: /config/movies/assets/dog.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Big Dumb Action:
+    sort_title: "!030_big_dumb_action"
+    letterboxd_list: https://letterboxd.com/miajb/list/big-dumb-action/
+    file_poster: /config/movies/assets/big-dumb-action.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Heist Movies:
+    sort_title: "!030_heist_movies"
+    collection_order: random
+    letterboxd_list:
+      - https://letterboxd.com/wba/list/my-100-favorite-heist-movies/
+    text_file: /config/movies/generated/heist-movies.txt
+    file_poster: /config/movies/assets/heist.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Good Bad Movies:
+    sort_title: "!030_good_bad_movies"
+    letterboxd_list: https://letterboxd.com/videobath/list/so-bad-its-good/
+    text_file: /config/movies/generated/so-bad-its-good.txt
+    file_poster: /config/movies/assets/so-bad-its-good.png
+    radarr_add_missing: true
+    sync_mode: sync
+
+  Zombie Movies:
+    sort_title: "!030_zombies"
+    letterboxd_list: https://letterboxd.com/screeningnotes/list/zombies/
+    text_file: /config/movies/generated/zombies.txt
+    file_poster: /config/movies/assets/zombies.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Martial Arts Movies:
+    sort_title: "!030_martial_arts"
+    letterboxd_list: https://letterboxd.com/trevorwang/list/martial-arts/
+    file_poster: /config/movies/assets/martial-arts.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  High Octane Action:
+    sort_title: "!030_high_octane_action"
+    letterboxd_list: https://letterboxd.com/iamakku/list/high-octane-action/
+    file_poster: /config/movies/assets/high-octane-action.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Found Footage:
+    sort_title: "!030_found_footage"
+    letterboxd_list: https://letterboxd.com/giger5/list/found-footage/
+    file_poster: /config/movies/assets/found-footage.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Car Chase:
+    sort_title: "!030_car_chase"
+    summary: "Movies with awesome car chases."
+    letterboxd_list: https://letterboxd.com/lahzah/list/car-chase/
+    text_file: /config/movies/generated/car-chase.txt
+    file_poster: /config/movies/assets/car-chase.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Florida Man Inspiration:
+    sort_title: "!030_florida_man_inspiration"
+    file_poster: /config/movies/assets/florida-man-inspiration.png
+    letterboxd_list: https://letterboxd.com/thisnames2long/list/florida-man-inspiration/
+    radarr_add_missing: true
+    sync_mode: sync
+
+  Cerebral Sci Fi:
+    sort_title: "!030_cerebral_sci_fi"
+    letterboxd_list: https://letterboxd.com/maekelcheese/list/cerebral-sci-fi/
+    text_file: /config/movies/generated/cerebral-sci-fi.txt
+    file_poster: /config/movies/assets/cerebral-sci-fi.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Musicals:
+    sort_title: "!030_musicals"
+    letterboxd_list: https://letterboxd.com/hopefulwonderer/list/musicals/
+    file_poster: /config/movies/assets/musicals.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Cyberpunk:
+    sort_title: "!030_cyberpunk"
+    letterboxd_list: https://letterboxd.com/burnt_ramen/list/cyberpunk/
+    text_file: /config/movies/generated/cyberpunk.txt
+    file_poster: /config/movies/assets/cyberpunk.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Slasher:
+    sort_title: "!030_slasher"
+    letterboxd_list:
+      - https://letterboxd.com/va24mar/list/slasher/
+      - https://letterboxd.com/fuchsiadyke/list/slasher/
+    text_file: /config/movies/generated/slasher.txt
+    file_poster: /config/movies/assets/slasher.png
+    collection_order: random
+    radarr_add_missing: true
+    sync_mode: sync
+
+  Romantic Comedies:
+    sort_title: "!030_romantic_comedies"
+    text_file: /config/movies/generated/romantic-comedies.txt
+    file_poster: /config/movies/assets/rom-com.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Dark Fantasy:
+    sort_title: "!030_dark_fantasy"
+    letterboxd_list: https://letterboxd.com/jirasaurus/list/dark-fantasy/
+    text_file: /config/movies/generated/dark-fantasy.txt
+    file_poster: /config/movies/assets/dark-fantasy.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Lynchian:
+    sort_title: "!030_lynchian"
+    summary: "Movies by David Lynch, alongside others that invoke a similar feeling."
+    letterboxd_list: https://letterboxd.com/co_punk/list/lynchian/
+    text_file: /config/movies/generated/lynchian.txt
+    file_poster: /config/movies/assets/lynchian.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Spaghetti Western:
+    sort_title: "!030_spaghetti_western"
+    letterboxd_list: https://letterboxd.com/screeningnotes/list/spaghetti-western/
+    file_poster: /config/movies/assets/spaghetti-western.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Stand-Up Comedy:
+    sort_title: "!030_stand_up_comedy"
+    text_file: /config/movies/generated/stand-up-comedy.txt
+    file_poster: /config/movies/assets/standup-comedy.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Quirky:
+    sort_title: "!030_quirky"
+    letterboxd_list: https://letterboxd.com/chani/list/quirky/
+    file_poster: /config/movies/assets/quirky.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Space Opera:
+    sort_title: "!030_space_opera"
+    letterboxd_list: https://letterboxd.com/shaugahaga/list/space-opera/
+    file_poster: /config/movies/assets/space-opera.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Cozy:
+    sort_title: "!030_cozy"
+    letterboxd_list: https://letterboxd.com/moth__man/list/cozy/
+    file_poster: /config/movies/assets/cozy.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Ho Ho Horror:
+    sort_title: "!030_ho_ho_horror"
+    letterboxd_list: https://letterboxd.com/thisnames2long/list/ho-ho-horror/
+    file_poster: /config/movies/assets/ho-ho-horror.png
+    radarr_add_missing: true
+    sync_mode: sync
+
+  Occult:
+    sort_title: "!030_occult"
+    letterboxd_list: https://letterboxd.com/airtown/list/occult/
+    file_poster: /config/movies/assets/occult.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Uplifting:
+    sort_title: "!030_uplifting"
+    letterboxd_list: https://letterboxd.com/uzumarkus/list/uplifting/
+    file_poster: /config/movies/assets/uplifting.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Vampires!:
+    sort_title: "!030_vampires"
+    letterboxd_list: https://letterboxd.com/seanfennessey/list/vampires/
+    text_file: /config/movies/generated/vampires.txt
+    file_poster: /config/movies/assets/vampires.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Time Travel:
+    sort_title: "!030_time_travel"
+    text_file: /config/movies/generated/time-travel.txt
+    file_poster: /config/movies/assets/time-travel.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Psychedelic:
+    sort_title: "!030_psychedelic"
+    letterboxd_list: https://letterboxd.com/6kinds_of_light/list/psychedelic/
+    file_poster: /config/movies/assets/psychedelic.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Neon & Synth:
+    sort_title: "!030_neon_synth"
+    summary: "Movies of varying genres that have that particular aesthetic/mood created with the combination of neon lights and heavy synth soundtracks."
+    letterboxd_list: https://letterboxd.com/valsorim/list/neon-synth/
+    text_file: /config/movies/generated/neon-synth.txt
+    file_poster: /config/movies/assets/neon-synth.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Cosmic Horror:
+    sort_title: "!030_cosmic_horror"
+    text_file: /config/movies/generated/cosmic-horror.txt
+    file_poster: /config/movies/assets/cosmic-horror.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Raunchy Comedy:
+    sort_title: "!030_raunchy_comedy"
+    letterboxd_list: https://letterboxd.com/soupyytwist/list/raunchy-comedy/
+    text_file: /config/movies/generated/raunchy-comedy.txt
+    file_poster: /config/movies/assets/raunchy-comedy.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Ancient Rome:
+    sort_title: "!030_ancient_rome"
+    summary: "Movies set in Ancient Rome."
+    text_file: /config/movies/generated/ancient-rome.txt
+    file_poster: /config/movies/assets/ancient-rome.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Spicy Romance:
+    sort_title: "!030_spicy_romance"
+    collection_order: random
+    letterboxd_list:
+      - https://letterboxd.com/jasminmini/list/steamy/
+      - https://letterboxd.com/oldfamiliarway/list/love-and-smut/
+    text_file: /config/movies/generated/spicy-romance.txt
+    file_poster: /config/movies/assets/spicy-romance.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Grindhouse:
+    sort_title: "!030_grindhouse"
+    letterboxd_list: https://letterboxd.com/existentialjeny/list/grindhouse/
+    text_file: /config/movies/generated/grindhouse.txt
+    file_poster: /config/movies/assets/grindhouse.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Food:
+    sort_title: "!030_food"
+    letterboxd_list: https://letterboxd.com/iauhnaush/list/foooood/
+    file_poster: /config/movies/assets/food.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Spy Movies:
+    sort_title: "!030_spy_movies"
+    letterboxd_list: https://letterboxd.com/ceejay1/list/spy-movies/
+    file_poster: /config/movies/assets/spy-movies.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Camp:
+    sort_title: "!030_camp"
+    letterboxd_list: https://letterboxd.com/fuchsiadyke/list/camp/
+    text_file: /config/movies/generated/camp.txt
+    file_poster: /config/movies/assets/camp.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Creature Features:
+    sort_title: "!030_creature_features"
+    letterboxd_list: https://letterboxd.com/kez70/list/creature-features/
+    file_poster: /config/movies/assets/creature-features.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Psychological Horror:
+    sort_title: "!030_psychological_horror"
+    letterboxd_list: https://letterboxd.com/calathea_os/list/psychological-horror/
+    file_poster: /config/movies/assets/psychological-horror.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Fairy Tales:
+    sort_title: "!030_fairy_tales"
+    letterboxd_list: https://letterboxd.com/marian64/list/fairy-tales/
+    file_poster: /config/movies/assets/fairy-tales.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Movies Where Nazis Get Punched:
+    sort_title: "!030_movies_where_nazis_get_punched"
+    letterboxd_list: https://letterboxd.com/briellehans/list/movies-where-nazis-get-punched/
+    file_poster: /config/movies/assets/movies-where-nazis-get-punched.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Scariest Horror Movies:
+    sort_title: "!030_scariest_horror_movies"
+    letterboxd_list: https://letterboxd.com/grichmond/list/scariest/
+    text_file: /config/movies/generated/scariest-horror-movies.txt
+    file_poster: /config/movies/assets/scariest-horror-movies.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Satire:
+    sort_title: "!030_satire"
+    letterboxd_list: https://letterboxd.com/danielfie/list/satire/
+    text_file: /config/movies/generated/satire.txt
+    file_poster: /config/movies/assets/satire.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Meditative:
+    sort_title: "!030_meditative"
+    letterboxd_list: https://letterboxd.com/bloppenheim/list/meditative/
+    text_file: /config/movies/generated/meditative.txt
+    file_poster: /config/movies/assets/meditative.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Survival:
+    sort_title: "!030_survival"
+    letterboxd_list: https://letterboxd.com/gy1leenhaal/list/nature-survival/
+    text_file: /config/movies/generated/survival.txt
+    file_poster: /config/movies/assets/survival.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Trauma for the Whole Family!:
+    sort_title: "!030_trauma_for_the_whole_family"
+    letterboxd_list: https://letterboxd.com/thisnames2long/list/trauma-for-the-whole-family/
+    file_poster: /config/movies/assets/trauma-for-the-whole-family.png
+    radarr_add_missing: true
+    sync_mode: sync
+
+  Historically Accurate:
+    sort_title: "!030_historically_accurate"
+    letterboxd_list: https://letterboxd.com/thisnames2long/list/historically-accurate/
+    file_poster: /config/movies/assets/historically-accurate.png
+    radarr_add_missing: true
+    sync_mode: sync
+
+  Punk:
+    sort_title: "!030_punk"
+    letterboxd_list: https://letterboxd.com/fuchsiadyke/list/punk/
+    file_poster: /config/movies/assets/punk.png
+    radarr_add_missing: false
+    summary: Movies that exemplify the punk spirit.
+    sync_mode: sync
+
+  Tarantino's Influences & Movie References:
+    sort_title: "!030_tarantinos_influences"
+    letterboxd_list: https://letterboxd.com/yewverma/list/tarantinos-influences-in-movie-references/
+    file_poster: /config/movies/assets/tarantinos-influences.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Gangster:
+    sort_title: "!030_gangster"
+    letterboxd_list: https://letterboxd.com/dsuter8/list/gangster/
+    file_poster: /config/movies/assets/gangster.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Horror Comedy:
+    sort_title: "!030_horror_comedy"
+    letterboxd_list: https://letterboxd.com/dsuter8/list/horror-comedy/
+    file_poster: /config/movies/assets/horror-comedy.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Dark Humor:
+    sort_title: "!030_dark_humor"
+    letterboxd_list: https://letterboxd.com/guisreis/list/dark-humor/
+    file_poster: /config/movies/assets/dark-humor.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Comfort Movies:
+    sort_title: "!030_comfort_movies"
+    letterboxd_list: https://letterboxd.com/cinemaparadisa/list/comfort-movies/
+    file_poster: /config/movies/assets/comfort-movies.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  WTF:
+    sort_title: "!030_wtf"
+    letterboxd_list: https://letterboxd.com/alluneedis/list/wtf/
+    file_poster: /config/movies/assets/wtf.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Girl Power:
+    sort_title: "!030_girl_power"
+    letterboxd_list: https://letterboxd.com/pedroholiv_/list/girl-power/
+    file_poster: /config/movies/assets/girl-power.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Folk Horror:
+    sort_title: "!030_folk_horror"
+    letterboxd_list: https://letterboxd.com/rachelbea/list/folk-horror/
+    text_file: /config/movies/generated/folk-horror.txt
+    file_poster: /config/movies/assets/folk-horror.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Anxiety Inducing:
+    sort_title: "!030_anxiety_inducing"
+    letterboxd_list: https://letterboxd.com/juliendonkeyboi/list/anxiety-inducing-cinema/
+    text_file: /config/movies/generated/anxiety-inducing.txt
+    file_poster: /config/movies/assets/anxiety-inducing.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  LGBT:
+    sort_title: "!030_lgbt"
+    letterboxd_list: https://letterboxd.com/lunasgf/list/lgbt/
+    file_poster: /config/movies/assets/lgbt.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  I Don't Understand This Trilogy...:
+    sort_title: "!030_i_dont_understand_trilogy"
+    letterboxd_list: https://letterboxd.com/thisnames2long/list/i-dont-understand-this-trilogy/
+    file_poster: /config/movies/assets/dont-understand-trilogy.png
+    radarr_add_missing: true
+    sync_mode: sync
+
+  Halloweeners:
+    sort_title: "!030_halloweeners"
+    summary: >-
+      Movies that take place on Halloween, or just have strong Halloween vibes.
+      Mostly horror, but not just a catch all "best horror movies" list — Halloween
+      has its own vibe that I'm trying to match here.
+    letterboxd_list: https://letterboxd.com/thisnames2long/list/halloweeners/
+    file_poster: /config/movies/assets/halloweeners.png
+    radarr_add_missing: false
+    sync_mode: sync

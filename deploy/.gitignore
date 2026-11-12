@@ -1,0 +1,7 @@
+# Host-local state that lives next to the deploy scripts but is never committed.
+.env
+.env.*
+!.env.example
+*.bak*
+deploy-*.log
+.omc/

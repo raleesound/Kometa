@@ -1,0 +1,13 @@
+collections:
+  Marvel:
+    imdb_list: https://www.imdb.com/list/ls031310794/
+    sort_title: "!050_marvel"
+    sonarr_add_missing: true
+    url_poster: https://theposterdb.com/api/assets/112965
+
+  Star Wars:
+    imdb_list: https://www.imdb.com/list/ls096384270/
+    sort_title: "!050_star_wars"
+    sonarr_add_missing: true
+    url_poster: https://theposterdb.com/api/assets/57917
+    

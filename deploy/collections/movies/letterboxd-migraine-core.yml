@@ -1,0 +1,7 @@
+collections:
+  'Migraine Core':
+    sort_title: '!030_migraine_core'
+    letterboxd_list: 'https://letterboxd.com/thisnames2long/list/migraine-core/'
+    file_poster: '/config/movies/assets/migraine-core.png'
+    radarr_add_missing: false
+    sync_mode: 'sync'

@@ -1,0 +1,7 @@
+collections:
+  Rob's Monthly List:
+    sync_mode: sync
+    sort_title: "!029_robs_monthly_list"
+    letterboxd_list: https://letterboxd.com/thisnames2long/list/no-shame-november-1/
+    file_poster: /config/movies/assets/robs-monthly-list.png
+    radarr_add_missing: true

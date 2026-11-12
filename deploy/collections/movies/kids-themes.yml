@@ -1,0 +1,121 @@
+collections:
+
+  'Kids in Space':
+    sort_title: '!029_kids_in_space'
+    tmdb_movie: 9016, 10122, 9872, 10681, 718789, 6795, 7450, 228161, 68179, 16866, 50321, 19378, 14821, 14822, 13836, 11884, 13766, 12589, 10208, 54007, 34086, 9982, 16577
+    collection_order: release
+    file_poster: '/config/movies/assets/kids-in-space.png'
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
+
+  'Robots & Aliens':
+    sort_title: '!029_robots_aliens'
+    tmdb_movie: 10386, 601, 177572, 2605, 11966, 482321, 10681, 11544, 15512, 9928, 1267, 238603, 11548, 501929, 523777, 16248, 9574, 16577, 228161, 68179
+    collection_order: release
+    file_poster: '/config/movies/assets/robots-aliens.png'
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
+
+  'Brave Girls':
+    sort_title: '!029_brave_girls'
+    tmdb_movie: 277834, 62177, 10674, 16859, 10830, 668482, 1088, 129, 19101, 81, 568124, 527774, 508947, 109445, 269149, 13751, 110416, 12429, 11076, 38223, 14442, 9820, 129112, 342473, 475215
+    collection_order: release
+    file_poster: '/config/movies/assets/brave-girls.png'
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
+
+  'Witches & Magic':
+    sort_title: '!029_witches_magic'
+    tmdb_movie: 16859, 4935, 10439, 12335, 24054, 27850, 21481, 10166, 433, 9078, 10830, 129, 11283, 430447, 14821, 508439, 568124, 24100, 402431, 508943
+    collection_order: release
+    file_poster: '/config/movies/assets/witches-magic.png'
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
+
+  'Kids'' Musicals':
+    sort_title: '!029_kids_musicals'
+    tmdb_movie: 15739, 15121, 668482, 433, 400650, 568124, 277834, 109445, 335797, 438695, 316029, 252, 11708, 17917, 2976, 11176, 354912, 8587, 402431, 15300, 630, 4523, 277217, 10947
+    collection_order: release
+    file_poster: '/config/movies/assets/kids-musicals.png'
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
+
+  '80s Kid Adventure':
+    sort_title: '!029_80s_kid_adventure'
+    letterboxd_list: 'https://letterboxd.com/lukeskybl0cker/list/80s-kids-movies/'
+    file_poster: '/config/movies/assets/80s-kid-adventure.png'
+    filters:
+      content_rating.not: [R, TV-MA, '18', '17', '16', '15', '14']
+      title.not: ['Princess Mononoke', 'Fantastic Planet', '$9.99']
+    collection_order: custom
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
+
+  'Swords & Sorcery':
+    sort_title: '!029_swords_sorcery'
+    letterboxd_list: 'https://letterboxd.com/rachel_remeny/list/medieval-times-witches-wizards-knights-pirates/'
+    file_poster: '/config/movies/assets/swords-sorcery.png'
+    filters:
+      content_rating.not: [R, TV-MA, '18', '17', '16', '15', '14']
+      title.not: ['Princess Mononoke', 'Fantastic Planet', '$9.99']
+    collection_order: custom
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
+
+  'Stop-Motion':
+    sort_title: '!029_stop_motion'
+    letterboxd_list: 'https://letterboxd.com/jxsxpx/list/rotten-tomatoes-30-greatest-stop-motion-animated/'
+    file_poster: '/config/movies/assets/stop-motion.png'
+    filters:
+      content_rating.not: [R, TV-MA, '18', '17', '16', '15', '14']
+      title.not: ['Princess Mononoke', 'Fantastic Planet', '$9.99']
+    collection_order: custom
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
+
+  'Talking Animals':
+    sort_title: '!029_talking_animals'
+    letterboxd_list: 'https://letterboxd.com/distortedvideos/list/live-action-talking-animal-movies/'
+    file_poster: '/config/movies/assets/talking-animals.png'
+    filters:
+      content_rating.not: [R, TV-MA, '18', '17', '16', '15', '14']
+      title.not: ['Princess Mononoke', 'Fantastic Planet', '$9.99']
+    collection_order: custom
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true

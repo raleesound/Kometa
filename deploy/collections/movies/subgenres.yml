@@ -1,0 +1,516 @@
+templates:
+  sub_genre:
+    collection_mode: hide
+    collection_order: critic_rating.desc
+    delete_not_scheduled: false
+    limit: 250
+    sort_title: "+130_<<collection_name>>"
+    sync_mode: sync
+    visible_home: false
+    visible_library: false
+    visible_shared: false
+    imdb_list:
+      list_id: <<imdb_extra_1>>
+    imdb_search:
+      genre: <<genre>>
+      genre.any: <<genre.any>>
+      genre.not: documentary
+      keyword.any: <<keyword.any>>
+      keyword: <<keyword>>
+      language: <<language>>
+      limit: 250
+      rating.gte: <<rating.gte>>
+      sort_by: rating.desc
+      type: <<type>>
+      votes.gte: <<votes.gte>>
+    # letterboxd_list_details:
+    #   - url: https://letterboxd.com/ediblehedgehog/list/<<letterboxd_list>>/by/rating/
+    #     limit: 250
+    #   - url: <<letterboxd_list_details_url_1>>
+    #     limit: <<letterboxd_list_details_limit_1>>
+    #   - url: <<letterboxd_list_details_url_2>>
+    #     limit: <<letterboxd_list_details_limit_2>>
+    #   - url: <<letterboxd_list_details_url_3>>
+    #     limit: <<letterboxd_list_details_limit_3>>
+    #   - url: <<letterboxd_list_details_url_4>>
+    #     limit: <<letterboxd_list_details_limit_4>>
+    #   - url: <<letterboxd_list_details_url_5>>
+    #     limit: <<letterboxd_list_details_limit_5>>
+    # trakt_list:
+    #   - <<trakt_extra_1>>
+    #   - <<trakt_extra_2>>
+    #   - <<trakt_extra_3>>
+    #   - <<trakt_extra_4>>
+    #   - <<trakt_extra_5>>
+    optional:
+      - genre
+      - genre.any
+      - imdb_extra_1
+      - imdb_extra_2
+      - imdb_extra_3
+      - imdb_extra_4
+      - imdb_extra_5
+      - keyword
+      - keyword.any
+      - letterboxd_list_details_url_1
+      - letterboxd_list_details_url_2
+      - letterboxd_list_details_url_3
+      - letterboxd_list_details_url_4
+      - letterboxd_list_details_url_5
+      - letterboxd_list_details_limit_1
+      - letterboxd_list_details_limit_2
+      - letterboxd_list_details_limit_3
+      - letterboxd_list_details_limit_4
+      - letterboxd_list_details_limit_5
+      - trakt_extra_1
+      - trakt_extra_2
+      - trakt_extra_3
+      - trakt_extra_4
+      - trakt_extra_5
+    item_genre: <<collection_name>>
+    build_collection: false
+## _subgenre_top.yml
+
+collections:
+  Alien:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_aliens.png
+    # schedule: weekly(monday)
+    #summary: "Top rated movies in Aliens"
+    template:
+      {
+        keyword: "alien,alien-invasion",
+        language: "en",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Alternate History:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_alternate-history.png
+    # schedule: weekly(monday)
+    #summary: "Top rated movies in Alternate History"
+    template:
+      {
+        keyword: "alternate-history",
+        language: "en",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Anti-Hero:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_anti-hero.png
+    # schedule: weekly(monday)
+    #summary: "Top rated movies in Anti-Hero"
+    template:
+      {
+        keyword: "anti-hero,superhero",
+        language: "en",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Apocalypse:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_apocalypse.png
+    # schedule: weekly(monday)
+    #summary: "Top rated movies in Apocalypse"
+    template:
+      {
+        keyword: "apocalypse,end-of-the-world",
+        language: "en",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Artificial Intelligence:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_artificial-intelligence.png
+    # schedule: weekly(monday)
+    #summary: "Top rated movies in Artificial Intelligence"
+    template:
+      {
+        keyword: "artificial-intelligence",
+        language: "en",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Chick Flick:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_chick-flick.png
+    # schedule: weekly(monday)
+    #summary: "Top rated movies in Chick-flick"
+    template:
+      {
+        keyword: "chick-flick",
+        language: "en",
+        letterboxd_list_details_url_1: "https://letterboxd.com/akookieforyou/list/chick-flicks/by/rating/",
+        letterboxd_list_details_limit_1: 250,
+        letterboxd_list_details_url_2: "https://letterboxd.com/marialuisacctc/list/women-have-superior-taste-that-is-why-these/by/rating/",
+        letterboxd_list_details_limit_2: 250,
+        # letterboxd_list: "theme-chick-flick",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 100,
+      }
+
+  Dark Comedy:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_dark-comedy.png
+    # schedule: weekly(tuesday)
+    #summary: "Top rated movies in Dark Comedy"
+    template:
+      {
+        genre: "comedy",
+        keyword.any: "black-comedy,dark-comedy",
+        language: "en",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Dystopian:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_dystopian.png
+    # schedule: weekly(tuesday)
+    #summary: "Top rated movies in Dystopian"
+    template:
+      {
+        keyword: "dystopia",
+        language: "en",
+        name: sub_genre,
+        rating.gte: 5,
+        imdb_extra_1: ls003911192,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Epic:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_epics.png
+    # schedule: weekly(tuesday)
+    #summary: "Top rated movies in Epics"
+    template:
+      {
+        keyword: "epic",
+        language: "en",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Espionage:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_espionage.png
+    # schedule: weekly(tuesday)
+    #summary: "Top rated movies in Espionage"
+    template:
+      {
+        keyword: "espionage",
+        language: "en",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Ghost:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_ghosts.png
+    # schedule: weekly(wednesday)
+    #summary: "Top rated movies in Ghosts"
+    template:
+      {
+        genre: "horror",
+        keyword: "ghost",
+        language: "en",
+        # letterboxd_list: "theme-ghosts",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Gothic:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_gothic.png
+    # schedule: weekly(wednesday)
+    #summary: "Top rated movies in Gothic"
+    template:
+      {
+        genre: "horror",
+        keyword: "gothic",
+        language: "en",
+        # letterboxd_list: "theme-gothic",
+        name: sub_genre,
+        rating.gte: 2,
+        type: "movie,tv_movie",
+        votes.gte: 100,
+      }
+
+  LGBTQ+:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_lgbtq.png
+    # schedule: weekly(wednesday)
+    #summary: "Top rated movies in LGBTQ+"
+    template:
+      {
+        keyword.any: "lgbt,lgbtq,lgbtqi,lgbtqia,gay,lesbianism,homosexuality,gay-interest",
+        language: "en",
+        # letterboxd_list: "theme-lgbtq",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+  Martial Arts:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_martial-arts.png
+    # schedule: weekly(wednesday)
+    #summary: "Top rated movies in Martial-Arts"
+    template:
+      {
+        imdb_extra_1: "https://www.imdb.com/list/ls000099643",
+        imdb_extra_2: "https://www.imdb.com/list/ls068611186",
+        imdb_extra_3: "https://www.imdb.com/list/ls068378513",
+        imdb_extra_4: "https://www.imdb.com/list/ls090404120",
+        keyword: "martial-artist,martial-arts-master,martial-arts",
+        language: "en",
+        # letterboxd_list: "theme-martial-arts",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+  Mind-Bend:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_mindfuck.png
+    # schedule: weekly(thursday)
+    #summary: "Top rated movies in Mindfuck"
+    template:
+      {
+        imdb_extra_1: "https://www.imdb.com/list/ls066069214",
+        keyword: "mindbender",
+        language: "en",
+        # letterboxd_list: "theme-mindfuck",
+        name: sub_genre,
+        rating.gte: 5,
+        trakt_extra_1: "https://trakt.tv/users/hdlists/lists/mindfuck-movies",
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+  Monster:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_monsters.png
+    # schedule: weekly(thursday)
+    #summary: "Top rated movies in Monsters"
+    template:
+      {
+        genre: "horror",
+        keyword: "creature,monster,creature-feature",
+        language: "en",
+        # letterboxd_list: "theme-monsters",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Mythology:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_mythology.png
+    # schedule: weekly(thursday)
+    #summary: "Top rated movies in Mythology"
+    template:
+      {
+        keyword: "mythology",
+        language: "en",
+        # letterboxd_list: "theme-mythology",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Space:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_outerspace.png
+    # schedule: weekly(thursday)
+    #summary: "Top rated movies in Outerspace"
+    template:
+      {
+        keyword: "outer-space,space-travel",
+        language: "en",
+        # letterboxd_list: "theme-outer-space",
+        name: sub_genre,
+        rating.gte: 5,
+        trakt_extra_1: "https://trakt.tv/users/hdlists/lists/outer-space-space-exploration-movies",
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+  
+  Paranormal:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_paranormal.png
+    # schedule: weekly(thursday)
+    #summary: "Top rated movies in Paranormal"
+    template:
+      {
+        keyword: "paranormal-phenomenon",
+        language: "en",
+        # letterboxd_list: "theme-paranormal",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Parody:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_parody.png
+    # schedule: weekly(thursday)
+    #summary: "Top rated movies in Parody"
+    template:
+      {
+        keyword.any: "parody,parody-comedy",
+        language: "en",
+        # letterboxd_list: "theme-parody",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Period Drama:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_period-drama.png
+    # schedule: weekly(friday)
+    #summary: "Top rated movies in Period Drama"
+    template:
+      {
+        keyword: "period-drama",
+        language: "en",
+        # letterboxd_list: "theme-period-drama",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+  Psychological:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_psychological.png
+    # schedule: weekly(friday)
+    #summary: "Top rated movies in Psychological"
+    template:
+      {
+        keyword.any: "psychological,psychological-horror",
+        language: "en",
+        # letterboxd_list: "theme-psychological",
+        imdb_extra_1: ls027274077,
+        name: sub_genre,
+        rating.gte: 2,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+  Romantic Comedy:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_romantic-comedy.png
+    # schedule: weekly(friday)
+    #summary: "Top rated movies in Romantic Comedy"
+    template:
+      {
+        genre: "romance,comedy",
+        language: "en",
+        # letterboxd_list: "theme-romantic-comedy",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+    filters:
+      genre: Comedy
+      year.gte: 1960
+
+  Satire:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_satire.png
+    # schedule: weekly(friday)
+    #summary: "Top rated movies in Satire"
+    template:
+      {
+        genre: "comedy",
+        keyword: "satire",
+        language: "en",
+        # letterboxd_list: "theme-satire",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Serial Killer:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_serial-killers.png
+    # schedule: weekly(saturday)
+    #summary: "Top rated movies in Serial Killers"
+    template:
+      {
+        keyword: "serial-killer,murder",
+        language: "en",
+        # letterboxd_list: "theme-serial-killers",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Standup Comedy:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_dark-comedy.png
+    # schedule: weekly(tuesday)
+    #summary: "Top rated movies in Dark Comedy"
+    template:
+      {
+        genre: "comedy",
+        keyword.any: "stand-up-comedy",
+        language: "en",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+        imdb_extra_1: ls041728102
+      }
+
+  Stoner Comedy:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_stoner.png
+    # schedule: weekly(saturday)
+    #summary: "Top rated movies in Stoner"
+    template:
+      {
+        keyword: "stoner,marijuana",
+        language: "en",
+        # letterboxd_list: "theme-stoner",
+        name: sub_genre,
+        rating.gte: 1,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+  Supernatural:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_supernatural.png
+    # schedule: weekly(saturday)
+    #summary: "Top rated movies in Supernatural"
+    template:
+      {
+        keyword: "supernatural-power",
+        language: "en",
+        # letterboxd_list: "theme-supernatural",
+        name: sub_genre,
+        rating.gte: 5,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+
+  Surrealism:
+    #url_poster: https://raw.githubusercontent.com/0x5f3/pmm.config/assets/_subgenre_top/subgenre_top_surrealism.png
+    # schedule: weekly(saturday)
+    #summary: "Top rated movies in Surrealism"
+    template:
+      {
+        keyword: "surrealism",
+        language: "en",
+        # letterboxd_list: "theme-surrealism",
+        name: sub_genre,
+        rating.gte: 7,
+        type: "movie,tv_movie",
+        votes.gte: 1000,
+      }
+

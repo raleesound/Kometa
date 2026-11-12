@@ -1,0 +1,5 @@
+# generated 2026-08-28T05:55:08-0400 by letterboxd-kometa-sync
+# source: letterboxd.com/thisnames2long/list/vampires/ (TOP-UP over upstream)
+# 1 of 1 entries resolved; 0 not in the Plex library
+
+tmdb:426063  # Nosferatu (2024)
