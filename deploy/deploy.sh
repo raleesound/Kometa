@@ -189,8 +189,9 @@ docker run -d \
 
 echo "==> Recreating import trigger"
 # Same image as the scheduler, so the trigger is always version-locked to the fork it
-# shells out to. It listens on Plex's websocket (outbound only, no published port). It refuses to start if that build has no --run-items (Kometa ignores
-# unknown flags and would run a full sweep per import instead).
+# shells out to. It listens on Plex's websocket (outbound only, no published port).
+# It refuses to start if that build has no --run-items (Kometa ignores unknown
+# flags and would run a full sweep per import instead).
 docker rm -f kometa-import-trigger >/dev/null 2>&1 || true
 docker run -d \
   --name kometa-import-trigger \

@@ -149,9 +149,12 @@ or episode gets its operations within minutes instead of at the next sweep.
   already in the seen-set. Refreshes, edits and the 2097-pinned films are ignored.
 - Episodes queue their show. Keys are debounced (`TRIGGER_DEBOUNCE_SECONDS`) into
   one run per library; `local://` (unmatched) items are retried on a backoff.
-- Queue and seen-set persist in `CONFIG_DIR/.kometa-trigger-queue.json`. Every
-  (re)connect sweeps the libraries for items added inside the window, so a
-  restart or a dropped socket loses nothing.
+- Queue, in-flight batch, seen-set and catch-up horizon persist in
+  `CONFIG_DIR/.kometa-trigger-queue.json`. Every (re)connect, once the socket is
+  open, sweeps the libraries for items added since the last completed sweep
+  (capped at `MAX_CATCH_UP_SECONDS`, default 7 days), so a restart, a dropped
+  socket or a Plex outage loses nothing. A failed Kometa run, or a crash
+  mid-run, puts its batch back in the queue (bounded by `MAX_ATTEMPTS`).
 - Plex's `library.new` webhook never fired on this server; the old `:9596`
   receiver and its plex.tv webhook registration were removed.
 
