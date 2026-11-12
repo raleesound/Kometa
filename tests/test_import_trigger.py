@@ -120,6 +120,10 @@ class TestProcessedEntries:
     def test_drops_everything_else(self, trig, bad):
         assert trig.processed_entries(timeline(bad)) == []
 
+    @pytest.mark.parametrize("junk", [{"type": "timeline", "TimelineEntry": ["junk"]}, {"type": "timeline", "TimelineEntry": {"a": 1}}, ["not", "a", "dict"], None])
+    def test_junk_is_ignored_not_raised(self, trig, junk):
+        assert trig.processed_entries(junk) == []
+
     def test_ignores_non_timeline_notifications(self, trig):
         assert trig.processed_entries({"type": "playing", "PlaySessionStateNotification": [{}]}) == []
         assert trig.processed_entries({"type": "timeline"}) == []
@@ -227,6 +231,47 @@ class TestHandleNotification:
             time.sleep(0.01)
         assert pending.items == {"Movies": {"10": 0}} and calls == [10, 10]
 
+    def test_resolver_survives_anything(self, trig, pending, monkeypatch):
+        # The resolver is the inbox's only consumer: if it died, every later
+        # live arrival would sit unread.
+        def boom(*a):
+            raise RuntimeError("bug")
+
+        monkeypatch.setattr(trig, "handle_notification", boom)
+        monkeypatch.setattr(trig, "processed_entries", boom)
+        inbox = trig.queue.Queue()
+        thread = threading.Thread(target=trig.resolve_forever, args=(inbox, pending), daemon=True)
+        thread.start()
+        inbox.put((None, {"type": "timeline", "TimelineEntry": ["junk"]}, 0))
+        inbox.put((None, timeline(), 0))
+        deadline = time.time() + 5
+        while inbox.unfinished_tasks and not inbox.empty() and time.time() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        assert thread.is_alive() and inbox.empty()
+
+    def test_resolver_survives_a_failed_retry_schedule(self, trig, pending, monkeypatch):
+        handled = []
+
+        def handle(server, pending, data):
+            handled.append(data)
+            return [{"identifier": "x"}]
+
+        def boom(*a):
+            raise RuntimeError("cannot start timer")
+
+        monkeypatch.setattr(trig, "handle_notification", handle)
+        monkeypatch.setattr(trig, "retry_lookup", boom)
+        inbox = trig.queue.Queue()
+        thread = threading.Thread(target=trig.resolve_forever, args=(inbox, pending), daemon=True)
+        thread.start()
+        inbox.put((None, timeline(), 0))
+        inbox.put((None, timeline(), 0))
+        deadline = time.time() + 5
+        while len(handled) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert len(handled) == 2 and thread.is_alive()
+
     def test_lookup_retries_are_bounded(self, trig, monkeypatch):
         monkeypatch.setattr(trig, "MAX_ATTEMPTS", 3)
         started = []
@@ -332,7 +377,7 @@ class TestListener:
         listener._message(None, json.dumps({"NotificationContainer": {}}))  # handler raises, swallowed
 
     def test_run_connects_websocket_with_keepalive(self, trig, monkeypatch):
-        seen = {}
+        seen, seen_timeouts = {}, []
 
         class FakeApp:
             def __init__(self, url, **callbacks):
@@ -342,14 +387,17 @@ class TestListener:
             def run_forever(self, **kwargs):
                 seen["kwargs"] = kwargs
 
-        monkeypatch.setitem(sys.modules, "websocket", SimpleNamespace(WebSocketApp=FakeApp))
+        monkeypatch.setitem(sys.modules, "websocket", SimpleNamespace(WebSocketApp=FakeApp, setdefaulttimeout=lambda t: seen_timeouts.append(t)))
         listener = trig.Listener(FakeServer(), lambda d: None)
         listener.run()
         assert listener.ready.is_set() and listener.opened
         assert seen["url"].startswith("ws://10.0.0.1:32400/:/websockets/notifications?")
         assert seen["kwargs"]["ping_interval"] > seen["kwargs"]["ping_timeout"] > 0
+        assert seen_timeouts == [trig.PLEX_TIMEOUT_SECONDS]  # a hung connect cannot leak the thread
 
     def test_token_never_logged(self, trig, monkeypatch, caplog):
+        seen_timeouts = []
+
         class FakeApp:
             def __init__(self, url, on_error, **callbacks):
                 on_error(self, ConnectionResetError("reset by peer"))
@@ -357,7 +405,7 @@ class TestListener:
             def run_forever(self, **kwargs):
                 pass
 
-        monkeypatch.setitem(sys.modules, "websocket", SimpleNamespace(WebSocketApp=FakeApp))
+        monkeypatch.setitem(sys.modules, "websocket", SimpleNamespace(WebSocketApp=FakeApp, setdefaulttimeout=lambda t: seen_timeouts.append(t)))
         with caplog.at_level("DEBUG"):
             listener = trig.Listener(FakeServer(), lambda d: None)
             listener.run()
@@ -617,7 +665,7 @@ class TestQueue:
         assert recovered.items == {"Movies": {"10": 2}}
         assert recovered.due_at <= time.time() + trig.DEBOUNCE_SECONDS
 
-    @pytest.mark.parametrize("content", ["{not json", "", "[1, 2]", '{"items": {"Movies": ["10"]}}', '{"items": {"Movies": {"10": "x"}}}'])
+    @pytest.mark.parametrize("content", ["{not json", "", "[1, 2]", '{"items": {"Movies": ["10"]}}', '{"items": {"Movies": {"10": "x"}}}', '{"items": {"M": {"1": 1e999}}}'])
     def test_bad_queue_file_starts_empty_and_says_so(self, trig, tmp_path, caplog, content):
         path = tmp_path / "queue.json"
         path.write_text(content)

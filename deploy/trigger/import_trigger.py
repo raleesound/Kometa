@@ -136,7 +136,7 @@ class Pending:
                     self.seen[str(source)] = [float(value[0]), str(value[1])]
             if isinstance(data.get("horizon"), (int, float)):
                 self.horizon = float(data["horizon"])
-        except (AttributeError, TypeError, ValueError) as e:
+        except (AttributeError, TypeError, ValueError, ArithmeticError) as e:
             log.error("queue file %s is malformed (%s: %s); starting with an empty queue - the catch-up sweep re-finds recent arrivals", self.path, type(e).__name__, e)
             self.items, self.seen, self.horizon = {}, {}, None
             return
@@ -154,6 +154,12 @@ class Pending:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)
+            # Make the rename itself durable.
+            dir_fd = os.open(os.path.dirname(os.path.abspath(self.path)), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except (OSError, TypeError, ValueError) as e:
             log.warning("could not persist queue: %s", e)
 
@@ -321,12 +327,15 @@ def consider(pending: Pending, library: str, item: Any, now: float | None = None
 
 def processed_entries(data: dict) -> list[dict]:
     """The library timeline entries in a websocket notification that report a finished item."""
-    if data.get("type") != "timeline":
+    if not isinstance(data, dict) or data.get("type") != "timeline":
+        return []
+    entries = data.get("TimelineEntry")
+    if not isinstance(entries, list):
         return []
     return [
         entry
-        for entry in data.get("TimelineEntry") or []
-        if entry.get("identifier") == LIBRARY_IDENTIFIER and entry.get("state") == STATE_PROCESSED and entry.get("type") in TIMELINE_TYPES and entry.get("itemID") and entry.get("sectionID") not in (None, "", "-1")
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("identifier") == LIBRARY_IDENTIFIER and entry.get("state") == STATE_PROCESSED and entry.get("type") in TIMELINE_TYPES and entry.get("itemID") and entry.get("sectionID") not in (None, "", "-1")
     ]
 
 
@@ -366,13 +375,20 @@ def resolve_forever(inbox: queue.Queue, pending: Pending) -> None:
     """
     while True:
         server, data, attempt = inbox.get()
+        # Nothing here may escape: this is the only consumer of the inbox.
         try:
             failed = handle_notification(server, pending, data)
         except Exception as e:
             log.exception("notification handler failed: %s", e)
-            failed = processed_entries(data)
-        if failed:
-            retry_lookup(inbox, server, failed, attempt)
+            try:
+                failed = processed_entries(data)
+            except Exception:
+                failed = []
+        try:
+            if failed:
+                retry_lookup(inbox, server, failed, attempt)
+        except Exception as e:
+            log.exception("could not schedule a lookup retry: %s", e)
 
 
 def retry_lookup(inbox: queue.Queue, server: Any, entries: list[dict], attempt: int) -> None:
@@ -458,6 +474,10 @@ class Listener:
     def run(self) -> None:
         import websocket
 
+        # Bounds the TCP/TLS connect and handshake, so a hung connect ends this
+        # thread instead of leaking it. Reads happen only once select reports
+        # data, so an idle socket is not timed out by this.
+        websocket.setdefaulttimeout(PLEX_TIMEOUT_SECONDS)
         # The URL carries the token as a query parameter: it is never logged.
         url = self.server.url(self.key, includeToken=True).replace("http", "ws", 1)
         self.ws = websocket.WebSocketApp(url, on_open=self._open, on_message=self._message, on_error=self._error)
