@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import threading
 import time
@@ -21,8 +22,13 @@ from plexapi.exceptions import NotFound
 TRIGGER_PATH = Path(__file__).resolve().parent.parent / "deploy" / "trigger" / "import_trigger.py"
 
 
+KOMETA_CONFIG = "plex:\n  url: http://plex:32400\n  token: t\nlibraries:\n  Movies:\n    operations: {}\n  TV Shows:\n"
+
+
 @pytest.fixture
-def trig(monkeypatch):
+def trig(monkeypatch, tmp_path):
+    config = tmp_path / "config.yml"
+    config.write_text(KOMETA_CONFIG)
     spec = importlib.util.spec_from_file_location("import_trigger_under_test", TRIGGER_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -30,6 +36,7 @@ def trig(monkeypatch):
     monkeypatch.setattr(module, "RETRY_SECONDS", 150)
     monkeypatch.setattr(module, "NEW_ITEM_WINDOW_SECONDS", 6 * 3600)
     monkeypatch.setattr(module, "MAX_CATCH_UP_SECONDS", 7 * 86400)
+    monkeypatch.setattr(module, "CONFIG_PATH", str(config))
     return module
 
 
@@ -97,6 +104,102 @@ class FakeServer:
 
 
 # ── the new-item filter ──────────────────────────────────────────────────────
+
+
+class TestManagedLibraries:
+    def test_maps_plex_names_to_config_keys(self, trig):
+        Path(trig.CONFIG_PATH).write_text("libraries:\n  Movies:\n  Shows:\n    library_name: TV Shows\n")
+        assert trig.managed_libraries() == {"Movies": "Movies", "TV Shows": "Shows"}
+
+    def test_queues_under_the_key_kometa_matches(self, trig, pending):
+        # Kometa matches --run-libraries against the config key, not the Plex name.
+        Path(trig.CONFIG_PATH).write_text("libraries:\n  Shows:\n    library_name: TV Shows\n")
+        assert trig.consider(pending, "TV Shows", movie(10)) == "10"
+        assert trig.consider(pending, "Shows", movie(11)) is None
+        assert pending.items == {"Shows": {"10": 0}}
+
+    def test_unmanaged_library_is_never_queued(self, trig, pending):
+        # Live 11-12: a film in "Involuntary Film Club" produced a Kometa run
+        # that matched no library, exited 0 and was logged as finished.
+        assert trig.consider(pending, "Involuntary Film Club", movie(10)) is None
+        assert pending.items == {}
+        assert trig.consider(pending, "Movies", movie(11)) == "11"
+
+    def test_sweep_skips_unmanaged_sections(self, trig, pending):
+        ifc = FakeSection(4, "Involuntary Film Club", "movie", [movie(10)])
+        movies = FakeSection(2, "Movies", "movie", [movie(11)])
+        assert trig.catch_up(FakeServer(sections=[ifc, movies]), pending, now=NOW) == 1
+        assert ifc.searches == [] and pending.items == {"Movies": {"11": 0}}
+
+    def test_config_change_is_picked_up(self, trig, pending):
+        assert trig.consider(pending, "Anime", movie(10)) is None
+        path = Path(trig.CONFIG_PATH)
+        path.write_text(KOMETA_CONFIG + "  Anime:\n")
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+        assert trig.consider(pending, "Anime", movie(10)) == "10"
+
+    def test_broken_config_keeps_the_last_good_list(self, trig, pending, caplog):
+        assert trig.consider(pending, "Movies", movie(10)) == "10"
+        path = Path(trig.CONFIG_PATH)
+        path.write_text("{half written: [")
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+        assert trig.consider(pending, "Involuntary Film Club", movie(11)) is None
+        assert trig.consider(pending, "Movies", movie(12)) == "12"
+        assert [r.levelname for r in caplog.records].count("ERROR") == 1  # once per broken version
+
+    @pytest.mark.parametrize("text", ["{not yaml: [", "- a list\n"])
+    def test_unreadable_config_queues_everything_loudly(self, trig, pending, caplog, text):
+        Path(trig.CONFIG_PATH).write_text(text)
+        assert trig.consider(pending, "Involuntary Film Club", movie(10)) == "10"
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+
+    def test_yaml_error_never_logs_the_file(self, trig, pending, caplog, monkeypatch):
+        secret = "s3cr3t-T0KEN-value"
+        Path(trig.CONFIG_PATH).write_text(f"plex:\n  token: {secret}: [\nlibraries:\n  Movies:\n")
+        # Parse the whole text, as a load from a string would: the error then
+        # quotes the token line, so only the logging guard keeps it out.
+        real = trig.yaml.safe_load
+        monkeypatch.setattr(trig.yaml, "safe_load", lambda fh: real(fh.read()))
+        caplog.set_level("DEBUG")
+        trig.consider(pending, "Movies", movie(10))
+        assert caplog.records, "the failure must be logged"
+        assert any("line 2" in r.getMessage() for r in caplog.records)
+        assert all(secret not in r.getMessage() and secret not in str(r.args) for r in caplog.records)
+
+    def test_yaml_error_text_never_reaches_the_log(self, trig):
+        # PyYAML quotes the offending line when it holds the whole document; that
+        # line can be the token line.
+        secret = "s3cr3t-T0KEN-value"
+        with pytest.raises(trig.yaml.YAMLError) as caught:
+            trig.yaml.safe_load(f"plex:\n  token: {secret}: [\n")
+        assert secret in str(caught.value)  # the leak this guards against is real
+        described = trig.describe_config_error(caught.value)
+        assert secret not in described and described.startswith("ScannerError at line 2, column")
+
+    def test_missing_config_logs_once(self, trig, pending, caplog):
+        Path(trig.CONFIG_PATH).unlink()
+        for key in (10, 11, 12):
+            trig.consider(pending, "Movies", movie(key))
+        assert [r.levelname for r in caplog.records].count("ERROR") == 1
+
+    def test_ignored_library_is_announced_once(self, trig, pending, caplog):
+        caplog.set_level("INFO")
+        for key in (10, 11):
+            trig.consider(pending, "Involuntary Film Club", movie(key))
+        notes = [r for r in caplog.records if "Involuntary Film Club" in r.getMessage()]
+        assert len(notes) == 1 and notes[0].levelname == "INFO"
+
+    def test_empty_library_list_warns(self, trig, pending, caplog):
+        Path(trig.CONFIG_PATH).write_text("libraries:\n")
+        assert trig.consider(pending, "Movies", movie(10)) is None
+        assert any(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_missing_config_queues_everything_loudly(self, trig, pending, caplog):
+        Path(trig.CONFIG_PATH).unlink()
+        assert trig.consider(pending, "Involuntary Film Club", movie(10)) == "10"
+        assert any(r.levelname == "ERROR" for r in caplog.records)
 
 
 class TestProcessedEntries:
@@ -283,6 +386,7 @@ class TestHandleNotification:
 
     def test_library_comes_from_the_item_first(self, trig, pending):
         # A library created after connect is missing from the cached section map.
+        Path(trig.CONFIG_PATH).write_text(KOMETA_CONFIG + "  New Library:\n")
         film = movie(10)
         film.librarySectionTitle = "New Library"
         server = FakeServer(sections=[], items=[film])
@@ -781,12 +885,21 @@ class TestWorker:
 class TestRunKometa:
     def test_command_is_item_scoped(self, trig, monkeypatch):
         calls = []
-        monkeypatch.setattr(trig.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(returncode=0, stderr=""))
+        monkeypatch.setattr(trig.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(returncode=0, stdout="", stderr=""))
         assert trig.run_kometa("Movies", ["10", "11"])
         cmd = calls[0]
         assert cmd[cmd.index("--run-items") + 1] == "10|11"
         assert "--operations-only" in cmd and "--read-only-config" in cmd
         assert cmd[cmd.index("--run-libraries") + 1] == "Movies"
+
+    @pytest.mark.parametrize("stream", ["stdout", "stderr"])
+    def test_run_on_no_library_is_an_error_not_a_retry(self, trig, monkeypatch, caplog, stream):
+        # Live 11-12: Kometa exited 0 having matched no library; that was logged as finished.
+        out = {"stdout": "", "stderr": "", stream: "[CRITICAL] | Config Error: No libraries were found in config"}
+        monkeypatch.setattr(trig.subprocess, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, **out))
+        assert trig.run_kometa("Involuntary Film Club", ["10"])  # settled: retrying cannot help
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+        assert not any("finished operations" in r.getMessage() for r in caplog.records)
 
     def test_unstartable_kometa_returns_false(self, trig, monkeypatch):
         def missing(cmd, **kw):

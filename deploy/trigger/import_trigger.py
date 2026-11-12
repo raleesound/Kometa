@@ -87,6 +87,7 @@ SECTION_LIBTYPES = {"movie": "movie", "show": "episode"}
 
 # Plex writes a placeholder GUID until its agent has matched the item.
 UNMATCHED_GUID_PREFIX = "local://"
+NO_LIBRARIES_MESSAGE = "No libraries were found in config"
 
 
 class Pending:
@@ -278,6 +279,64 @@ def load_plex() -> tuple[str, str]:
     return plex["url"].rstrip("/"), plex["token"]
 
 
+_managed: tuple[float, dict[str, str] | None] = (-1.0, None)
+_config_error: Any = None
+_ignored_announced: set[str] = set()
+
+
+def describe_config_error(e: BaseException) -> str:
+    """Name a config read failure without echoing the file.
+
+    A YAML error's text quotes the offending line, which can be the token line.
+    """
+    mark = getattr(e, "problem_mark", None)
+    if mark is not None:
+        return f"{type(e).__name__} at line {mark.line + 1}, column {mark.column + 1}"
+    errno = getattr(e, "errno", None)
+    return f"{type(e).__name__} (errno {errno})" if errno is not None else type(e).__name__
+
+
+def managed_libraries() -> dict[str, str] | None:
+    """Map each Plex library Kometa runs on to its config.yml ``libraries`` key.
+
+    ``--run-libraries`` matches the key; the Plex name is the key unless the
+    entry sets ``library_name``. Re-read when the file changes. A config that
+    cannot be read keeps the last good map; with none, returns None so the
+    trigger queues every library rather than none. Each failure is logged once.
+    """
+    global _managed, _config_error
+    mtime = None
+    try:
+        mtime = os.stat(CONFIG_PATH).st_mtime
+        if mtime == _managed[0]:
+            return _managed[1]
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            libraries = (yaml.safe_load(fh) or {}).get("libraries") or {}
+        mapping = {str((attrs.get("library_name") if isinstance(attrs, dict) else None) or key).strip(): str(key) for key, attrs in libraries.items()}
+    except (OSError, yaml.YAMLError, AttributeError, TypeError) as e:
+        state = (mtime, type(e).__name__)
+        if state != _config_error:
+            _config_error = state
+            fallback = "keeping the last good library list" if _managed[1] is not None else "queueing arrivals from every library"
+            log.error("cannot read the Kometa libraries from %s (%s); %s", CONFIG_PATH, describe_config_error(e), fallback)
+        return _managed[1]
+    _managed = (mtime, mapping)
+    _config_error = None
+    if not mapping:
+        log.warning("%s lists no libraries: no arrival will be queued", CONFIG_PATH)
+    else:
+        log.info("Kometa libraries: %s", ", ".join(f"{name} ({key})" if name != key else key for name, key in sorted(mapping.items())))
+    return mapping
+
+
+def kometa_library(library: str) -> str | None:
+    """The config key to run for a Plex library, or None if Kometa does not run on it."""
+    managed = managed_libraries()
+    if managed is None:
+        return library
+    return managed.get(library.strip())
+
+
 def connect_plex() -> Any:
     from plexapi.server import PlexServer
 
@@ -316,6 +375,13 @@ def consider(pending: Pending, library: str, item: Any, now: float | None = None
     """Queue an item if it is a new import. Returns the queued key, or None."""
     added_at = epoch(getattr(item, "addedAt", None))
     if added_at is None or not library:
+        return None
+    # Kometa would run on nothing for another library, exit 0, and look done.
+    plex_library, library = library, kometa_library(library)
+    if library is None:
+        if plex_library not in _ignored_announced:
+            _ignored_announced.add(plex_library)
+            log.info("not queueing arrivals from %s: it is not a library in %s", plex_library, CONFIG_PATH)
         return None
     key = target_key(item)
     if not key or not pending.admit(library, str(item.ratingKey), key, added_at, now=now):
@@ -412,7 +478,7 @@ def catch_up(server: Any, pending: Pending, now: float | None = None) -> int:
     queued = 0
     for section in server.library.sections():
         libtype = SECTION_LIBTYPES.get(section.type)
-        if not libtype:
+        if not libtype or kometa_library(section.title) is None:
             continue
         for item in section.search(libtype=libtype, filters={"addedAt>>": since}):
             if consider(pending, section.title, item, now=now):
@@ -560,6 +626,11 @@ def run_kometa(library: str, rating_keys: list[str]) -> bool:
     if result.returncode != 0:
         log.error("Kometa exited %s for %s: %s", result.returncode, library, result.stderr[-2000:])
         return False
+    # Kometa exits 0 when --run-libraries matches nothing in the config. Retrying
+    # cannot fix that, so it is settled - loudly - rather than requeued.
+    if NO_LIBRARIES_MESSAGE in (result.stdout or "") + (result.stderr or ""):
+        log.error("Kometa ran on nothing for %s: no library in %s has that key; not retrying %s", library, CONFIG_PATH, ",".join(rating_keys))
+        return True
     log.info("finished operations for %s", library)
     return True
 
