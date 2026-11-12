@@ -135,7 +135,8 @@ tagged `kometa-fork:<sha>` locally on the host, so a rollback needs no rebuild.
   ran inside Plex's butler window and deadlocked Plex on 2026-09-03)
 - `kometa`: `DATA_DIR` → `/data`, `CONFIG_DIR` → `/config`
 - `kometa-import-trigger`: `CONFIG_DIR` → `/config`, `./trigger` → `/trigger:ro`,
-  no published port (it connects out to Plex's websocket)
+  `--env-file .env.nats` (the NATS nkey seed), `NATS_URL`, no published port (it
+  connects out to Plex's websocket and to NATS)
 
 ## The import trigger
 
@@ -155,8 +156,35 @@ or episode gets its operations within minutes instead of at the next sweep.
   (capped at `MAX_CATCH_UP_SECONDS`, default 7 days), so a restart, a dropped
   socket or a Plex outage loses nothing. A failed Kometa run, or a crash
   mid-run, puts its batch back in the queue (bounded by `MAX_ATTEMPTS`).
+- An item run that finds a sweep holding the run lock exits 75; the trigger waits
+  for the lock and runs it again, without charging it an attempt. A scheduled
+  sweep that finds an item run holding it waits for it.
 - Plex's `library.new` webhook never fired on this server; the old `:9596`
   receiver and its plex.tv webhook registration were removed.
+
+### Arrivals (#5634)
+
+The item run starts with an arrival step (`modules/arrivals.py`): every collection
+the live record (`CONFIG_DIR/live-collections.db`, written by each scheduled sweep)
+says is waiting for the new item's TMDb id (films) or TVDb id (shows) gets it
+through the Plex API, and a custom-ordered collection gets it moved into its
+recorded position, checked against Plex's actual order. Only what the record says a
+collection wants is ever added, so the next sweep agrees with it. A waiting
+collection that is not in Plex yet is queued as a scoped
+`--collections-only --run-collections <name>` run, which the trigger runs after
+the batch.
+
+Each new item also leaves one `kometa.item.arrived` event (payload `v: 1`, with the
+collections it went into, possibly none) in the record's outbox. The trigger
+publishes the outbox to JetStream as the nkey user `kometa-trigger`, with
+`Nats-Msg-Id: arrived:<library>:<ratingKey>`, and removes a row from the outbox
+only once JetStream acknowledged it. A NATS outage, or no stream yet (plex-bot
+owns the `KOMETA` stream), only delays an event; the trigger retries on a backoff
+and on every reconnect.
+
+The seed lives in `.env.nats` next to `.env` (mode 0600, one line
+`NATS_NKEY_SEED=SU...`). `deploy.sh` refuses to run without it; the trigger drops
+it from its environment before starting any Kometa run.
 
 ## Why config.yml is host-owned
 

@@ -182,7 +182,7 @@ class TestStorage:
         old.close()
         log = StackLogger()
         conn = live_record.connect(path, log=log)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION == 3
         assert live_record.get_collection(conn, "Movies", "Picks") is None
         assert any("schema v1 is out of date" in m for m in log.warning_messages)
         live_record.write_collection(conn, snapshot(wanted=[(5, False, False, None)]))
@@ -200,7 +200,7 @@ class TestStorage:
         recorder = live_record.RunRecorder(str(tmp_path), log)
         assert recorder.record(fake_library(), METADATA, fake_builder(), "picks", False, False) is True
         assert recorder.failures == 0
-        assert any("rebuilt it as v2" in m for m in log.warning_messages)
+        assert any("rebuilt it as v3" in m for m in log.warning_messages)
 
     def test_a_current_record_is_not_rebuilt(self, tmp_path):
         path = live_record.db_path(str(tmp_path))
@@ -946,7 +946,9 @@ class TestWiring:
             "run_libraries",
             "is_partial_run",
             "expire_live_record",
+            "run_arrivals",
             run_args=args,
+            arrivals=MagicMock(),
             run_collection=run_collection,
             live_record=SimpleNamespace(RunRecorder=lambda *_: recorder),
             logger=MagicMock(),
@@ -982,3 +984,76 @@ def test_connect_rejects_a_non_database(tmp_path):
     path.write_bytes(b"not a database at all, just bytes" * 10)
     with pytest.raises(sqlite3.DatabaseError):
         live_record.connect(str(path))
+
+
+# ── #5634 S3: in-place upgrade, arrivals outbox, collection-run queue ──
+
+
+def _v2_schema():
+    schema = live_record.SCHEMA.replace("    source TEXT,\n    added_at TEXT,\n", "").replace(",\n    source TEXT\n", "\n")
+    assert "source TEXT" not in schema and "added_at" not in schema
+    return schema
+
+
+class TestUpgradeInPlace:
+    def test_a_v2_record_keeps_its_rows_and_gains_the_v3_columns(self, tmp_path):
+        path = live_record.db_path(str(tmp_path))
+        old = sqlite3.connect(path)
+        old.executescript(_v2_schema())
+        old.execute(
+            "INSERT INTO collections (library, name, mapping_name, source_file, source_path, id_type, built, present, kind, members_tracked, missing_checked, order_recorded, last_synced) "
+            "VALUES ('Movies', 'Picks', 'Picks', 'picks', '/c/p.yml', 'tmdb', 1, 1, 'list', 1, 1, 0, ?)",
+            (live_record._now(),),
+        )
+        old.execute("INSERT INTO wanted VALUES ('Movies', 'Picks', 511, 0, 0, NULL)")
+        old.execute("INSERT INTO members VALUES ('Movies', 'Picks', 1, 501, NULL)")
+        old.execute("PRAGMA user_version = 2")
+        old.commit()
+        old.close()
+        log = StackLogger()
+        conn = live_record.connect(path, log=log)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert not log.warning_messages  # upgraded, not dropped
+        assert [r["name"] for r in live_record.find_waiting(conn, "tmdb", 511)] == ["Picks"]
+        assert live_record.record_arrival(conn, "Movies", "Picks", 11, 511) is True
+        assert live_record.get_history(conn, "Movies", "Picks")[0]["source"] == live_record.SOURCE_TRIGGER
+        assert live_record.queue_arrival(conn, "Movies", 11, {"v": 1}) is True
+        conn.close()
+
+
+class TestOutbox:
+    def test_an_unpublished_event_is_replaced_and_a_published_one_is_never_queued_again(self, db):
+        assert live_record.queue_arrival(db, "Movies", 11, {"n": 1}) is True
+        assert live_record.queue_arrival(db, "Movies", 11, {"n": 2}) is True
+        assert [r["payload"] for r in live_record.unpublished_arrivals(db)] == [{"n": 2}]
+        live_record.mark_published(db, "Movies", 11)
+        assert live_record.queue_arrival(db, "Movies", 11, {"n": 3}) is False
+        assert live_record.unpublished_arrivals(db) == []
+
+    def test_expiry_keeps_published_arrivals(self, db):
+        live_record.write_collection(db, snapshot())
+        live_record.queue_arrival(db, "Movies", 11, {"n": 1})
+        live_record.mark_published(db, "Movies", 11)
+        _age(db, "Picks", 60)
+        assert live_record.expire(db) == [("Movies", "Picks")]
+        assert live_record.queue_arrival(db, "Movies", 11, {"n": 2}) is False
+
+    def test_record_arrival_is_idempotent(self, db):
+        live_record.write_collection(db, snapshot(wanted=[(511, False, False, None)]))
+        assert live_record.record_arrival(db, "Movies", "Picks", 11, 511) is True
+        assert live_record.record_arrival(db, "Movies", "Picks", 11, 511) is False
+        assert [h["event"] for h in live_record.get_history(db, "Movies", "Picks")].count(live_record.MEMBER_ADDED) == 1
+
+    def test_positions_cover_members_and_wanted(self, db):
+        live_record.write_collection(db, snapshot(members=[(1, 501, 0), (2, None, 1)], wanted=[(511, False, False, 2), (512, False, False, None)], collection_order="custom.asc", order_recorded=True))
+        assert live_record.positions(db, "Movies", "Picks") == {501: 0, 511: 2}
+
+
+class TestBuildQueue:
+    def test_a_repeat_request_is_one_entry_and_failures_are_bounded(self, db):
+        live_record.queue_build(db, "movies-key", "Picks", "picks")
+        live_record.queue_build(db, "movies-key", "Picks", "picks")
+        assert len(live_record.pending_builds(db)) == 1
+        assert live_record.fail_build(db, "movies-key", "Picks", 2) is False
+        assert live_record.fail_build(db, "movies-key", "Picks", 2) is True
+        assert live_record.pending_builds(db) == []

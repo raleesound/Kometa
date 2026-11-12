@@ -63,6 +63,24 @@ require_idle() {
 }
 require_idle
 
+# The import trigger publishes kometa.item.arrived to NATS as the nkey user
+# kometa-trigger. Its seed lives in an env file on this host (NATS_NKEY_SEED=...),
+# never in .env and never on a command line. Checked before the slow build.
+NATS_ENV_FILE="${NATS_ENV_FILE:-$(pwd)/.env.nats}"
+NATS_URL="${NATS_URL:-nats://10.43.155.192:4222}"
+if [[ ! -f "$NATS_ENV_FILE" ]]; then
+  echo "FATAL: ${NATS_ENV_FILE} is missing (NATS_NKEY_SEED for the kometa-trigger nkey user)" >&2
+  exit 1
+fi
+if [[ "$(stat -c %a "$NATS_ENV_FILE")" != "600" ]]; then
+  echo "FATAL: ${NATS_ENV_FILE} must be mode 0600 (it holds an nkey seed)" >&2
+  exit 1
+fi
+if ! grep -q '^NATS_NKEY_SEED=.' "$NATS_ENV_FILE"; then
+  echo "FATAL: ${NATS_ENV_FILE} has no NATS_NKEY_SEED" >&2
+  exit 1
+fi
+
 echo "==> Fetching fork at ${REF}"
 if [[ ! -d "$SRC_DIR/.git" ]]; then
   git clone "$FORK_URL" "$SRC_DIR"
@@ -191,7 +209,8 @@ echo "==> Recreating import trigger"
 # Same image as the scheduler, so the trigger is always version-locked to the fork it
 # shells out to. It listens on Plex's websocket (outbound only, no published port).
 # It refuses to start if that build has no --run-items (Kometa ignores unknown
-# flags and would run a full sweep per import instead).
+# flags and would run a full sweep per import instead). It publishes the arrival
+# outbox to NATS (#5634), so it gets the nkey seed by env file.
 docker rm -f kometa-import-trigger >/dev/null 2>&1 || true
 docker run -d \
   --name kometa-import-trigger \
@@ -201,6 +220,8 @@ docker run -d \
   -v "$(pwd)/trigger:/trigger:ro" \
   -e TZ="${TZ}" \
   -e DEBOUNCE_SECONDS="${TRIGGER_DEBOUNCE_SECONDS}" \
+  -e NATS_URL="${NATS_URL}" \
+  --env-file "${NATS_ENV_FILE}" \
   --entrypoint python3 \
   "${IMAGE}:local" /trigger/import_trigger.py
 

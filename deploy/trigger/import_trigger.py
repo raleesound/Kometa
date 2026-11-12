@@ -36,15 +36,29 @@ What makes it more than a shell-out:
   batch. Every (re)connect sweeps the libraries for items added since the last
   completed sweep (up to MAX_CATCH_UP_SECONDS back), so a restart, a dropped
   socket or a Plex outage does not lose an import.
+* **Arrivals (#5634 S3).** The item run itself puts a new item into every
+  collection the live record says is waiting for it (kometa.py's arrival step,
+  modules/arrivals.py) and leaves one kometa.item.arrived event per item in the
+  record's outbox. This process publishes that outbox to JetStream from its own
+  thread, acknowledged, deduplicated by Nats-Msg-Id. A row leaves the outbox only
+  once JetStream acknowledged it: a NATS outage, or no stream yet, only delays it.
+  A waiting collection that is not in Plex yet is queued as a scoped Kometa run
+  of that collection, which this process runs after the batch.
+* **One Kometa run at a time.** An item run that finds a sweep holding the run
+  lock exits 75; this process waits for the lock to come free and runs it again
+  without charging it an attempt.
 """
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import json
 import logging
 import os
 import queue
 import subprocess  # nosec B404 - runs kometa.py with a fixed argv, no shell
+import sys
 import threading
 import time
 from datetime import datetime
@@ -63,6 +77,25 @@ DEBOUNCE_SECONDS = int(os.environ.get("DEBOUNCE_SECONDS", "90"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "12"))
 RETRY_SECONDS = int(os.environ.get("RETRY_SECONDS", "150"))
 RUN_TIMEOUT_SECONDS = int(os.environ.get("RUN_TIMEOUT_SECONDS", "1800"))
+# kometa.py's exit code when another run holds the run lock (EX_TEMPFAIL).
+EXIT_LOCK_BUSY = 75
+RUN_LOCK_PATH = os.environ.get("RUN_LOCK_PATH", os.path.join(os.path.dirname(CONFIG_PATH), ".kometa.run.lock"))
+# A run that reports the lock busy while nobody holds it (it could not open the lock file, say)
+# is a failure, not a reason to run it again forever.
+MAX_SPURIOUS_BUSY = 3
+# A scoped run of a collection an arrival is waiting for; past this many failures the scheduled
+# sweep builds it instead.
+BUILD_MAX_ATTEMPTS = int(os.environ.get("BUILD_MAX_ATTEMPTS", "3"))
+# NATS (#5634): the per-client nkey user kometa-trigger. The seed comes from an env file
+# (docker --env-file) and is never logged; the trigger drops it from its environment so the
+# Kometa runs it starts never inherit it.
+NATS_URL = os.environ.get("NATS_URL", "nats://10.43.155.192:4222")
+NATS_CLIENT_NAME = "kometa-trigger"
+NATS_INBOX_PREFIX = "_INBOX_kometa_trigger"
+ARRIVED_SUBJECT = "kometa.item.arrived"
+PUBLISH_TIMEOUT_SECONDS = 10
+PUBLISH_RETRY_MIN_SECONDS = 5
+PUBLISH_RETRY_MAX_SECONDS = 300
 # How recently Plex must have added an item for a "processed" event to count as
 # an import rather than a refresh. Also the reach of the catch-up sweep.
 NEW_ITEM_WINDOW_SECONDS = int(os.environ.get("NEW_ITEM_WINDOW_SECONDS", str(6 * 3600)))
@@ -76,6 +109,15 @@ STABLE_CONNECTION_SECONDS = 60
 OPEN_TIMEOUT_SECONDS = 60
 PLEX_TIMEOUT_SECONDS = 30
 CLOCK_SKEW_SECONDS = 300
+
+# The live record is read and drained with the fork's own module, from the same image as the
+# kometa.py this runs (stdlib only). Appended, so nothing in the image root shadows a stdlib module.
+KOMETA_DIR = os.path.dirname(os.path.abspath(KOMETA_PY))
+if KOMETA_DIR not in sys.path:
+    sys.path.append(KOMETA_DIR)
+from modules import live_record  # noqa: E402
+
+RECORD_PATH = os.environ.get("RECORD_PATH", live_record.db_path(os.path.dirname(CONFIG_PATH)))
 
 LIBRARY_IDENTIFIER = "com.plexapp.plugins.library"
 STATE_PROCESSED = 5
@@ -600,7 +642,48 @@ def listen_forever(
         delay = min(delay * 2, RECONNECT_MAX_SECONDS)
 
 
-def run_kometa(library: str, rating_keys: list[str]) -> bool:
+class _Busy:
+    def __repr__(self) -> str:
+        return "RUN_BUSY"
+
+
+# A run's result when another Kometa run held the lock: neither success nor failure.
+RUN_BUSY: Any = _Busy()
+
+
+def wait_for_run_lock(path: str | None = None) -> bool:
+    """Block until no Kometa run holds the run lock. Returns True when it actually had to wait.
+    A shared lock is granted only once the holder's exclusive lock is released, so this waits on
+    the kernel, not on a timer; it is released at once, leaving the lock to the next run."""
+    with open(path or RUN_LOCK_PATH, "a+") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            waited = False
+        except OSError:
+            log.info("a Kometa run holds the run lock; waiting for it to finish")
+            fcntl.flock(fh, fcntl.LOCK_SH)
+            waited = True
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    return waited
+
+
+def run_unless_busy(run: Callable[..., Any], *args: Any, wait: Callable[[], bool] | None = None) -> bool:
+    """Run, and while the run reports the lock busy, wait for the lock and run again. A busy
+    result is never charged as a failed attempt."""
+    wait = wait or wait_for_run_lock
+    spurious = 0
+    while True:
+        result = run(*args)
+        if result is not RUN_BUSY:
+            return bool(result)
+        if not wait():
+            spurious += 1
+            if spurious >= MAX_SPURIOUS_BUSY:
+                log.error("Kometa keeps reporting the run lock busy while nobody holds it (%s); counting it as a failed run", RUN_LOCK_PATH)
+                return False
+
+
+def run_kometa(library: str, rating_keys: list[str]) -> Any:
     command = [
         "python3",
         KOMETA_PY,
@@ -623,6 +706,8 @@ def run_kometa(library: str, rating_keys: list[str]) -> bool:
     except OSError as e:
         log.error("could not start Kometa for %s: %s", library, e)
         return False
+    if result.returncode == EXIT_LOCK_BUSY:
+        return RUN_BUSY
     if result.returncode != 0:
         log.error("Kometa exited %s for %s: %s", result.returncode, library, result.stderr[-2000:])
         return False
@@ -650,7 +735,7 @@ def process_due(
     pending: Pending,
     due: dict[str, dict[str, int]],
     connect: Callable[[], Any] = connect_plex,
-    run: Callable[[str, list[str]], bool] = run_kometa,
+    run: Callable[[str, list[str]], Any] = run_kometa,
 ) -> None:
     """Run one batch. Every key ends up run, requeued or given up on; then the batch is settled."""
     try:
@@ -683,13 +768,71 @@ def process_due(
             target = target_key(item)
             if target:
                 ready[target] = max(attempts, ready.get(target, 0))
-        if ready and not run(library, list(ready)):
+        if ready and not run_unless_busy(run, library, list(ready)):
             for target, attempts in ready.items():
                 give_up_or_retry(pending, library, target, attempts, "Kometa run failed")
     pending.settle()
 
 
-def worker_step(pending: Pending, connect: Callable[[], Any] = connect_plex, run: Callable[[str, list[str]], bool] = run_kometa) -> None:
+def run_build(library: str, mapping_name: str) -> Any:
+    """A scoped Kometa run of one collection (an arrival is waiting for it and it is not in Plex)."""
+    command = [
+        "python3",
+        KOMETA_PY,
+        "-c",
+        CONFIG_PATH,
+        "--collections-only",
+        "--run-libraries",
+        library,
+        "--run-collections",
+        mapping_name,
+        "--ignore-schedules",
+        "--read-only-config",
+    ]
+    log.info("running collection %s in %s for an arrival waiting on it", mapping_name, library)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=RUN_TIMEOUT_SECONDS)  # nosec B603 - fixed argv
+    except subprocess.TimeoutExpired:
+        log.error("Kometa run of %s timed out after %ss", mapping_name, RUN_TIMEOUT_SECONDS)
+        return False
+    except OSError as e:
+        log.error("could not start Kometa for %s: %s", mapping_name, e)
+        return False
+    if result.returncode == EXIT_LOCK_BUSY:
+        return RUN_BUSY
+    if result.returncode != 0:
+        log.error("Kometa exited %s for collection %s: %s", result.returncode, mapping_name, result.stderr[-2000:])
+        return False
+    return True
+
+
+def run_builds(record_path: str | None = None, run: Callable[[str, str], Any] = run_build) -> None:
+    """Run every collection build the arrival step queued. Never raises."""
+    try:
+        conn = live_record.connect(record_path or RECORD_PATH)
+    except Exception as e:
+        log.warning("cannot open the live record for queued collection runs: %s: %s", type(e).__name__, e)
+        return
+    try:
+        for build in live_record.pending_builds(conn):
+            library, mapping_name = build["library"], build["mapping_name"]
+            if run_unless_busy(run, library, mapping_name):
+                live_record.finish_build(conn, library, mapping_name)
+                log.info("built %s in %s", mapping_name, library)
+            elif live_record.fail_build(conn, library, mapping_name, BUILD_MAX_ATTEMPTS):
+                log.warning("giving up on running %s after %d attempts; the scheduled sweep builds it", mapping_name, BUILD_MAX_ATTEMPTS)
+    except Exception as e:
+        log.exception("queued collection runs failed: %s", e)
+    finally:
+        conn.close()
+
+
+def worker_step(
+    pending: Pending,
+    connect: Callable[[], Any] = connect_plex,
+    run: Callable[[str, list[str]], Any] = run_kometa,
+    after: Callable[[], None] | None = None,
+) -> None:
     due = pending.wait_due()
     try:
         process_due(pending, due, connect, run)
@@ -697,11 +840,160 @@ def worker_step(pending: Pending, connect: Callable[[], Any] = connect_plex, run
         # Never let one bad batch kill the only thread that runs Kometa.
         log.exception("batch failed, requeueing it: %s", e)
         pending.restore_inflight()
+    if after is not None:
+        try:
+            after()
+        except Exception as e:
+            log.exception("after-batch step failed: %s", e)
 
 
-def worker(pending: Pending, connect: Callable[[], Any] = connect_plex) -> None:
+def worker(pending: Pending, connect: Callable[[], Any] = connect_plex, after: Callable[[], None] | None = None) -> None:
+    if after is not None:
+        # Collection runs or outbox rows a crash left behind.
+        after()
     while True:
-        worker_step(pending, connect)
+        worker_step(pending, connect, after=after)
+
+
+class Publisher:
+    """Publishes the live record's arrival outbox to JetStream as kometa.item.arrived.
+
+    Runs its own asyncio loop on a thread. It drains the outbox when woken (after every batch, on
+    every NATS reconnect) and, after a failed publish, again on a backoff. A row is marked published
+    only once JetStream acknowledged it, so a NATS outage or a stream that does not exist yet (the
+    consumer, plex-bot, creates it) only delays an event, never drops it. Each event carries
+    Nats-Msg-Id arrived:<library>:<ratingKey>, so a re-send inside the stream's duplicate window is
+    stored once.
+    """
+
+    def __init__(self, record_path: str, url: str, seed: str, connect: Callable[..., Any] | None = None):
+        self.record_path = record_path
+        self.url = url
+        self._seed = seed
+        self._connect = connect
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self._woken: asyncio.Event | None = None
+        self.nc: Any = None
+
+    def wake(self) -> None:
+        """Thread-safe: drain the outbox now."""
+        loop, woken = self.loop, self._woken
+        if loop is not None and woken is not None:
+            loop.call_soon_threadsafe(woken.set)
+
+    async def _on_reconnect(self) -> None:
+        log.info("NATS reconnected")
+        if self._woken is not None:
+            self._woken.set()
+
+    async def _on_disconnect(self) -> None:
+        log.warning("NATS disconnected; arrival events wait in the outbox")
+
+    async def _on_error(self, e: Exception) -> None:
+        log.warning("NATS error: %s", type(e).__name__)
+
+    async def _open(self) -> Any:
+        if self._connect is not None:
+            return await self._connect()
+        import nats
+
+        return await nats.connect(
+            servers=[self.url],
+            name=NATS_CLIENT_NAME,
+            nkeys_seed_str=self._seed,
+            inbox_prefix=NATS_INBOX_PREFIX,
+            allow_reconnect=True,
+            max_reconnect_attempts=-1,
+            connect_timeout=10,
+            reconnected_cb=self._on_reconnect,
+            disconnected_cb=self._on_disconnect,
+            error_cb=self._on_error,
+        )
+
+    async def _sleep(self, timeout: float | None) -> None:
+        """Until woken, or ``timeout`` seconds (None: until woken)."""
+        assert self._woken is not None
+        try:
+            await asyncio.wait_for(self._woken.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        self._woken.clear()
+
+    async def drain(self, js: Any) -> bool:
+        """Publish every unpublished arrival, oldest first. True when the outbox is empty; False
+        when a publish failed (the row stays queued)."""
+        try:
+            conn = live_record.connect(self.record_path)
+        except Exception as e:
+            log.warning("cannot open the live record to publish arrivals: %s: %s", type(e).__name__, e)
+            return False
+        try:
+            while True:
+                rows = live_record.unpublished_arrivals(conn)
+                if not rows:
+                    return True
+                for row in rows:
+                    msg_id = f"arrived:{row['library']}:{row['rating_key']}"
+                    body = json.dumps(row["payload"], sort_keys=True).encode()
+                    try:
+                        await js.publish(ARRIVED_SUBJECT, body, timeout=PUBLISH_TIMEOUT_SECONDS, headers={"Nats-Msg-Id": msg_id})
+                    except Exception as e:
+                        # NoRespondersError / NotFoundError: no stream captures the subject yet.
+                        log.warning("%s held in the outbox, will retry: %s: %s", msg_id, type(e).__name__, e)
+                        return False
+                    live_record.mark_published(conn, row["library"], row["rating_key"])
+                    log.info("published %s %s", ARRIVED_SUBJECT, msg_id)
+        except Exception as e:
+            log.warning("publishing arrivals failed, will retry: %s: %s", type(e).__name__, e)
+            return False
+        finally:
+            conn.close()
+
+    async def main(self, stop: threading.Event | None = None) -> None:
+        self.loop = asyncio.get_running_loop()
+        self._woken = asyncio.Event()
+        delay = PUBLISH_RETRY_MIN_SECONDS
+        while self.nc is None:
+            try:
+                self.nc = await self._open()
+            except Exception as e:
+                # The type only: the client's errors are not worth risking next to a seed.
+                log.warning("NATS connect to %s failed (%s); retrying in %ds", self.url, type(e).__name__, delay)
+                await self._sleep(delay)
+                delay = min(delay * 2, PUBLISH_RETRY_MAX_SECONDS)
+            if stop is not None and stop.is_set():
+                return
+        log.info("connected to NATS at %s as %s", self.url, NATS_CLIENT_NAME)
+        js = self.nc.jetstream()
+        delay = PUBLISH_RETRY_MIN_SECONDS
+        while stop is None or not stop.is_set():
+            if await self.drain(js):
+                delay = PUBLISH_RETRY_MIN_SECONDS
+                await self._sleep(None)
+            else:
+                await self._sleep(delay)
+                delay = min(delay * 2, PUBLISH_RETRY_MAX_SECONDS)
+
+    def run_forever(self) -> None:
+        while True:
+            try:
+                asyncio.run(self.main())
+            except Exception as e:
+                log.exception("arrival publisher crashed, restarting: %s", e)
+            self.loop = None
+            self.nc = None
+            time.sleep(PUBLISH_RETRY_MIN_SECONDS)
+
+
+def start_publisher() -> Publisher | None:
+    """Start the outbox publisher. Without a seed, say so loudly: events stay in the outbox."""
+    seed = os.environ.pop("NATS_NKEY_SEED", "").strip()
+    if not seed:
+        log.error("NATS_NKEY_SEED is not set: kometa.item.arrived events stay in the outbox (%s) until it is", RECORD_PATH)
+        return None
+    publisher = Publisher(RECORD_PATH, NATS_URL, seed)
+    threading.Thread(target=publisher.run_forever, daemon=True, name="arrival-publisher").start()
+    return publisher
 
 
 def assert_run_items_supported() -> None:
@@ -727,7 +1019,14 @@ def main() -> None:
     logging.getLogger("websocket").setLevel(logging.WARNING)
     assert_run_items_supported()
     pending = Pending(QUEUE_PATH)
-    threading.Thread(target=worker, args=(pending,), daemon=True, name="kometa-runner").start()
+    publisher = start_publisher()
+
+    def after_batch() -> None:
+        run_builds()
+        if publisher is not None:
+            publisher.wake()
+
+    threading.Thread(target=worker, args=(pending,), kwargs={"after": after_batch}, daemon=True, name="kometa-runner").start()
     listen_forever(pending)
 
 
