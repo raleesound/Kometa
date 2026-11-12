@@ -30,7 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MUST_BE_PRESENT = [
     (
         "kometa.py",
-        "record_live_collection(config, library, metadata, *live_ran)",
+        "record_live_collection(config, library, metadata, live_ran[0], mapping_name",
         "every collection run writes the live membership record that the live import path reads (#5634)",
     ),
     (

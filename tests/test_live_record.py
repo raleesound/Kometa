@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import ast
+import multiprocessing
 import sqlite3
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -29,12 +28,13 @@ def db(tmp_path):
     conn.close()
 
 
-def snapshot(name="Picks", library="Movies", members=(), wanted=(), previous_members=None, built=True, present=True, id_type="tmdb", **extra):
+def snapshot(name="Picks", library="Movies", members=(), wanted=(), previous_members=None, built=True, present=True, id_type="tmdb", source_path="/config/movies/picks.yml", **extra):
     snap = {
         "library": library,
         "name": name,
+        "mapping_name": name,
         "source_file": "picks",
-        "source_path": "/config/movies/picks.yml",
+        "source_path": source_path,
         "id_type": id_type,
         "built": built,
         "present": present,
@@ -86,6 +86,8 @@ def fake_builder(**attrs):
         "missing_shows": [],
         "missing_filtered_movies": [],
         "missing_filtered_shows": [],
+        "missing_passed_movies": [],
+        "missing_passed_shows": [],
         "missing_checked": True,
         "held_back_radarr": [],
         "held_back_sonarr": [],
@@ -102,6 +104,47 @@ def fake_builder(**attrs):
 METADATA = SimpleNamespace(get_file_name=lambda: "picks", path="/config/movies/picks.yml")
 
 
+class StackLogger(FakeLogger):
+    def __init__(self):
+        super().__init__()
+        self.stacktraces = 0
+
+    def stacktrace(self):
+        self.stacktraces += 1
+
+
+# ── multi-process workers (top level so the spawn start method can import them) ──
+
+
+def _proc_writer(path, prefix, count, start, results):
+    start.wait()
+    total = 0
+    conn = live_record.connect(path)
+    try:
+        for i in range(count):
+            name = prefix if prefix.endswith("!") else f"{prefix}{i}"
+            events = live_record.write_collection(conn, snapshot(name=name, members=[(i, i, None)], wanted=[(1000 + i, False, False, None)], previous_members=[]))
+            total += len(events)
+    finally:
+        conn.close()
+    results.put(total)
+
+
+def _run_processes(path, jobs):
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Event()
+    results = ctx.Queue()
+    procs = [ctx.Process(target=_proc_writer, args=(path, prefix, count, start, results)) for prefix, count in jobs]
+    for proc in procs:
+        proc.start()
+    start.set()
+    totals = [results.get(timeout=120) for _ in procs]
+    for proc in procs:
+        proc.join(timeout=120)
+    assert [proc.exitcode for proc in procs] == [0] * len(procs)
+    return totals
+
+
 # ── storage ───────────────────────────────────────────────────────────
 
 
@@ -116,20 +159,48 @@ class TestStorage:
         conn = live_record.connect(path)
         live_record.write_collection(conn, snapshot(members=[(1, 10, None)]))
         conn.close()
-        conn = live_record.connect(path)
+        conn = live_record.connect(path, timeout_ms=500)
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 500
         assert [m["rating_key"] for m in live_record.get_members(conn, "Movies", "Picks")] == [1]
         conn.close()
 
+    def test_wal_switch_retries_a_locked_race(self):
+        class RacingConn:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, sql):
+                self.calls += 1
+                if sql == "PRAGMA journal_mode":
+                    return SimpleNamespace(fetchone=lambda: ["delete"])
+                if self.calls < 6:
+                    raise sqlite3.OperationalError("database is locked")
+                return SimpleNamespace(fetchone=lambda: ["wal"])
+
+        conn = RacingConn()
+        live_record._set_wal(conn, 5000)
+        assert conn.calls == 6
+
+    def test_wal_switch_gives_up_at_the_deadline(self):
+        class LockedConn:
+            def execute(self, sql):
+                if sql == "PRAGMA journal_mode":
+                    return SimpleNamespace(fetchone=lambda: ["delete"])
+                raise sqlite3.OperationalError("database is locked")
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            live_record._set_wal(LockedConn(), 0)
+
     def test_first_record_diffs_against_the_runs_starting_membership(self, db):
         # Before this run Plex held 1 and 2; the run added 3 and removed 2.
-        events = live_record.write_collection(db, snapshot(members=[(1, 10, None), (3, 30, None)], previous_members=[1, 2]))
-        assert sorted(events, key=str) == sorted([(live_record.MEMBER_ADDED, 3, 30), (live_record.MEMBER_REMOVED, 2, None)], key=str)
+        events = live_record.write_collection(db, snapshot(members=[(1, 10, None), (3, 30, None)], previous_members=[(1, 10), (2, 20)]))
+        assert set(events) == {(live_record.MEMBER_ADDED, 3, 30), (live_record.MEMBER_REMOVED, 2, 20)}
 
     def test_first_record_without_known_start_writes_no_member_events(self, db):
         assert live_record.write_collection(db, snapshot(members=[(1, 10, None)], previous_members=None)) == []
 
     def test_second_record_diffs_against_the_first(self, db):
-        live_record.write_collection(db, snapshot(members=[(1, 10, None), (2, 20, None)], wanted=[(40, False, False, None)], previous_members=[1, 2]))
+        live_record.write_collection(db, snapshot(members=[(1, 10, None), (2, 20, None)], wanted=[(40, False, False, None)], previous_members=[(1, 10), (2, 20)]))
         events = live_record.write_collection(db, snapshot(members=[(2, 20, None), (4, 40, None)], wanted=[(50, False, True, None)]))
         assert set(events) == {
             (live_record.MEMBER_ADDED, 4, 40),
@@ -140,11 +211,20 @@ class TestStorage:
         history = live_record.get_history(db, "Movies", "Picks")
         assert {(h["event"], h["rating_key"], h["ext_id"]) for h in history} == set(events)
 
-    def test_untracked_members_do_not_wipe_history_diff_base(self, db):
+    def test_history_is_bounded_per_collection(self, db, monkeypatch):
+        monkeypatch.setattr(live_record, "HISTORY_KEEP", 5)
+        live_record.write_collection(db, snapshot(name="Other", members=[(1, 1, None)], previous_members=[]))
+        for i in range(10):
+            live_record.write_collection(db, snapshot(members=[(i, i, None)], previous_members=[]))
+        assert len(live_record.get_history(db, "Movies", "Picks", limit=100)) == 5
+        newest = live_record.get_history(db, "Movies", "Picks", limit=2)
+        assert {(h["event"], h["rating_key"]) for h in newest} == {(live_record.MEMBER_ADDED, 9), (live_record.MEMBER_REMOVED, 8)}
+        assert len(live_record.get_history(db, "Movies", "Other")) == 1
+
+    def test_untracked_members_keep_no_member_rows(self, db):
         live_record.write_collection(db, snapshot(members=[(1, 10, None)], previous_members=[]))
         live_record.write_collection(db, snapshot(members=None))
-        row = live_record.get_collection(db, "Movies", "Picks")
-        assert row["members_tracked"] == 0
+        assert live_record.get_collection(db, "Movies", "Picks")["members_tracked"] == 0
         assert live_record.get_members(db, "Movies", "Picks") == []
 
     def test_failed_write_rolls_back(self, db):
@@ -156,6 +236,22 @@ class TestStorage:
         assert [m["rating_key"] for m in live_record.get_members(db, "Movies", "Picks")] == [1]
         assert not db.in_transaction
 
+    def test_failed_sort_keeps_the_last_good_order(self, db):
+        live_record.write_collection(db, snapshot(members=[(1, 10, 0), (2, 20, 2)], wanted=[(15, False, False, 1)], collection_order="custom.asc", order_recorded=True))
+        first = live_record.get_collection(db, "Movies", "Picks")["order_recorded_at"]
+        live_record.write_collection(db, snapshot(members=[(1, 10, None), (2, 20, None), (3, 30, None)], wanted=[(15, False, False, None)], collection_order="custom.asc", order_recorded=False))
+        row = live_record.get_collection(db, "Movies", "Picks")
+        assert row["order_recorded"] == 1
+        assert row["order_recorded_at"] == first
+        assert [(m["rating_key"], m["position"]) for m in live_record.get_members(db, "Movies", "Picks")] == [(1, 0), (2, 2), (3, None)]
+        assert live_record.get_position(db, "Movies", "Picks", 15) == 1
+
+    def test_order_not_carried_when_the_collection_order_changed(self, db):
+        live_record.write_collection(db, snapshot(members=[(1, 10, 0)], collection_order="custom.asc", order_recorded=True))
+        live_record.write_collection(db, snapshot(members=[(1, 10, None)], collection_order=None, order_recorded=False))
+        assert live_record.get_collection(db, "Movies", "Picks")["order_recorded"] == 0
+        assert live_record.get_position(db, "Movies", "Picks", 10) is None
+
 
 class TestPartialRuns:
     def test_recording_one_collection_leaves_the_others(self, db):
@@ -166,59 +262,76 @@ class TestPartialRuns:
         assert [m["rating_key"] for m in live_record.get_members(db, "Movies", "A")] == [1]
         assert [m["rating_key"] for m in live_record.get_members(db, "Movies", "B")] == [3]
 
-    def test_prune_drops_only_unconfigured_collections_in_that_library(self, db):
+    def test_prune_drops_only_collections_removed_from_a_cleanly_loaded_file(self, db):
         live_record.write_collection(db, snapshot(name="Keep", wanted=[(1, False, False, None)]))
-        live_record.write_collection(db, snapshot(name="Gone", wanted=[(2, False, False, None)]))
+        live_record.write_collection(db, snapshot(name="Gone", wanted=[(2, False, False, None)], previous_members=[]))
         live_record.write_collection(db, snapshot(name="Gone", library="TV Shows", id_type="tvdb"))
-        assert live_record.prune_library(db, "Movies", ["Keep"]) == ["Gone"]
+        assert live_record.prune_library(db, "Movies", {"/config/movies/picks.yml": {"Keep"}}) == ["Gone"]
         assert live_record.get_collection(db, "Movies", "Gone") is None
+        assert live_record.get_history(db, "Movies", "Gone") == []
         assert live_record.find_waiting(db, "tmdb", 2) == []
         assert live_record.get_collection(db, "Movies", "Keep") is not None
         assert live_record.get_collection(db, "TV Shows", "Gone") is not None
 
+    def test_prune_keeps_everything_from_a_file_that_failed_to_load(self, db):
+        live_record.write_collection(db, snapshot(name="Remote", source_path="https://example.invalid/list.yml", wanted=[(9, False, False, 0)]))
+        live_record.write_collection(db, snapshot(name="Local", wanted=[(8, False, False, None)]))
+        # The remote file failed this run, so it is absent from collection_files and the map.
+        assert live_record.prune_library(db, "Movies", {"/config/movies/picks.yml": {"Local"}}) == []
+        assert [r["name"] for r in live_record.find_waiting(db, "tmdb", 9)] == ["Remote"]
+        assert live_record.get_position(db, "Movies", "Remote", 9) == 0
+
+    def test_prune_matches_on_mapping_name_not_display_name(self, db):
+        live_record.write_collection(db, snapshot(name="Best of 1999", mapping_name="best_1999"))
+        assert live_record.prune_library(db, "Movies", {"/config/movies/picks.yml": {"best_1999"}}) == []
+        assert live_record.get_collection(db, "Movies", "Best of 1999") is not None
+
+    def test_mark_deleted_empties_the_record(self, db):
+        live_record.write_collection(db, snapshot(name="Xmas", mapping_name="xmas", members=[(1, 10, None)], wanted=[(20, False, False, None)], previous_members=[]))
+        assert live_record.mark_deleted(db, "Movies", "xmas") == ["Xmas"]
+        row = live_record.get_collection(db, "Movies", "Xmas")
+        assert row["present"] == 0
+        assert live_record.get_members(db, "Movies", "Xmas") == []
+        assert live_record.find_waiting(db, "tmdb", 20) == []
+        events = {(h["event"], h["rating_key"], h["ext_id"]) for h in live_record.get_history(db, "Movies", "Xmas")}
+        assert {(live_record.MEMBER_REMOVED, 1, 10), (live_record.WANTED_REMOVED, None, 20)} <= events
+
 
 class TestConcurrentWriters:
-    def test_two_writers_interleave_without_losing_writes(self, tmp_path):
-        path = live_record.db_path(str(tmp_path))
-        live_record.connect(path).close()
-
-        def writer(prefix):
+    def test_processes_racing_on_a_fresh_file_all_succeed(self, tmp_path):
+        # Each trial starts from no file at all: the WAL switch and schema creation race.
+        for trial in range(3):
+            path = str(tmp_path / f"race{trial}.db")
+            _run_processes(path, [(f"p{n}-", 15) for n in range(4)])
             conn = live_record.connect(path)
-            try:
-                for i in range(40):
-                    live_record.write_collection(conn, snapshot(name=f"{prefix}{i}", members=[(i, i, None)], wanted=[(1000 + i, False, False, None)], previous_members=[]))
-            finally:
-                conn.close()
+            assert conn.execute("SELECT COUNT(*) FROM collections").fetchone()[0] == 60
+            assert conn.execute("SELECT COUNT(*) FROM members").fetchone()[0] == 60
+            conn.close()
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(writer, ["sweep-", "trigger-"]))
+    def test_two_processes_writing_the_same_collection_stay_consistent(self, tmp_path):
+        path = live_record.db_path(str(tmp_path))
+        totals = _run_processes(path, [("Shared!", 25), ("Shared!", 25)])
         conn = live_record.connect(path)
-        assert conn.execute("SELECT COUNT(*) FROM collections").fetchone()[0] == 80
-        assert conn.execute("SELECT COUNT(*) FROM members").fetchone()[0] == 80
+        assert conn.execute("SELECT COUNT(*) FROM collections").fetchone()[0] == 1
+        members = live_record.get_members(conn, "Movies", "Shared!")
+        assert len(members) == 1
+        assert [r["ext_id"] for r in conn.execute("SELECT ext_id FROM wanted")] == [1000 + members[0]["rating_key"]]
+        # Every diff each writer computed landed in history: no lost or interleaved transaction.
+        assert conn.execute("SELECT COUNT(*) FROM history").fetchone()[0] == sum(totals)
         conn.close()
 
-    def test_writer_waits_for_a_held_write_lock(self, tmp_path):
+    def test_held_write_lock_blocks_then_releases(self, tmp_path):
         path = live_record.db_path(str(tmp_path))
         holder = live_record.connect(path)
         holder.execute("BEGIN IMMEDIATE")
-        started = threading.Event()
-        result = {}
-
-        def writer():
-            conn = live_record.connect(path)
-            started.set()
-            try:
-                result["events"] = live_record.write_collection(conn, snapshot(members=[(1, 10, None)], previous_members=[]))
-            finally:
-                conn.close()
-
-        thread = threading.Thread(target=writer)
-        thread.start()
-        started.wait()
+        writer = live_record.connect(path, timeout_ms=50)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            live_record.write_collection(writer, snapshot(members=[(1, 10, None)], previous_members=[]))
+        assert not writer.in_transaction
         holder.execute("COMMIT")
         holder.close()
-        thread.join()
-        assert result["events"] == [(live_record.MEMBER_ADDED, 1, 10)]
+        assert live_record.write_collection(writer, snapshot(members=[(1, 10, None)], previous_members=[])) == [(live_record.MEMBER_ADDED, 1, 10)]
+        writer.close()
 
     def test_reader_sees_last_commit_while_a_write_is_open(self, tmp_path):
         path = live_record.db_path(str(tmp_path))
@@ -242,10 +355,12 @@ class TestReadApi:
         live_record.write_collection(db, snapshot(name="Filtered", wanted=[(7, True, False, None)]))
         live_record.write_collection(db, snapshot(name="NotBuilt", built=False, wanted=[(7, False, False, None)]))
         live_record.write_collection(db, snapshot(name="Shows", library="TV Shows", id_type="tvdb", wanted=[(7, False, False, None)]))
-        live_record.write_collection(db, snapshot(name="New", present=False, members=[], wanted=[(7, False, False, None)]))
+        live_record.write_collection(db, snapshot(name="New", present=False, members=[], wanted=[(7, None, False, None)]))
         rows = live_record.find_waiting(db, "tmdb", 7)
-        assert [(r["name"], r["present"], r["held_back"], r["position"]) for r in rows] == [("A", 1, 1, 3), ("New", 0, 0, None)]
+        assert [(r["name"], r["present"], r["held_back"], r["position"], r["filter_state"]) for r in rows] == [("A", 1, 1, 3, "passed"), ("New", 0, 0, None, "unknown")]
         assert rows[0]["source_file"] == "picks"
+        assert rows[0]["mapping_name"] == "A"
+        assert [r["name"] for r in live_record.find_waiting(db, "tmdb", 7, include_unknown=False)] == ["A"]
         assert [r["name"] for r in live_record.find_waiting(db, "tvdb", 7)] == ["Shows"]
 
     def test_position_and_slot(self, db):
@@ -270,9 +385,10 @@ class TestSnapshot:
         library = fake_library({1: 10, 2: 20, 3: 30})
         # Collection started with 1 and 2; 1 matched (map value cleared), 2 was removed, 3 added.
         builder = fake_builder(remove_item_map={1: None, 2: item(2)}, found_items=[item(1), item(3)])
-        snap = live_record.build_snapshot(builder, library, METADATA, add_ran=True, sync_ran=True)
+        snap = live_record.build_snapshot(builder, library, METADATA, add_ran=True, sync_ran=True, mapping_name="picks_key")
         assert snap["members"] == [(1, 10, None), (3, 30, None)]
-        assert snap["previous_members"] == [1, 2]
+        assert snap["previous_members"] == [(1, 10), (2, 20)]
+        assert snap["mapping_name"] == "picks_key"
         library.get_collection_items.assert_not_called()
 
     def test_sync_not_run_keeps_original_members(self):
@@ -287,6 +403,14 @@ class TestSnapshot:
         snap = live_record.build_snapshot(builder, library, METADATA, add_ran=True, sync_ran=False)
         assert snap["members"] == [(5, 50, None)]
         assert snap["previous_members"] == []
+
+    def test_nothing_in_plex_yet_still_records_what_it_wants(self):
+        # The NonExisting path: no items found, no Plex collection, every film still missing.
+        builder = fake_builder(obj=None, exists=False, missing_movies=[11, 12], missing_checked=False)
+        snap = live_record.build_snapshot(builder, fake_library(), METADATA, add_ran=False, sync_ran=False)
+        assert snap["present"] is False
+        assert snap["members"] == []
+        assert snap["wanted"] == [(11, None, False, None), (12, None, False, None)]
 
     def test_loaded_items_are_the_truth(self):
         library = fake_library({1: 10, 2: 20})
@@ -315,17 +439,19 @@ class TestSnapshot:
         assert snap["members"] is None
         assert snap["wanted"] == []
 
-    def test_wanted_flags_filtered_and_held_back(self):
+    def test_wanted_filter_state_and_held_back(self):
         builder = fake_builder(
-            missing_movies=[7, 8, 9, 7],
+            missing_movies=[7, 8, 9, 6, 7],
             missing_filtered_movies=[8],
+            missing_passed_movies=[7, 9],
             held_back_radarr=[{"title": "Nine", "id": 9}],
         )
         snap = live_record.build_snapshot(builder, fake_library(), METADATA, add_ran=False, sync_ran=False)
-        assert snap["wanted"] == [(7, False, False, None), (8, True, False, None), (9, False, True, None)]
+        # 6 was never evaluated (its lookup failed): unknown, not "passed".
+        assert snap["wanted"] == [(7, False, False, None), (8, True, False, None), (9, False, True, None), (6, None, False, None)]
 
     def test_show_library_uses_tvdb(self):
-        builder = fake_builder(missing_movies=[1], missing_shows=[2], remove_item_map={5: None})
+        builder = fake_builder(missing_movies=[1], missing_shows=[2], missing_passed_shows=[2], remove_item_map={5: None})
         snap = live_record.build_snapshot(builder, fake_library({5: 55}, is_movie=False), METADATA, add_ran=False, sync_ran=False)
         assert snap["id_type"] == "tvdb"
         assert snap["members"] == [(5, 55, None)]
@@ -339,6 +465,7 @@ class TestSnapshot:
             gathered_ids=[(10, "tmdb"), ([20, 10], "tmdb"), ("tt3", "imdb"), (40, "tmdb"), ("x", "tvdb")],
             items=[item(1), item(3)],
             missing_movies=[20, 40],
+            missing_passed_movies=[20, 40],
         )
         snap = live_record.build_snapshot(builder, library, METADATA, add_ran=False, sync_ran=False)
         assert snap["order_recorded"] is True
@@ -350,7 +477,7 @@ class TestSnapshot:
         builder = fake_builder(custom_sort="custom.desc", sort_completed=True, gathered_ids=[(10, "tmdb"), (20, "tmdb")], items=[item(1)], missing_movies=[20])
         snap = live_record.build_snapshot(builder, fake_library({1: 10}), METADATA, add_ran=False, sync_ran=False)
         assert snap["members"] == [(1, 10, 1)]
-        assert snap["wanted"] == [(20, False, False, 0)]
+        assert snap["wanted"] == [(20, None, False, 0)]
 
     def test_order_not_recorded_when_sort_did_not_finish(self):
         builder = fake_builder(custom_sort="custom.asc", sort_completed=False, gathered_ids=[(10, "tmdb")], items=[item(1)])
@@ -365,18 +492,118 @@ class TestSnapshot:
         assert snap["collection_order"] is None
 
     def test_snapshot_round_trips(self, db):
-        builder = fake_builder(remove_item_map={1: None}, found_items=[item(1), item(2)], missing_movies=[30], held_back_radarr=[{"title": "T", "id": 30}])
+        builder = fake_builder(remove_item_map={1: None}, found_items=[item(1), item(2)], missing_movies=[30], missing_passed_movies=[30], held_back_radarr=[{"title": "T", "id": 30}])
         snap = live_record.build_snapshot(builder, fake_library({1: 10, 2: 20}), METADATA, add_ran=True, sync_ran=True)
         events = live_record.write_collection(db, snap)
         assert events == [(live_record.MEMBER_ADDED, 2, 20)]
         assert live_record.find_waiting(db, "tmdb", 30)[0]["held_back"] == 1
 
 
+# ── the run integration actually running ──────────────────────────────
+
+
+def _kometa_functions(*names, **namespace):
+    """Compile the named functions out of kometa.py (importing it parses argv) into ``namespace``."""
+    tree = ast.parse((REPO_ROOT / "kometa.py").read_text(encoding="utf-8"))
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert sorted(n.name for n in nodes) == sorted(names)
+    module = ast.Module(body=nodes, type_ignores=[])
+    exec(compile(module, "kometa.py", "exec"), namespace)  # nosec B102 - our own source, under test
+    return namespace
+
+
+class TestRunIntegration:
+    def _ns(self, tmp_path, run_items=False, **recorder_kwargs):
+        log = StackLogger()
+        recorder = live_record.RunRecorder(str(tmp_path), log, **recorder_kwargs)
+        ns = _kometa_functions("record_live_collection", "record_live_deleted", "prune_live_record", live_recorder=recorder, live_record=live_record)
+        config = SimpleNamespace(run_items=run_items, default_dir=str(tmp_path))
+        return ns, config, log, recorder
+
+    def test_record_writes_through_kometa_wrapper(self, tmp_path):
+        ns, config, log, _ = self._ns(tmp_path)
+        builder = fake_builder(remove_item_map={1: None}, found_items=[item(1)], missing_movies=[5])
+        ns["record_live_collection"](config, fake_library({1: 10}), METADATA, builder, "picks_key", True, True)
+        conn = live_record.connect(live_record.db_path(str(tmp_path)))
+        assert live_record.get_collection(conn, "Movies", "Picks")["mapping_name"] == "picks_key"
+        conn.close()
+        assert any(m.startswith("Live Record: Picks | members: 1 | wanted: 1") for m in log.info_messages)
+
+    def test_run_items_never_opens_the_record(self, tmp_path):
+        ns, config, log, _ = self._ns(tmp_path, run_items=True)
+        ns["record_live_collection"](config, fake_library(), METADATA, fake_builder(), "picks", False, False)
+        ns["record_live_deleted"](config, fake_library(), "picks")
+        ns["prune_live_record"](config, SimpleNamespace(name="Movies", collection_files=[]))
+        assert not Path(live_record.db_path(str(tmp_path))).exists()
+
+    def test_broken_snapshot_is_logged_and_the_run_continues(self, tmp_path):
+        ns, config, log, recorder = self._ns(tmp_path)
+        broken = fake_builder()
+        del broken.missing_passed_movies
+        assert ns["record_live_collection"](config, fake_library(), METADATA, broken, "picks", False, False) is None
+        assert log.stacktraces == 1
+        assert any("Live Record Error: picks" in m for m in log.error_messages)
+        assert recorder.record(fake_library(), METADATA, fake_builder(), "picks", False, False) is True
+
+    def test_unopenable_record_is_logged_and_the_run_continues(self, tmp_path):
+        Path(live_record.db_path(str(tmp_path))).write_bytes(b"not a database at all, just bytes" * 10)
+        ns, config, log, _ = self._ns(tmp_path)
+        ns["record_live_collection"](config, fake_library(), METADATA, fake_builder(), "picks", False, False)
+        assert any("Live Record Error" in m for m in log.error_messages)
+
+    def test_held_lock_costs_a_short_timeout_then_recording_stops_for_the_run(self, tmp_path):
+        path = live_record.db_path(str(tmp_path))
+        holder = live_record.connect(path)
+        holder.execute("BEGIN IMMEDIATE")
+        ns, config, log, recorder = self._ns(tmp_path, timeout_ms=20, failure_limit=2)
+        for _ in range(5):
+            ns["record_live_collection"](config, fake_library(), METADATA, fake_builder(), "picks", False, False)
+        holder.execute("ROLLBACK")
+        holder.close()
+        # Two attempts hit the lock, then the breaker skipped the rest without touching SQLite.
+        assert log.stacktraces == 2
+        assert any("not recording the rest of this run" in m for m in log.error_messages)
+        assert recorder.record(fake_library(), METADATA, fake_builder(), "picks", False, False) is False
+
+    def test_success_resets_the_failure_count(self, tmp_path):
+        _, _, log, recorder = self._ns(tmp_path, failure_limit=2)
+        broken_path = recorder.path
+        recorder.path = str(tmp_path / "missing-dir" / "x.db")
+        assert recorder.record(fake_library(), METADATA, fake_builder(), "picks", False, False) is False
+        recorder.path = broken_path
+        assert recorder.record(fake_library(), METADATA, fake_builder(), "picks", False, False) is True
+        assert recorder.failures == 0
+
+    def test_prune_wrapper_uses_only_cleanly_loaded_files(self, tmp_path):
+        ns, config, log, _ = self._ns(tmp_path)
+        conn = live_record.connect(live_record.db_path(str(tmp_path)))
+        live_record.write_collection(conn, snapshot(name="Old", source_path="/config/a.yml"))
+        live_record.write_collection(conn, snapshot(name="Remote", source_path="https://x.invalid/b.yml"))
+        conn.close()
+        loaded = SimpleNamespace(path="/config/a.yml", collections={"New": {}})
+        ns["prune_live_record"](config, SimpleNamespace(name="Movies", collection_files=[loaded]))
+        conn = live_record.connect(live_record.db_path(str(tmp_path)))
+        assert live_record.get_collection(conn, "Movies", "Old") is None
+        assert live_record.get_collection(conn, "Movies", "Remote") is not None
+        conn.close()
+        assert "Live Record: dropped Old, no longer configured in Movies" in log.info_messages
+
+    def test_deleted_wrapper_marks_absent(self, tmp_path):
+        ns, config, log, _ = self._ns(tmp_path)
+        conn = live_record.connect(live_record.db_path(str(tmp_path)))
+        live_record.write_collection(conn, snapshot(name="Xmas", mapping_name="xmas", wanted=[(3, False, False, None)]))
+        conn.close()
+        ns["record_live_deleted"](config, SimpleNamespace(name="Movies"), "xmas")
+        conn = live_record.connect(live_record.db_path(str(tmp_path)))
+        assert live_record.get_collection(conn, "Movies", "Xmas")["present"] == 0
+        conn.close()
+
+
 # ── builder capture points ────────────────────────────────────────────
 
 
 class TestBuilderCapture:
-    def test_run_missing_records_filtered_ids(self, monkeypatch):
+    def test_run_missing_records_filtered_and_passed_ids(self, monkeypatch):
         import modules.builder as builder_module
 
         monkeypatch.setattr(builder_module, "logger", FakeLogger())
@@ -396,8 +623,9 @@ class TestBuilderCapture:
         builder.check_missing_filters = lambda missing_id, is_movie, **kwargs: missing_id != 2
         builder.run_missing()
         assert builder.missing_checked is True
-        # 3 failed its TMDb lookup: it stays wanted rather than being treated as filtered.
         assert builder.missing_filtered_movies == [2]
+        assert builder.missing_passed_movies == [1]
+        # 3 failed its TMDb lookup: it is in neither list, so the record marks it unknown.
 
     def test_gather_keeps_order_only_for_custom_sorts(self):
         builder = fake_builder(custom_sort="custom.asc", budget_blockers=[], gathered_ids=[])
@@ -416,10 +644,8 @@ class TestBuilderCapture:
         from modules.util import Failed
 
         monkeypatch.setattr(builder_module, "logger", FakeLogger())
-        moves = []
 
         def move(obj, it, previous):
-            moves.append(it.ratingKey)
             if it.ratingKey == 2:
                 raise Failed("nope")
 
@@ -431,7 +657,7 @@ class TestBuilderCapture:
         assert builder.sort_completed is True
 
 
-# ── kometa.py wiring (static: importing kometa.py parses argv) ───────
+# ── kometa.py wiring (structural; the wrappers themselves run above) ──
 
 
 def _function(name):
@@ -446,26 +672,63 @@ def _calls(node, name):
     return [n for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name]
 
 
+def _parents(root):
+    parents = {}
+    for node in ast.walk(root):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    return parents
+
+
+def _ancestors(node, parents):
+    while node in parents:
+        node = parents[node]
+        yield node
+
+
+def _live_ran_assignments(func):
+    return [n for n in ast.walk(func) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "live_ran" for t in n.targets) and isinstance(n.value, ast.Tuple)]
+
+
 class TestWiring:
     def test_record_runs_after_the_except_chain_for_every_collection(self):
         loop = next(n for n in ast.walk(_function("run_collection")) if isinstance(n, ast.For))
-        body_types = [type(stmt).__name__ for stmt in loop.body]
-        try_index = body_types.index("Try")
-        record_if = [stmt for stmt in loop.body[try_index + 1 :] if isinstance(stmt, ast.If) and _calls(stmt, "record_live_collection")]
-        assert record_if, "record_live_collection must run after the try/except, not inside a success path"
+        try_index = next(i for i, stmt in enumerate(loop.body) if isinstance(stmt, ast.Try))
+        record_ifs = [stmt for stmt in loop.body[try_index + 1 :] if isinstance(stmt, ast.If) and _calls(stmt, "record_live_collection")]
+        assert record_ifs, "record_live_collection must run after the try/except, not inside a success path"
 
     def test_record_is_not_gated_on_missing_items(self):
-        source = ast.unparse(_function("run_collection"))
-        settled = source.index("live_ran = (builder, add_ran, sync_ran)")
-        missing_gate = source.index("builder.do_missing and (len(builder.missing_movies)")
-        # The snapshot point sits outside the do_missing block (same indentation as the builder loop's if).
-        assert settled > missing_gate
-        assert "live_ran = (builder, add_ran, sync_ran)" not in ast.unparse(next(n for n in ast.walk(_function("run_collection")) if isinstance(n, ast.If) and "builder.do_missing" in ast.unparse(n.test)))
+        func = _function("run_collection")
+        parents = _parents(func)
+        assignments = _live_ran_assignments(func)
+        assert len(assignments) == 2
+        for assign in assignments:
+            for ancestor in _ancestors(assign, parents):
+                if isinstance(ancestor, ast.If):
+                    assert "do_missing" not in ast.unparse(ancestor.test)
+        # One snapshot point sits directly in the try body, unconditional.
+        assert any(isinstance(parents[a], ast.Try) for a in assignments)
+
+    def test_no_items_found_records_before_raising(self):
+        func = _function("run_collection")
+        raising = [n for n in ast.walk(func) if isinstance(n, ast.If) and any(isinstance(s, ast.Raise) and "NonExisting" in ast.unparse(s) for s in n.body)]
+        assert len(raising) == 1
+        kinds = [type(s).__name__ for s in raising[0].body]
+        assert kinds == ["Assign", "Raise"]
+        assert ast.unparse(raising[0].body[0].targets[0]) == "live_ran"
+
+    def test_deleted_not_scheduled_marks_the_record(self):
+        func = _function("run_collection")
+        handler = next(h for h in ast.walk(func) if isinstance(h, ast.ExceptHandler) and h.type is not None and ast.unparse(h.type) == "NotScheduled")
+        deleted_if = next(n for n in ast.walk(handler) if isinstance(n, ast.If) and "was deleted" in ast.unparse(n.test))
+        assert _calls(deleted_if, "record_live_deleted")
 
     def test_item_runs_never_touch_the_record(self):
-        for name in ("record_live_collection", "prune_live_record"):
+        for name in ("record_live_collection", "record_live_deleted", "prune_live_record"):
             first = _function(name).body[1]
-            assert isinstance(first, ast.If) and ast.unparse(first.test) == "config.run_items"
+            assert isinstance(first, ast.If) and "config.run_items" in ast.unparse(first.test)
+        run_libraries = ast.unparse(_function("run_libraries"))
+        assert "live_recorder = None if config.run_items else live_record.RunRecorder(config.default_dir, logger)" in run_libraries
 
     def test_prune_only_on_full_runs(self):
         run_libraries = _function("run_libraries")

@@ -449,43 +449,34 @@ def should_sync_collection(builder):
     return builder.sync and builder.build_collection and bool(builder.remove_item_map) and (not builder.found_items or len(builder.found_items) + builder.beginning_count >= builder.minimum)
 
 
-def record_live_collection(config, library, metadata, builder, add_ran, sync_ran):
+live_recorder = None  # live_record.RunRecorder for the current run; set in run_libraries()
+
+
+def record_live_collection(config, library, metadata, builder, mapping_name, add_ran, sync_ran):
     """Write this collection's membership, wanted ids and order to the live record (#5634).
 
     A per-item run (--run-items) never touches the record: it does not rebuild collections.
-    A record failure is logged loudly but never fails the collection run.
+    RunRecorder logs and swallows every failure, so recording never fails the collection run.
     """
-    if config.run_items:
+    if config.run_items or live_recorder is None:
         return
-    try:
-        snapshot = live_record.build_snapshot(builder, library, metadata, add_ran, sync_ran)
-        conn = live_record.connect(live_record.db_path(config.default_dir))
-        try:
-            events = live_record.write_collection(conn, snapshot)
-        finally:
-            conn.close()
-        members = "untracked" if snapshot["members"] is None else len(snapshot["members"])
-        logger.info(f"Live Record: {builder.name} | members: {members} | wanted: {len(snapshot['wanted'])} | changes: {len(events)}")
-    except Exception as e:
-        logger.stacktrace()
-        logger.error(f"Live Record Error: {builder.name}: {e}")
+    live_recorder.record(library, metadata, builder, mapping_name, add_ran, sync_ran)
+
+
+def record_live_deleted(config, library, mapping_name):
+    """delete_not_scheduled removed this collection from Plex: record it as absent, waiting on nothing."""
+    if config.run_items or live_recorder is None:
+        return
+    live_recorder.deleted(library.name, mapping_name)
 
 
 def prune_live_record(config, library):
-    """After a full collections run, drop records of collections no longer configured in this library."""
-    if config.run_items:
+    """After a full collections run, drop records only for collections whose file loaded cleanly and no
+    longer defines them. A file that failed to load is absent from collection_files, so its records stay."""
+    if config.run_items or live_recorder is None:
         return
-    try:
-        conn = live_record.connect(live_record.db_path(config.default_dir))
-        try:
-            dropped = live_record.prune_library(conn, library.name, library.collection_names)
-        finally:
-            conn.close()
-        for name in dropped:
-            logger.info(f"Live Record: dropped {name}, no longer configured in {library.name}")
-    except Exception as e:
-        logger.stacktrace()
-        logger.error(f"Live Record Error: pruning {library.name}: {e}")
+    loaded_files = {metadata.path: set(metadata.collections or {}) for metadata in library.collection_files}
+    live_recorder.prune(library.name, loaded_files)
 
 
 def collection_count_after_run(beginning_count, items_added, items_removed):
@@ -1118,6 +1109,8 @@ def run_config(config, stats):
 
 
 def run_libraries(config) -> tuple[LibraryRunStatus, bool]:
+    global live_recorder
+    live_recorder = None if config.run_items else live_record.RunRecorder(config.default_dir, logger)
     library_status: LibraryRunStatus = {}
     collections_ran = False
     config.run_libraries = []
@@ -1416,6 +1409,8 @@ def run_collection(config, library, metadata, requested_collections):
                     library.status[str(mapping_name)]["sonarr"] += sonarr_add
 
                 if not builder.found_items and not builder.ignore_blank_results and not builder.obj and builder.mdb_list_arr_ids is None:
+                    # Nothing in Plex yet, but its wanted ids are exactly what the arrival handler needs.
+                    live_ran = (builder, add_ran, sync_ran)
                     raise NonExisting(f"{builder.Type} Warning: No items found")
 
             # From here the collection's membership is settled; record it even if a later step
@@ -1495,6 +1490,7 @@ def run_collection(config, library, metadata, requested_collections):
             logger.info(e)
             if str(e).endswith("and was deleted"):
                 library.status[str(mapping_name)]["status"] = "Deleted Not Scheduled"
+                record_live_deleted(config, library, mapping_name)
             elif str(e).startswith("Skipped because run_definition"):
                 library.status[str(mapping_name)]["status"] = "Skipped Run Definition"
             else:
@@ -1530,7 +1526,7 @@ def run_collection(config, library, metadata, requested_collections):
             library.status[str(mapping_name)]["status"] = "Unknown Error"
             library.status[str(mapping_name)]["errors"].append(e)
         if live_ran is not None:
-            record_live_collection(config, library, metadata, *live_ran)
+            record_live_collection(config, library, metadata, live_ran[0], mapping_name, live_ran[1], live_ran[2])
         collection_run_time = str(datetime.now() - collection_start).split(".")[0]
         library.status[str(mapping_name)]["run_time"] = collection_run_time
         logger.info("")

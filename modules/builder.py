@@ -1149,9 +1149,12 @@ class CollectionBuilder:
         self.held_back_radarr = []
         self.held_back_sonarr = []
         # Live collection record (modules/live_record.py): which missing ids run_missing() filtered
-        # out, whether it ran at all, the builders' raw id order, and whether the custom sort finished.
+        # out or passed (an id in neither was never evaluated), whether it ran at all, the builders'
+        # raw id order, and whether the custom sort finished.
         self.missing_filtered_movies = []
         self.missing_filtered_shows = []
+        self.missing_passed_movies = []
+        self.missing_passed_shows = []
         self.missing_checked = False
         self.gathered_ids = []
         self.sort_completed = False
@@ -4918,6 +4921,7 @@ class CollectionBuilder:
                 current_title = f"{movie.title} ({movie.release_date.year})" if movie.release_date else movie.title
                 if self.check_missing_filters(missing_id, True, tmdb_item=movie, check_released=self.details["missing_only_released"]):
                     missing_movies_with_names.append((current_title, missing_id))
+                    self.missing_passed_movies.append(missing_id)
                     if self.details["show_missing"] is True:
                         logger.info(f"{i}/{total_ids} {self.name} {self.Type} | ? | {current_title} (TMDb: {missing_id})")
                     else:
@@ -4992,6 +4996,7 @@ class CollectionBuilder:
                     continue
                 if self.check_missing_filters(missing_id, False, check_released=self.details["missing_only_released"]):
                     missing_shows_with_names.append((title, missing_id))
+                    self.missing_passed_shows.append(missing_id)
                     if self.details["show_missing"] is True:
                         logger.info(f"{i}/{total_ids} {self.name} {self.Type} | ? | {title} (TVDb: {missing_id})")
                     else:
