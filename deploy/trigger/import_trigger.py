@@ -61,7 +61,7 @@ import subprocess  # nosec B404 - runs kometa.py with a fixed argv, no shell
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 import yaml
@@ -720,23 +720,90 @@ def run_kometa(library: str, rating_keys: list[str]) -> Any:
     return True
 
 
-def release_arrival(rating_key: str, record_path: str | None = None) -> None:
-    """Out of retries: let the publisher send what the item's last run managed. Never raises."""
+def release_arrivals(rating_keys: list[str], record_path: str | None = None) -> None:
+    """Let the publisher send events a failed run held back: the item ran again and succeeded, ran
+    out of retries, or left Plex. Never raises."""
+    try:
+        conn = live_record.connect(record_path or RECORD_PATH)
+        try:
+            for rating_key in rating_keys:
+                if live_record.release_arrival(conn, rating_key):
+                    log.warning("publishing the arrival of %s with the collections its runs managed", rating_key)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("could not release held arrivals %s: %s: %s", ",".join(rating_keys), type(e).__name__, e)
+
+
+def _plex_ids(item: Any) -> dict[str, Any]:
+    ids: dict[str, Any] = {"tmdb_id": None, "tvdb_id": None, "imdb_id": None}
+    for guid in getattr(item, "guids", None) or []:
+        scheme, _, value = str(getattr(guid, "id", "")).partition("://")
+        if scheme in ("tmdb", "tvdb") and value.isdigit() and int(value) > 0:
+            ids[f"{scheme}_id"] = ids[f"{scheme}_id"] or int(value)
+        elif scheme == "imdb" and value.startswith("tt") and value[2:].isdigit():
+            ids["imdb_id"] = ids["imdb_id"] or value
+    return ids
+
+
+def _utc_stamp(value: Any) -> str:
+    seconds = epoch(value)
+    moment = datetime.fromtimestamp(seconds if seconds is not None else time.time(), timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def plain_payload(item: Any) -> dict[str, Any] | None:
+    """A kometa.item.arrived event with no collections, from Plex alone: for an item whose Kometa runs
+    never reached the arrival step. None when the contract cannot carry it (no id, not a movie/show)."""
+    media_type = getattr(item, "type", None)
+    ids = _plex_ids(item)
+    if media_type not in ("movie", "show") or not any(ids.values()):
+        return None
+    year = getattr(item, "year", None)
+    return {
+        "v": 1,
+        "library": item.librarySectionTitle,
+        "rating_key": str(item.ratingKey),
+        "media_type": media_type,
+        **ids,
+        "title": item.title or str(item.ratingKey),
+        "year": year if isinstance(year, int) and 1870 <= year <= 2200 else None,
+        "added_at": _utc_stamp(getattr(item, "addedAt", None)),
+        "arrived_at": _utc_stamp(None),
+        "collections": [],
+    }
+
+
+def announce_unfinished(server: Any, rating_key: str, record_path: str | None = None) -> None:
+    """Out of retries: the arrival is announced anyway. A held event goes out with what its runs
+    managed; with no event at all (Kometa never reached the arrival step), a plain one from Plex.
+    Never raises."""
     try:
         conn = live_record.connect(record_path or RECORD_PATH)
         try:
             if live_record.release_arrival(conn, rating_key):
-                log.warning("publishing the arrival of %s without the collections its runs could not finish", rating_key)
+                log.warning("publishing the arrival of %s with the collections its runs managed", rating_key)
+                return
+            if live_record.has_arrival(conn, rating_key):
+                return
+            item = fetch_item(server, rating_key)
+            payload = None if item is None else plain_payload(item)
+            if payload is None:
+                log.error("cannot announce %s: not in Plex, or Plex has no TMDb, TVDb or IMDb id for it", rating_key)
+                return
+            if live_record.queue_arrival(conn, payload["library"], rating_key, payload):
+                log.warning("Kometa never finished %s; announcing it with no collections", rating_key)
         finally:
             conn.close()
     except Exception as e:
-        log.warning("could not release the held arrival of %s: %s: %s", rating_key, type(e).__name__, e)
+        log.warning("could not announce %s: %s: %s", rating_key, type(e).__name__, e)
 
 
-def give_up_or_retry(pending: Pending, library: str, rating_key: str, attempts: int, why: str) -> None:
+def give_up_or_retry(pending: Pending, library: str, rating_key: str, attempts: int, why: str, on_give_up: Callable[[str], None] | None = None) -> None:
     if attempts + 1 >= MAX_ATTEMPTS:
         log.warning("giving up on %s: %s after %d attempts", rating_key, why, attempts + 1)
-        release_arrival(rating_key)
+        if on_give_up is not None:
+            on_give_up(rating_key)
         # Clear it from the seen-set (every episode queued as this show, too), so a
         # later processed event - Plex finally matching it, say - queues it again.
         pending.forget(rating_key)
@@ -775,16 +842,22 @@ def process_due(
                 # replaced file). Nothing to apply.
                 log.info("dropping %s: no longer in Plex", rating_key)
                 pending.forget(rating_key)
+                release_arrivals([rating_key])
                 continue
             if not is_matched(item):
-                give_up_or_retry(pending, library, rating_key, attempts, "not matched yet")
+                give_up_or_retry(pending, library, rating_key, attempts, "not matched yet", on_give_up=lambda key: announce_unfinished(server, key))
                 continue
             target = target_key(item)
             if target:
                 ready[target] = max(attempts, ready.get(target, 0))
-        if ready and not run_unless_busy(run, library, list(ready)):
+        if not ready:
+            continue
+        if run_unless_busy(run, library, list(ready)):
+            # A run that succeeded without re-queueing an event held by an earlier failure.
+            release_arrivals(list(ready))
+        else:
             for target, attempts in ready.items():
-                give_up_or_retry(pending, library, target, attempts, "Kometa run failed")
+                give_up_or_retry(pending, library, target, attempts, "Kometa run failed", on_give_up=lambda key: announce_unfinished(server, key))
     pending.settle()
 
 
@@ -841,6 +914,26 @@ def run_builds(record_path: str | None = None, run: Callable[[str, str], Any] = 
         conn.close()
 
 
+def builder(woken: threading.Event, stop: threading.Event | None = None, run_all: Callable[[], None] = run_builds) -> None:
+    """Runs queued collection builds on its own thread, so arrivals never queue behind one. Starts
+    with whatever a crash left queued, then sleeps until a batch queues more."""
+    while True:
+        try:
+            run_all()
+        except Exception as e:
+            log.exception("queued collection runs failed: %s", e)
+        if stop is not None and stop.is_set():
+            return
+        woken.wait()
+        woken.clear()
+
+
+def start_builder() -> threading.Event:
+    woken = threading.Event()
+    threading.Thread(target=builder, args=(woken,), daemon=True, name="collection-builder").start()
+    return woken
+
+
 def worker_step(
     pending: Pending,
     connect: Callable[[], Any] = connect_plex,
@@ -867,6 +960,14 @@ def worker(pending: Pending, connect: Callable[[], Any] = connect_plex, after: C
         after()
     while True:
         worker_step(pending, connect, after=after)
+
+
+# Publisher.drain() results.
+DRAIN_EMPTY = "empty"
+DRAIN_RETRY = "retry"
+DRAIN_WAIT = "wait"
+# An ack that did not come in time is worth a retry on a backoff; nothing else is.
+TIMEOUT_ERRORS = {"TimeoutError", "FlushTimeoutError"}
 
 
 class Publisher:
@@ -926,41 +1027,49 @@ class Publisher:
 
     async def _sleep(self, timeout: float | None) -> None:
         """Until woken, or ``timeout`` seconds (None: until woken)."""
-        assert self._woken is not None
+        woken = self._woken
+        if woken is None:
+            return
         try:
-            await asyncio.wait_for(self._woken.wait(), timeout)
+            await asyncio.wait_for(woken.wait(), timeout)
         except asyncio.TimeoutError:
             pass
-        self._woken.clear()
+        woken.clear()
 
-    async def drain(self, js: Any) -> bool:
-        """Publish every unpublished arrival, oldest first. True when the outbox is empty; False
-        when a publish failed (the row stays queued)."""
+    async def drain(self, js: Any) -> str:
+        """Publish every unpublished arrival, oldest first. DRAIN_EMPTY when the outbox is empty;
+        DRAIN_RETRY when JetStream did not ack in time (worth a retry on a backoff); DRAIN_WAIT when
+        nothing can take the event until something changes (no stream, NATS down). Failed rows stay
+        queued."""
         # sqlite calls go to a worker thread: a busy record must not stall the NATS client's loop.
         try:
             conn = await asyncio.to_thread(live_record.connect, self.record_path, check_same_thread=False)
         except Exception as e:
             log.warning("cannot open the live record to publish arrivals: %s: %s", type(e).__name__, e)
-            return False
+            return DRAIN_RETRY
         try:
             while True:
                 rows = await asyncio.to_thread(live_record.unpublished_arrivals, conn)
                 if not rows:
-                    return True
+                    return DRAIN_EMPTY
                 for row in rows:
                     msg_id = f"arrived:{row['library']}:{row['rating_key']}"
                     body = json.dumps(row["payload"], sort_keys=True).encode()
                     try:
                         await js.publish(ARRIVED_SUBJECT, body, timeout=PUBLISH_TIMEOUT_SECONDS, headers={"Nats-Msg-Id": msg_id})
                     except Exception as e:
-                        # NoRespondersError / NotFoundError: no stream captures the subject yet.
-                        log.warning("%s held in the outbox, will retry: %s: %s", msg_id, type(e).__name__, e)
-                        return False
-                    await asyncio.to_thread(live_record.mark_published, conn, row["library"], row["rating_key"])
+                        if type(e).__name__ in TIMEOUT_ERRORS or isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+                            log.warning("%s: no ack from JetStream (%s); retrying on a backoff", msg_id, type(e).__name__)
+                            return DRAIN_RETRY
+                        # No stream yet (NoRespondersError / 503), or the connection is down: nothing
+                        # a timer would fix. The next reconnect, arrival or restart drains again.
+                        log.warning("%s held in the outbox until NATS can take it: %s: %s", msg_id, type(e).__name__, e)
+                        return DRAIN_WAIT
+                    await asyncio.to_thread(live_record.mark_published, conn, row["library"], row["rating_key"], row["raw"])
                     log.info("published %s %s", ARRIVED_SUBJECT, msg_id)
         except Exception as e:
             log.warning("publishing arrivals failed, will retry: %s: %s", type(e).__name__, e)
-            return False
+            return DRAIN_RETRY
         finally:
             conn.close()
 
@@ -983,12 +1092,14 @@ class Publisher:
             js = self.nc.jetstream()
             delay = PUBLISH_RETRY_MIN_SECONDS
             while stop is None or not stop.is_set():
-                if await self.drain(js):
-                    delay = PUBLISH_RETRY_MIN_SECONDS
-                    await self._sleep(None)
-                else:
+                result = await self.drain(js)
+                if result == DRAIN_RETRY:
                     await self._sleep(delay)
                     delay = min(delay * 2, PUBLISH_RETRY_MAX_SECONDS)
+                else:
+                    # Empty, or waiting on NATS: the next wake (an arrival, a reconnect) drains again.
+                    delay = PUBLISH_RETRY_MIN_SECONDS
+                    await self._sleep(None)
         finally:
             # A crash restarts main() on a new loop with a new connection: close this one.
             try:
@@ -1042,11 +1153,13 @@ def main() -> None:
     assert_run_items_supported()
     pending = Pending(QUEUE_PATH)
     publisher = start_publisher()
+    builds = start_builder()
 
     def after_batch() -> None:
-        run_builds()
+        # Neither waits on the other or on the next batch: a scoped collection run can take a while.
         if publisher is not None:
             publisher.wake()
+        builds.set()
 
     threading.Thread(target=worker, args=(pending,), kwargs={"after": after_batch}, daemon=True, name="kometa-runner").start()
     listen_forever(pending)

@@ -22,7 +22,13 @@ DB_NAME = "live-collections.db"
 # Bump on any schema change: an older record is dropped and rebuilt (it is derived data; the next
 # sweep repopulates it).
 SCHEMA_VERSION = 3
-TABLES = ("collections", "members", "wanted", "history", "arrivals", "builds")
+TABLES = ("collections", "members", "wanted", "history", "arrivals", "builds", "record_meta")
+# What an out-of-date record keeps when it is dropped and rebuilt: the outbox remembers which items
+# were announced, and losing it would announce them all again.
+KEEP_ON_REBUILD = ("arrivals", "record_meta")
+# Items Plex added before the arrivals outbox existed are recorded as announced, not announced: the
+# first deploy must not post a week of catch-up arrivals at once.
+ARRIVALS_SINCE = "arrivals_since"
 # Versions that can be upgraded in place (version -> statements bringing it to version + 1). Older
 # versions are dropped and rebuilt. In-place matters: a dropped record leaves the arrival handler
 # blind until the next sweep repopulates it.
@@ -118,6 +124,10 @@ CREATE TABLE IF NOT EXISTS builds (
     attempts INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (library, mapping_name)
 );
+CREATE TABLE IF NOT EXISTS record_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 MEMBER_ADDED = "member_added"
@@ -177,8 +187,10 @@ def connect(path, timeout_ms=BUSY_TIMEOUT_MS, log=None, check_same_thread=True):
                         log.info(f"Live Record: upgraded the record in place to schema v{SCHEMA_VERSION}")
                 elif version < SCHEMA_VERSION:
                     if version > 0:
+                        keep = KEEP_ON_REBUILD if _columns(conn, "arrivals") >= ARRIVALS_COLUMNS else ()
                         for table in TABLES:
-                            conn.execute(f"DROP TABLE IF EXISTS {table}")  # nosec B608 - table names are constants
+                            if table not in keep:
+                                conn.execute(f"DROP TABLE IF EXISTS {table}")  # nosec B608 - table names are constants
                         if log is not None:
                             log.warning(f"Live Record: schema v{version} is out of date, dropped the record and rebuilt it as v{SCHEMA_VERSION}; the next sweep repopulates it")
                     _create(conn)
@@ -193,10 +205,25 @@ def connect(path, timeout_ms=BUSY_TIMEOUT_MS, log=None, check_same_thread=True):
     return conn
 
 
+# The outbox columns every reader and writer here uses: an outbox without them is rebuilt, not kept.
+ARRIVALS_COLUMNS = frozenset({"library", "rating_key", "payload", "created_at", "published_at", "complete"})
+
+
+def _columns(conn, table):
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}  # nosec B608 - table name is a constant
+
+
 def _create(conn):
     for statement in (SCHEMA + SCHEMA_V3).split(";"):
         if statement.strip():
             conn.execute(statement)
+    conn.execute("INSERT OR IGNORE INTO record_meta (key, value) VALUES (?, ?)", (ARRIVALS_SINCE, _now()))
+
+
+def arrivals_since(conn):
+    """When the outbox started (an aware datetime): items Plex added before it are not announced."""
+    row = conn.execute("SELECT value FROM record_meta WHERE key = ?", (ARRIVALS_SINCE,)).fetchone()
+    return None if row is None else datetime.fromisoformat(row["value"])
 
 
 def _now():
@@ -415,7 +442,7 @@ def expire(conn, max_age=EXPIRE_AFTER, now=None):
 # ── Read API (used by the arrival handler, S3) ─────────────────────────
 
 
-def find_waiting(conn, id_type, ext_id, include_unknown=True, stale_after=STALE_AFTER, now=None):
+def find_waiting(conn, id_type, ext_id, include_unknown=False, stale_after=STALE_AFTER, now=None):
     """Every built collection still waiting on this TMDb ('tmdb') or TVDb ('tvdb') id.
 
     An id run_missing filtered out is never returned. ``filter_state`` is 'passed' when run_missing
@@ -549,6 +576,16 @@ def queue_arrival(conn, library, rating_key, payload, now=None, complete=True):
         if row is not None and row["published_at"] is not None:
             conn.execute("COMMIT")
             return False
+        since = arrivals_since(conn)
+        added_at = payload.get("added_at")
+        if row is None and since is not None and added_at and datetime.fromisoformat(added_at) < since:
+            # Added before the outbox existed (the first deploy's catch-up): on record, never announced.
+            conn.execute(
+                "INSERT INTO arrivals (library, rating_key, payload, created_at, published_at, complete) VALUES (?, ?, ?, ?, ?, 1)",
+                (library, int(rating_key), json.dumps(payload, sort_keys=True), stamp, stamp),
+            )
+            conn.execute("COMMIT")
+            return False
         if row is not None:
             payload = _merge_attempts(json.loads(row["payload"]), payload)
         conn.execute(
@@ -566,7 +603,12 @@ def unpublished_arrivals(conn, limit=100):
     """Outbox rows ready to publish and not yet acknowledged by JetStream, oldest first: library,
     rating_key, payload (dict). Rows held back by a failed run are not ready."""
     rows = conn.execute("SELECT library, rating_key, payload FROM arrivals WHERE published_at IS NULL AND complete = 1 ORDER BY created_at, library, rating_key LIMIT ?", (limit,))
-    return [{"library": row["library"], "rating_key": row["rating_key"], "payload": json.loads(row["payload"])} for row in rows]
+    return [{"library": row["library"], "rating_key": row["rating_key"], "payload": json.loads(row["payload"]), "raw": row["payload"]} for row in rows]
+
+
+def has_arrival(conn, rating_key):
+    """Whether the outbox has any row (held, queued or published) for this ratingKey."""
+    return conn.execute("SELECT 1 FROM arrivals WHERE rating_key = ? LIMIT 1", (int(rating_key),)).fetchone() is not None
 
 
 def release_arrival(conn, rating_key):
@@ -576,8 +618,17 @@ def release_arrival(conn, rating_key):
     return cursor.rowcount > 0
 
 
-def mark_published(conn, library, rating_key, now=None):
-    conn.execute("UPDATE arrivals SET published_at = ? WHERE library = ? AND rating_key = ?", (_stamp(now or datetime.now(timezone.utc)), library, int(rating_key)))
+def mark_published(conn, library, rating_key, raw=None, now=None):
+    """Mark the row published. With ``raw`` (the payload text that was sent), only while the row
+    still holds exactly that payload: a rerun that replaced it in the meantime keeps its own event
+    queued (the stream's duplicate window drops a resend of the same Nats-Msg-Id). Returns True when
+    a row was marked."""
+    stamp = _stamp(now or datetime.now(timezone.utc))
+    if raw is None:
+        cursor = conn.execute("UPDATE arrivals SET published_at = ? WHERE library = ? AND rating_key = ?", (stamp, library, int(rating_key)))
+    else:
+        cursor = conn.execute("UPDATE arrivals SET published_at = ? WHERE library = ? AND rating_key = ? AND complete = 1 AND payload = ?", (stamp, library, int(rating_key), raw))
+    return cursor.rowcount > 0
 
 
 def queue_build(conn, library, mapping_name, source_file, now=None):

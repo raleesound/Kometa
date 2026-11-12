@@ -141,10 +141,20 @@ class TestAdd:
     def test_every_waiting_collection_gets_it(self, db):
         plex = FakePlex(ext_ids={11: 511}, collections={"A": {"sort": 0, "keys": []}, "B": {"sort": 0, "keys": []}})
         record(db, name="A", wanted=[(511, False, None)])
-        record(db, name="B", wanted=[(511, None, None)])  # never evaluated by run_missing: still waiting
+        record(db, name="B", wanted=[(511, False, None)])
         assert arrivals.handle_item(db, plex, 11, now=NOW) is True
         assert sorted(plex.adds) == [("A", 11), ("B", 11)]
         assert [c["name"] for c in outbox(db)[0]["payload"]["collections"]] == ["A", "B"]
+
+    def test_an_id_the_filters_never_passed_is_not_added(self, db):
+        # run_missing never evaluated it (filter_state unknown): the next scheduled sync could
+        # filter it out and remove it, so the trigger leaves it to the sweep.
+        plex = FakePlex(ext_ids={11: 511}, collections={"A": {"sort": 0, "keys": []}, "B": {"sort": 0, "keys": []}})
+        record(db, name="A", wanted=[(511, False, None)])
+        record(db, name="B", wanted=[(511, None, None)])
+        assert arrivals.handle_item(db, plex, 11, now=NOW) is True
+        assert plex.adds == [("A", 11)]
+        assert [c["name"] for c in outbox(db)[0]["payload"]["collections"]] == ["A"]
 
     def test_only_what_the_record_wants_is_added(self, db):
         plex = FakePlex(ext_ids={11: 511}, collections={"Picks": {"sort": 0, "keys": []}, "Other": {"sort": 0, "keys": []}})
@@ -381,7 +391,8 @@ class TestStaleSnapshot:
 # ── the wire contract (kometa-contract item-arrived fixtures, #5634 S3n) ──
 
 FIXTURES = Path(__file__).parent / "fixtures" / "kometa_contract"
-ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
+# Exactly YYYY-MM-DDTHH:MM:SSZ: the contract rejects an offset (+00:00) and fractions.
+ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 def _shape(value):

@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -1036,6 +1037,139 @@ class TestBuilds:
         assert calls == [1]
 
 
+CONTRACT_FIXTURES = Path(__file__).parent / "fixtures" / "kometa_contract"
+
+
+def _contract_errors(payload):
+    """What the kometa-contract item-arrived schema would reject in an event with no collections."""
+    wire = json.loads(json.dumps(payload))
+    fixture = json.loads((CONTRACT_FIXTURES / "item-arrived-plain.json").read_text())
+    errors = []
+    if set(wire) != set(fixture):
+        errors.append(f"keys {sorted(set(wire) ^ set(fixture))}")
+    for key in ("added_at", "arrived_at"):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", str(wire.get(key))):
+            errors.append(f"{key} {wire.get(key)!r}")
+    if not re.fullmatch(r"\d+", str(wire.get("rating_key"))):
+        errors.append("rating_key")
+    if not any(wire.get(k) is not None for k in ("tmdb_id", "tvdb_id", "imdb_id")):
+        errors.append("no id")
+    return errors
+
+
+def matched(key, added=NOW - 60, guids=("tmdb://511", "imdb://tt0000511")):
+    item = movie(key, added=added, guid="plex://movie/m")
+    item.guids = [SimpleNamespace(id=g) for g in guids]
+    item.librarySectionTitle = "Movies"
+    item.year = 2011
+    return item
+
+
+class TestAnnounce:
+    """Every arrival is announced once: held events go out when their item stops being retried, and
+    an item Kometa never finished is announced from Plex alone."""
+
+    def _outbox(self, live_record, path):
+        conn = live_record.connect(path)
+        try:
+            return {r["rating_key"]: r["payload"] for r in live_record.unpublished_arrivals(conn)}
+        finally:
+            conn.close()
+
+    def _hold(self, live_record, path, key):
+        conn = live_record.connect(path)
+        live_record.queue_arrival(conn, "Movies", key, {"v": 1, "rating_key": str(key), "collections": [{"name": "Top"}]}, complete=False)
+        conn.close()
+
+    def test_giving_up_with_no_event_announces_it_from_plex(self, trig, pending, tmp_path, monkeypatch):
+        live_record, path = _db(trig, tmp_path)
+        monkeypatch.setattr(trig, "RECORD_PATH", path)
+        monkeypatch.setattr(trig, "MAX_ATTEMPTS", 1)
+        server = FakeServer(items=[matched(10, added=time.time() + 5)])  # after the outbox began
+        trig.process_due(pending, {"Movies": {"10": 0}}, connect=lambda: server, run=lambda *a: False)
+        payload = self._outbox(live_record, path)[10]
+        assert payload["collections"] == [] and payload["rating_key"] == "10" and payload["library"] == "Movies"
+        assert (payload["media_type"], payload["tmdb_id"], payload["tvdb_id"], payload["imdb_id"], payload["year"]) == ("movie", 511, None, "tt0000511", 2011)
+        assert payload["added_at"].endswith("Z") and payload["arrived_at"].endswith("Z")
+        assert _contract_errors(payload) == []
+
+    def test_giving_up_releases_a_held_event_instead(self, trig, pending, tmp_path, monkeypatch):
+        live_record, path = _db(trig, tmp_path)
+        monkeypatch.setattr(trig, "RECORD_PATH", path)
+        monkeypatch.setattr(trig, "MAX_ATTEMPTS", 1)
+        self._hold(live_record, path, 10)
+        trig.process_due(pending, {"Movies": {"10": 0}}, connect=lambda: FakeServer(items=[matched(10)]), run=lambda *a: False)
+        assert self._outbox(live_record, path)[10]["collections"] == [{"name": "Top"}]
+
+    def test_an_item_with_no_id_cannot_be_announced_and_says_so(self, trig, pending, tmp_path, monkeypatch, caplog):
+        live_record, path = _db(trig, tmp_path)
+        monkeypatch.setattr(trig, "RECORD_PATH", path)
+        monkeypatch.setattr(trig, "MAX_ATTEMPTS", 1)
+        server = FakeServer(items=[matched(10, guids=())])
+        server.items[10].guid = "local://10"
+        trig.process_due(pending, {"Movies": {"10": 0}}, connect=lambda: server, run=lambda *a: pytest.fail("ran"))
+        assert self._outbox(live_record, path) == {}
+        assert any(r.levelname == "ERROR" and "cannot announce 10" in r.getMessage() for r in caplog.records)
+
+    def test_an_item_plex_added_before_the_outbox_existed_is_not_announced(self, trig, pending, tmp_path, monkeypatch):
+        live_record, path = _db(trig, tmp_path)
+        monkeypatch.setattr(trig, "RECORD_PATH", path)
+        monkeypatch.setattr(trig, "MAX_ATTEMPTS", 1)
+        server = FakeServer(items=[matched(10, added=time.time() - 86400)])
+        trig.process_due(pending, {"Movies": {"10": 0}}, connect=lambda: server, run=lambda *a: False)
+        assert self._outbox(live_record, path) == {}
+
+    def test_a_successful_rerun_releases_what_an_earlier_failure_held(self, trig, pending, tmp_path, monkeypatch):
+        live_record, path = _db(trig, tmp_path)
+        monkeypatch.setattr(trig, "RECORD_PATH", path)
+        self._hold(live_record, path, 10)
+        trig.process_due(pending, {"Movies": {"10": 1}}, connect=lambda: FakeServer(items=[matched(10)]), run=lambda *a: True)
+        assert list(self._outbox(live_record, path)) == [10]
+
+    def test_an_item_that_left_plex_releases_its_held_event(self, trig, pending, tmp_path, monkeypatch):
+        live_record, path = _db(trig, tmp_path)
+        monkeypatch.setattr(trig, "RECORD_PATH", path)
+        self._hold(live_record, path, 10)
+        trig.process_due(pending, {"Movies": {"10": 1}}, connect=lambda: FakeServer(), run=lambda *a: pytest.fail("ran"))
+        assert list(self._outbox(live_record, path)) == [10]
+
+
+class TestBuilder:
+    def test_builds_run_at_start_and_on_every_wake_on_their_own_thread(self, trig):
+        woken, stop, runs = threading.Event(), threading.Event(), []
+        ran = threading.Semaphore(0)
+
+        def run_all():
+            runs.append(threading.current_thread().name)
+            if len(runs) == 2:
+                stop.set()
+            ran.release()
+
+        thread = threading.Thread(target=trig.builder, args=(woken, stop, run_all), name="collection-builder")
+        thread.start()
+        assert ran.acquire(timeout=10)  # at start: what a crash left queued
+        assert not ran.acquire(timeout=0.2)  # then nothing until a batch wakes it
+        woken.set()
+        assert ran.acquire(timeout=10)
+        thread.join(10)
+        assert runs == ["collection-builder", "collection-builder"] and not thread.is_alive()
+
+    def test_a_failing_build_pass_does_not_kill_the_thread(self, trig):
+        woken, stop, calls = threading.Event(), threading.Event(), []
+
+        def run_all():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            stop.set()
+
+        thread = threading.Thread(target=trig.builder, args=(woken, stop, run_all))
+        thread.start()
+        woken.set()
+        thread.join(10)
+        assert calls == [1, 1]
+
+
 class FakeJetStream:
     def __init__(self, failures=()):
         self.failures = list(failures)
@@ -1065,7 +1199,7 @@ class TestPublisher:
         self._queue(live_record, path, 11, 12)
         js = FakeJetStream()
         publisher = trig.Publisher(path, "nats://x:4222", "seed")
-        assert asyncio.run(publisher.drain(js)) is True
+        assert asyncio.run(publisher.drain(js)) == trig.DRAIN_EMPTY
         assert [(s, p["rating_key"], h) for s, p, h in js.published] == [
             ("kometa.item.arrived", 11, {"Nats-Msg-Id": "arrived:Movies:11"}),
             ("kometa.item.arrived", 12, {"Nats-Msg-Id": "arrived:Movies:12"}),
@@ -1081,13 +1215,49 @@ class TestPublisher:
         self._queue(live_record, path, 11)
         js = FakeJetStream(failures=[StreamNotFound("stream not found")])
         publisher = trig.Publisher(path, "nats://x:4222", "seed")
-        assert asyncio.run(publisher.drain(js)) is False
+        assert asyncio.run(publisher.drain(js)) == trig.DRAIN_WAIT
         conn = live_record.connect(path)
         assert [r["rating_key"] for r in live_record.unpublished_arrivals(conn)] == [11]
-        assert asyncio.run(publisher.drain(js)) is True
+        assert asyncio.run(publisher.drain(js)) == trig.DRAIN_EMPTY
         assert live_record.unpublished_arrivals(conn) == []
         conn.close()
         assert [p["rating_key"] for _, p, _ in js.published] == [11]
+
+    def test_a_publish_timeout_is_retried_on_a_backoff(self, trig, tmp_path):
+        import asyncio
+
+        live_record, path = _db(trig, tmp_path)
+        self._queue(live_record, path, 11)
+        publisher = trig.Publisher(path, "nats://x:4222", "seed")
+        for timeout in (TimeoutError(), asyncio.TimeoutError(), type("TimeoutError", (Exception,), {})()):
+            assert asyncio.run(publisher.drain(FakeJetStream(failures=[timeout]))) == trig.DRAIN_RETRY
+
+    def test_no_stream_waits_for_a_wake_not_a_timer(self, trig, tmp_path, monkeypatch):
+        import asyncio
+
+        monkeypatch.setattr(trig, "PUBLISH_RETRY_MIN_SECONDS", 0.001)
+        live_record, path = _db(trig, tmp_path)
+        self._queue(live_record, path, 11)
+        js = FakeJetStream(failures=[StreamNotFound("no stream")] * 50)
+
+        async def close():
+            pass
+
+        async def connect():
+            return SimpleNamespace(jetstream=lambda: js, close=close)
+
+        publisher = trig.Publisher(path, "nats://x:4222", "seed", connect=connect)
+
+        async def run():
+            task = asyncio.ensure_future(publisher.main())
+            await asyncio.sleep(0.3)  # a timer at 1 ms would have retried ~a hundred times by now
+            assert len(js.failures) == 49
+            publisher.wake()  # an arrival or a reconnect
+            await asyncio.sleep(0.1)
+            assert len(js.failures) == 48
+            task.cancel()
+
+        asyncio.run(run())
 
     def test_the_loop_retries_connect_and_publish_until_the_outbox_is_empty(self, trig, tmp_path, monkeypatch):
         import asyncio
@@ -1113,7 +1283,12 @@ class TestPublisher:
         original = js.publish
 
         async def publish_then_stop(*a, **kw):
-            await original(*a, **kw)
+            try:
+                await original(*a, **kw)
+            except StreamNotFound:
+                # Held until a wake: the reconnect callback stands in for plex-bot creating the stream.
+                asyncio.get_running_loop().call_later(0.05, lambda: asyncio.ensure_future(publisher._on_reconnect()))
+                raise
             stop.set()
             publisher.wake()
 
@@ -1148,11 +1323,10 @@ class TestPublisher:
         conn.close()
         js = FakeJetStream()
         publisher = trig.Publisher(path, "nats://x:4222", "seed")
-        assert asyncio.run(publisher.drain(js)) is True and js.published == []
+        assert asyncio.run(publisher.drain(js)) == trig.DRAIN_EMPTY and js.published == []
         # The trigger runs out of retries for the item: what its last run managed goes out.
-        pending = trig.Pending(str(tmp_path / "pending.json"))
-        trig.give_up_or_retry(pending, "Movies", "11", trig.MAX_ATTEMPTS - 1, "Kometa run failed")
-        assert asyncio.run(publisher.drain(js)) is True
+        trig.announce_unfinished(None, "11")
+        assert asyncio.run(publisher.drain(js)) == trig.DRAIN_EMPTY
         assert [h["Nats-Msg-Id"] for _, _, h in js.published] == ["arrived:Movies:11"]
 
     def test_no_seed_keeps_the_outbox_and_says_so(self, trig, monkeypatch, caplog):

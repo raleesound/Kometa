@@ -59,16 +59,6 @@ MUST_BE_PRESENT = [
         "one Kometa run at a time per config dir; item runs wait for a sweep, never run beside it",
     ),
     (
-        "kometa.py",
-        "return RUN_LOCK_BUSY",
-        "an item run that finds the lock held exits 75 so the trigger reruns it; exiting 0 would silently skip its arrival step",
-    ),
-    (
-        "kometa.py",
-        "run_arrivals(config, library)",
-        "per-item runs add the item to the collections waiting for it before operations run (#5634 S3)",
-    ),
-    (
         "modules/arrivals.py",
         "live_record.queue_arrival(",
         "every arrival lands in the outbox the trigger publishes as kometa.item.arrived",

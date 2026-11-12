@@ -150,7 +150,7 @@ def handle_item(conn, library, rating_key, now=None):
     id_type = "tmdb" if library.is_movie else "tvdb"
     ok = True
     collections = []
-    waiting_for = live_record.find_waiting(conn, id_type, ext_id, include_unknown=True, now=moment) if ext_id is not None else []
+    waiting_for = live_record.find_waiting(conn, id_type, ext_id, now=moment) if ext_id is not None else []
     for waiting in waiting_for:
         if waiting["library"] != library.name:
             continue

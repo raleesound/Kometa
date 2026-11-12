@@ -476,8 +476,10 @@ class TestReadApi:
         live_record.write_collection(db, snapshot(name="NotBuilt", built=False, wanted=[(7, False, False, None)]))
         live_record.write_collection(db, snapshot(name="Shows", library="TV Shows", id_type="tvdb", wanted=[(7, False, False, None)]))
         live_record.write_collection(db, snapshot(name="New", present=False, members=[], wanted=[(7, None, False, None)]))
-        rows = live_record.find_waiting(db, "tmdb", 7)
+        rows = live_record.find_waiting(db, "tmdb", 7, include_unknown=True)
         assert [(r["name"], r["present"], r["held_back"], r["position"], r["filter_state"]) for r in rows] == [("A", 1, 1, 3, "passed"), ("New", 0, 0, None, "unknown")]
+        # By default only ids run_missing passed: a sync run would remove an unevaluated one.
+        assert [r["name"] for r in live_record.find_waiting(db, "tmdb", 7)] == ["A"]
         assert rows[0]["source_file"] == "picks"
         assert rows[0]["mapping_name"] == "A"
         assert [r["name"] for r in live_record.find_waiting(db, "tmdb", 7, include_unknown=False)] == ["A"]
@@ -975,6 +977,80 @@ class TestWiring:
     def test_a_partial_run_never_expires(self, override):
         assert self._sweep(**override) is False
 
+    # ── #5634 S3: what the import trigger relies on from a per-item run (run, not grepped) ──
+
+    def _constant(self, name):
+        tree = ast.parse((REPO_ROOT / "kometa.py").read_text(encoding="utf-8"))
+        return next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign) and [ast.unparse(t) for t in n.targets] == [name])
+
+    def test_an_item_run_that_finds_the_lock_held_exits_75_and_never_runs(self, tmp_path):
+        import fcntl
+        import os
+
+        ran = []
+        ns = _kometa_functions(
+            "process",
+            "run_lock_path",
+            run_args={"run-items": "10"},
+            fcntl=fcntl,
+            os=os,
+            default_dir=str(tmp_path),
+            logger=MagicMock(),
+            RUN_LOCK_BUSY=self._constant("RUN_LOCK_BUSY"),
+            _process=lambda attrs: ran.append(attrs) or 0,
+        )
+        with open(tmp_path / ".kometa.run.lock", "a+") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            # 75 = the trigger's EXIT_LOCK_BUSY: it waits for the lock and runs the items again.
+            assert ns["process"]({}) == 75
+            assert ran == []
+        assert ns["process"]({}) == 0 and ran == [{}]
+
+    def _item_run(self, arrived_ok):
+        calls = []
+        args = {k: False for k in ("tests", "delete-collections", "delete-labels", "playlists-only", "operations-only", "overlays-only", "collections-only", "metadata-only")}
+        args["resume"] = None
+        library = MagicMock(skip_library=False, collection_files=[], run_order=["operations"], collection_names=[], hub_priorities={}, auto_sort_hubs=False, is_music=False, timeout=60)
+        library.name = library.original_mapping_name = "Movies"
+        library.cache_items.return_value = []
+        config = SimpleNamespace(run_items=["10"], default_dir="/nowhere", libraries=[library], Cache=None, requested_libraries=None, requested_collections=None, requested_files=None)
+        arrivals_module = SimpleNamespace(run=lambda config, library: calls.append("arrivals") or arrived_ok)
+        ns = _kometa_functions(
+            "run_libraries",
+            "is_partial_run",
+            "expire_live_record",
+            "run_arrivals",
+            run_args=args,
+            arrivals=arrivals_module,
+            run_collection=MagicMock(),
+            live_record=SimpleNamespace(RunRecorder=lambda *_: pytest.fail("an item run opened the recorder")),
+            logger=MagicMock(),
+            plexapi=MagicMock(),
+            timings=MagicMock(),
+            os=__import__("os"),
+            datetime=datetime,
+            Failed=Exception,
+            NotFound=Exception,
+            log_critical_exception=lambda e: (_ for _ in ()).throw(e),
+            get_critical_error_message=str,
+            item_run_failed=False,
+        )
+        library.update_item_from_assets.side_effect = lambda *a, **k: calls.append("operations")
+        ns["run_libraries"](config)
+        return calls, ns["item_run_failed"]
+
+    def test_an_item_run_does_its_arrival_step(self):
+        calls, failed = self._item_run(arrived_ok=True)
+        assert calls[:1] == ["arrivals"] and failed is False
+
+    def test_a_failed_arrival_step_fails_the_item_run(self):
+        _, failed = self._item_run(arrived_ok=False)
+        assert failed is True
+        # ...and a failed item run exits RUN_ITEMS_FAILED (1), which the trigger retries.
+        start = ast.unparse(_function("start"))
+        assert "if run_args['run-items'] and item_run_failed:\n        sys.exit(RUN_ITEMS_FAILED)" in start
+        assert self._constant("RUN_ITEMS_FAILED") == 1
+
     def test_no_prune_left_in_run_collection(self):
         assert not [n for n in ast.walk(_function("run_collection")) if isinstance(n, ast.Name) and "prune" in n.id]
 
@@ -1047,6 +1123,62 @@ class TestOutbox:
     def test_positions_cover_members_and_wanted(self, db):
         live_record.write_collection(db, snapshot(members=[(1, 501, 0), (2, None, 1)], wanted=[(511, False, False, 2), (512, False, False, None)], collection_order="custom.asc", order_recorded=True))
         assert live_record.positions(db, "Movies", "Picks") == {501: 0, 511: 2}
+
+
+class TestOutboxLifetime:
+    def _old_record_with_an_outbox(self, path, arrivals_columns):
+        old = sqlite3.connect(path)
+        old.executescript(V1_SCHEMA)
+        old.execute(f"CREATE TABLE arrivals ({arrivals_columns})")
+        old.execute("CREATE TABLE record_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        old.execute("INSERT INTO record_meta VALUES ('arrivals_since', '2026-11-01T00:00:00Z')")
+        old.execute("PRAGMA user_version = 1")
+        old.commit()
+        return old
+
+    def test_a_rebuild_keeps_the_outbox_so_nothing_is_announced_twice(self, tmp_path):
+        path = live_record.db_path(str(tmp_path))
+        old = self._old_record_with_an_outbox(path, "library TEXT NOT NULL, rating_key INTEGER NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, published_at TEXT, complete INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (library, rating_key)")
+        old.execute("INSERT INTO arrivals VALUES ('Movies', 11, '{}', '2026-11-02T00:00:00Z', '2026-11-02T00:00:01Z', 1)")
+        old.execute("INSERT INTO arrivals VALUES ('Movies', 12, '{\"n\": 1}', '2026-11-02T00:00:00Z', NULL, 1)")
+        old.commit()
+        old.close()
+        log = StackLogger()
+        conn = live_record.connect(path, log=log)
+        assert any("schema v1 is out of date" in m for m in log.warning_messages)  # the rest was rebuilt
+        assert live_record.queue_arrival(conn, "Movies", 11, {"added_at": "2026-11-12T00:00:00Z"}) is False
+        assert [r["rating_key"] for r in live_record.unpublished_arrivals(conn)] == [12]
+        assert live_record.arrivals_since(conn) == datetime(2026, 11, 1, tzinfo=timezone.utc)
+        conn.close()
+
+    def test_an_outbox_of_another_shape_is_rebuilt_not_kept(self, tmp_path):
+        path = live_record.db_path(str(tmp_path))
+        old = self._old_record_with_an_outbox(path, "library TEXT, rating_key INTEGER, payload TEXT")
+        old.close()
+        conn = live_record.connect(path)
+        assert live_record._columns(conn, "arrivals") >= live_record.ARRIVALS_COLUMNS
+        assert live_record.queue_arrival(conn, "Movies", 11, {"added_at": live_record._now()}) is True
+        conn.close()
+
+    def test_the_first_deploy_does_not_announce_what_plex_added_before_it(self, db):
+        since = live_record.arrivals_since(db)
+        before = live_record._stamp(since - timedelta(hours=1))
+        after = live_record._stamp(since + timedelta(minutes=1))
+        assert live_record.queue_arrival(db, "Movies", 11, {"added_at": before}) is False
+        assert live_record.queue_arrival(db, "Movies", 12, {"added_at": after}) is True
+        assert [r["rating_key"] for r in live_record.unpublished_arrivals(db)] == [12]
+        # Recorded as announced: a rerun of the old item never queues it either.
+        assert live_record.has_arrival(db, 11) and live_record.queue_arrival(db, "Movies", 11, {"added_at": before}) is False
+
+    def test_a_publish_never_marks_an_event_a_rerun_replaced_meanwhile(self, db):
+        live_record.queue_arrival(db, "Movies", 11, {"collections": [{"name": "A"}]})
+        [sent] = live_record.unpublished_arrivals(db)
+        live_record.queue_arrival(db, "Movies", 11, {"collections": [{"name": "B"}]})
+        assert live_record.mark_published(db, "Movies", 11, sent["raw"]) is False
+        [queued] = live_record.unpublished_arrivals(db)
+        assert {c["name"] for c in queued["payload"]["collections"]} == {"A", "B"}
+        assert live_record.mark_published(db, "Movies", 11, queued["raw"]) is True
+        assert live_record.unpublished_arrivals(db) == []
 
 
 class TestBuildQueue:
