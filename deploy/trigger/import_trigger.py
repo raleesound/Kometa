@@ -662,6 +662,11 @@ class _Stopped:
 
 # A queued collection run that did not start, or was stopped, because an arrival was due.
 RUN_STOPPED: Any = _Stopped()
+# A stopped run gets SIGTERM; one still running this long after it gets SIGKILL.
+STOP_GRACE_SECONDS = 30
+# A queued collection run stopped this many times for arrivals runs to completion on its next pass:
+# arrivals first, but a build longer than the gap between arrivals must still finish.
+BUILD_MAX_STOPS = 3
 
 
 def _spawn(command: list[str]) -> Any:
@@ -686,7 +691,22 @@ class BuildGate:
         self._mu = threading.Lock()
         self._idle = False
         self._proc: Any = None
+        self._protected = False
         self._stopped: Any = None
+        self._stops: dict[tuple[str, str], int] = {}
+
+    def note_stop(self, key: tuple[str, str]) -> int:
+        with self._mu:
+            self._stops[key] = self._stops.get(key, 0) + 1
+            return self._stops[key]
+
+    def stops(self, key: tuple[str, str]) -> int:
+        with self._mu:
+            return self._stops.get(key, 0)
+
+    def forget(self, key: tuple[str, str]) -> None:
+        with self._mu:
+            self._stops.pop(key, None)
 
     def worker_idle(self) -> None:
         with self._mu:
@@ -697,17 +717,28 @@ class BuildGate:
         with self._mu:
             self._idle = False
             proc = self._proc
-            if proc is not None and proc.poll() is None:
+            if proc is not None and proc.poll() is None and not self._protected:
                 log.info("stopping the queued collection run: an arrival is due")
                 self._stopped = proc
                 _signal_group(proc, signal.SIGTERM)
+                # Kometa has no SIGTERM handler, but nothing waits on a run that ignores it.
+                backstop = threading.Timer(STOP_GRACE_SECONDS, self._kill_if_unfinished, (proc,))
+                backstop.daemon = True
+                backstop.start()
 
-    def start(self, command: list[str]) -> Any:
-        """The started run, or None while the worker has work."""
+    def _kill_if_unfinished(self, proc: Any) -> None:
+        with self._mu:
+            if self._stopped is proc:
+                log.warning("the stopped collection run outlived SIGTERM by %ds; killing it", STOP_GRACE_SECONDS)
+                _signal_group(proc, signal.SIGKILL)
+
+    def start(self, command: list[str], protected: bool = False) -> Any:
+        """The started run, or None while the worker has work. A protected run is never stopped."""
         with self._mu:
             if not self._idle:
                 return None
             self._proc = _spawn(command)
+            self._protected = protected
             return self._proc
 
     def finish(self, proc: Any) -> bool:
@@ -715,6 +746,7 @@ class BuildGate:
         with self._mu:
             if self._proc is proc:
                 self._proc = None
+                self._protected = False
             stopped = self._stopped is proc
             if stopped:
                 self._stopped = None
@@ -724,11 +756,11 @@ class BuildGate:
 GATE = BuildGate()
 
 
-def run_command(command: list[str], gate: BuildGate | None = None) -> Any:
+def run_command(command: list[str], gate: BuildGate | None = None, protected: bool = False) -> Any:
     """Run Kometa; the finished process (returncode, stdout, stderr), or RUN_STOPPED when ``gate``
     kept it from starting or stopped it. A timeout kills the whole process group (the child holding
     the run lock with it) and raises subprocess.TimeoutExpired."""
-    proc = _spawn(command) if gate is None else gate.start(command)
+    proc = _spawn(command) if gate is None else gate.start(command, protected=protected)
     if proc is None:
         return RUN_STOPPED
     try:
@@ -740,10 +772,10 @@ def run_command(command: list[str], gate: BuildGate | None = None) -> Any:
             raise
     finally:
         stopped = gate is not None and gate.finish(proc)
-    if stopped:
-        return RUN_STOPPED
     # A child left behind (the parent exited first) must not keep the run lock.
     _signal_group(proc, signal.SIGKILL)
+    if stopped:
+        return RUN_STOPPED
     return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
 
 
@@ -980,9 +1012,15 @@ def run_build(library: str, mapping_name: str, gate: BuildGate | None = None) ->
         "--ignore-schedules",
         "--read-only-config",
     ]
-    log.info("running collection %s in %s for an arrival waiting on it", mapping_name, library)
+    gate = gate or GATE
+    stops = gate.stops((library, mapping_name))
+    protected = stops >= BUILD_MAX_STOPS
+    if protected:
+        log.info("running collection %s in %s to completion: arrivals stopped it %d times, they wait for it this once", mapping_name, library, stops)
+    else:
+        log.info("running collection %s in %s for an arrival waiting on it", mapping_name, library)
     try:
-        result = run_command(command, gate=gate or GATE)
+        result = run_command(command, gate=gate, protected=protected)
     except subprocess.TimeoutExpired:
         log.error("Kometa run of %s timed out after %ss", mapping_name, RUN_TIMEOUT_SECONDS)
         return False
@@ -1011,8 +1049,10 @@ def run_builds(record_path: str | None = None, run: Callable[[str, str], Any] = 
             library, mapping_name = build["library"], build["mapping_name"]
             result = run_unless_busy(run, library, mapping_name)
             if result is RUN_STOPPED:
-                log.info("arrivals first: running %s once the item runs are done", mapping_name)
+                stops = GATE.note_stop((library, mapping_name))
+                log.info("arrivals first: running %s once the item runs are done (stopped %d of %d times)", mapping_name, stops, BUILD_MAX_STOPS)
                 return
+            GATE.forget((library, mapping_name))
             if result:
                 live_record.finish_build(conn, library, mapping_name)
                 log.info("built %s in %s", mapping_name, library)
@@ -1099,6 +1139,18 @@ NOT_YET_ERRORS = {
 }
 
 
+def _refusal(e: BaseException) -> str | None:
+    """The reason when the NATS server refused this client (authorization, permissions), else None.
+    nats-py reports a publish permissions violation only to error_cb; the publish itself just gets
+    no ack. The server's text names the subject, never a credential."""
+    if type(e).__name__ == "AuthorizationError":
+        return "authorization failed"
+    text = str(e)
+    if "Permissions Violation" in text or "Authorization Violation" in text:
+        return text
+    return None
+
+
 class Publisher:
     """Publishes the live record's arrival outbox to JetStream as kometa.item.arrived.
 
@@ -1118,6 +1170,7 @@ class Publisher:
         self.loop: asyncio.AbstractEventLoop | None = None
         self._woken: asyncio.Event | None = None
         self.nc: Any = None
+        self._refused: str | None = None
 
     def wake(self) -> None:
         """Thread-safe: drain the outbox now."""
@@ -1134,7 +1187,12 @@ class Publisher:
         log.warning("NATS disconnected; arrival events wait in the outbox")
 
     async def _on_error(self, e: Exception) -> None:
-        log.warning("NATS error: %s", type(e).__name__)
+        refused = _refusal(e)
+        if refused:
+            self._refused = refused
+            log.error("NATS refused %s: %s", NATS_CLIENT_NAME, refused)
+        else:
+            log.warning("NATS error: %s", type(e).__name__)
 
     async def _open(self) -> Any:
         if self._connect is not None:
@@ -1188,13 +1246,17 @@ class Publisher:
                         await js.publish(ARRIVED_SUBJECT, body, timeout=PUBLISH_TIMEOUT_SECONDS, headers={"Nats-Msg-Id": msg_id})
                     except Exception as e:
                         if type(e).__name__ in TIMEOUT_ERRORS or isinstance(e, (asyncio.TimeoutError, TimeoutError)):
-                            log.warning("%s: no ack from JetStream (%s); retrying on a backoff", msg_id, type(e).__name__)
+                            if self._refused:
+                                log.error("%s: no ack from JetStream; NATS refused %s (%s), fix its permissions; retrying on a backoff", msg_id, NATS_CLIENT_NAME, self._refused)
+                            else:
+                                log.warning("%s: no ack from JetStream (%s); retrying on a backoff", msg_id, type(e).__name__)
                             return DRAIN_RETRY
                         # No stream yet (NoRespondersError / 503), or the connection is down: nothing
                         # a timer would fix. The next reconnect, arrival or restart drains again.
                         level = logging.WARNING if type(e).__name__ in NOT_YET_ERRORS else logging.ERROR
                         log.log(level, "%s held in the outbox until NATS can take it: %s: %s", msg_id, type(e).__name__, e)
                         return DRAIN_WAIT
+                    self._refused = None
                     unchanged = await asyncio.to_thread(live_record.mark_published, conn, row["library"], row["rating_key"], row["raw"])
                     log.info("published %s %s", ARRIVED_SUBJECT, msg_id)
                     if not unchanged:
@@ -1214,7 +1276,7 @@ class Publisher:
                 self.nc = await self._open()
             except Exception as e:
                 # The type only: the client's errors are not worth risking next to a seed.
-                log.warning("NATS connect to %s failed (%s); retrying in %ds", self.url, type(e).__name__, delay)
+                log.log(logging.ERROR if _refusal(e) else logging.WARNING, "NATS connect to %s failed (%s); retrying in %ds", self.url, type(e).__name__, delay)
                 await self._sleep(delay)
                 delay = min(delay * 2, PUBLISH_RETRY_MAX_SECONDS)
             if stop is not None and stop.is_set():

@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import re
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -1173,8 +1176,10 @@ class TestBuilder:
 # Kometa's shape: the parent runs the work in a ProcessPoolExecutor child, and the CHILD holds the
 # run lock. Killing only the parent would leave the lock held by an orphan.
 FAKE_KOMETA = """
-import fcntl, os, sys, time
+import fcntl, os, signal, sys, time
 if os.fork() == 0:
+    if os.environ.get("FAKE_KOMETA_IGNORE_TERM"):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     fh = open(os.environ["FAKE_KOMETA_LOCK"], "a+")
     fcntl.flock(fh, fcntl.LOCK_EX)
     with open(os.environ["FAKE_KOMETA_READY"], "w") as ready:
@@ -1308,6 +1313,88 @@ class TestArrivalsFirst:
         assert trig.run_kometa("Movies", ["10"]) is False
         assert _lock_is_free(lock)
 
+    def test_a_stopped_build_that_ignores_sigterm_is_killed_after_the_grace(self, trig, tmp_path, monkeypatch):
+        lock, ready = self._fake_kometa(trig, tmp_path, monkeypatch)
+        monkeypatch.setenv("FAKE_KOMETA_IGNORE_TERM", "1")
+        monkeypatch.setattr(trig, "STOP_GRACE_SECONDS", 1)
+        real_spawn = trig._spawn
+        spawned = []
+        monkeypatch.setattr(trig, "_spawn", lambda cmd: spawned.append(real_spawn(cmd)) or spawned[-1])
+        gate = trig.BuildGate()
+        gate.worker_idle()
+        result = []
+        build = threading.Thread(target=lambda: result.append(trig.run_command([sys.executable, trig.KOMETA_PY], gate=gate)), daemon=True)
+        build.start()
+        try:
+            self._await_locked(ready)
+            gate.worker_busy()
+            build.join(30)
+            assert not build.is_alive(), "a build that ignores SIGTERM still holds the run lock"
+            assert result and result[0] is trig.RUN_STOPPED
+            assert _lock_is_free(lock)
+        finally:
+            for proc in spawned:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_stops_are_counted_and_never_charged(self, trig, tmp_path, monkeypatch):
+        live_record, path = _db(trig, tmp_path)
+        gate = trig.BuildGate()
+        monkeypatch.setattr(trig, "GATE", gate)
+        conn = live_record.connect(path)
+        live_record.queue_build(conn, "Movies", "Picks", "collections/picks.yml")
+        for _ in range(trig.BUILD_MAX_STOPS):
+            trig.run_builds(path, run=lambda library, name: trig.RUN_STOPPED)
+        assert gate.stops(("Movies", "Picks")) == trig.BUILD_MAX_STOPS
+        assert [(b["mapping_name"], b["attempts"]) for b in live_record.pending_builds(conn)] == [("Picks", 0)]
+        trig.run_builds(path, run=lambda library, name: True)
+        assert gate.stops(("Movies", "Picks")) == 0 and live_record.pending_builds(conn) == []
+        conn.close()
+
+    def test_a_build_stopped_too_often_runs_to_completion(self, trig, tmp_path, monkeypatch):
+        # Arrivals first, but a build longer than the gap between arrivals must still finish.
+        live_record, path = _db(trig, tmp_path)
+        monkeypatch.setattr(trig, "RECORD_PATH", path)
+        gate = trig.BuildGate()
+        monkeypatch.setattr(trig, "GATE", gate)
+        conn = live_record.connect(path)
+        live_record.queue_build(conn, "Movies", "Picks", "collections/picks.yml")
+        for _ in range(trig.BUILD_MAX_STOPS):
+            gate.note_stop(("Movies", "Picks"))
+        release = tmp_path / "release"
+        os.mkfifo(release)
+        started = threading.Event()
+        spawned = []
+
+        def spawn(command):  # a build that runs until the test releases it
+            spawned.append(subprocess.Popen([sys.executable, "-c", f"open({str(release)!r}).read()"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True))
+            started.set()
+            return spawned[-1]
+
+        monkeypatch.setattr(trig, "_spawn", spawn)
+        gate.worker_idle()
+        builder = threading.Thread(target=trig.run_builds, args=(path,), daemon=True)
+        builder.start()
+        try:
+            assert started.wait(30)
+            gate.worker_busy()  # an arrival is due: a protected build is not stopped
+            builder.join(1)  # a stopped build would end at once; this one is still waiting to be released
+            assert builder.is_alive() and spawned[0].poll() is None, "a protected build was stopped"
+            os.close(os.open(release, os.O_WRONLY | os.O_NONBLOCK))
+            builder.join(30)
+            assert not builder.is_alive()
+            assert live_record.pending_builds(conn) == []  # it finished, and counts as built
+            assert gate.stops(("Movies", "Picks")) == 0
+        finally:
+            conn.close()
+            for proc in spawned:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_an_error_waiting_on_the_lock_is_a_failed_run_not_a_spin(self, trig):
         calls = []
 
@@ -1338,8 +1425,8 @@ class NoStreamResponseError(Exception):
     """Named like nats.js.errors.NoStreamResponseError: what nats-py raises publishing with no stream."""
 
 
-class PermissionsViolation(Exception):
-    """Any other publish error: a misconfiguration nobody is waiting out."""
+class BadRequestError(Exception):
+    """Named like nats.js.errors.BadRequestError: a publish error nobody is waiting out."""
 
 
 class TestPublisher:
@@ -1398,9 +1485,51 @@ class TestPublisher:
         publisher = trig.Publisher(path, "nats://x:4222", "seed")
         with caplog.at_level(logging.WARNING, logger=trig.log.name):
             assert asyncio.run(publisher.drain(FakeJetStream(failures=[NoStreamResponseError()]))) == trig.DRAIN_WAIT
-            assert asyncio.run(publisher.drain(FakeJetStream(failures=[PermissionsViolation("publish denied")]))) == trig.DRAIN_WAIT
+            assert asyncio.run(publisher.drain(FakeJetStream(failures=[BadRequestError("bad request")]))) == trig.DRAIN_WAIT
         levels = [(r.levelno, r.getMessage().split(": ")[1]) for r in caplog.records if "held in the outbox" in r.getMessage()]
-        assert levels == [(logging.WARNING, "NoStreamResponseError"), (logging.ERROR, "PermissionsViolation")]
+        assert levels == [(logging.WARNING, "NoStreamResponseError"), (logging.ERROR, "BadRequestError")]
+
+    def test_a_publish_the_server_refuses_logs_error_not_a_quiet_retry(self, trig, tmp_path, caplog):
+        # nats-py's real path: the server's -ERR goes to error_cb only, and the publish gets no ack.
+        import asyncio
+
+        import nats.errors
+
+        live_record, path = _db(trig, tmp_path)
+        conn = live_record.connect(path)
+        live_record.queue_arrival(conn, "Movies", 10, {"v": 1, "rating_key": "10", "collections": []})
+        conn.close()
+        publisher = trig.Publisher(path, "nats://x:4222", "seed")
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(publisher.drain(FakeJetStream(failures=[nats.errors.TimeoutError()])))
+            asyncio.run(publisher._on_error(nats.errors.Error('nats: Permissions Violation for Publish to "kometa.item.arrived"')))
+            assert asyncio.run(publisher.drain(FakeJetStream(failures=[nats.errors.TimeoutError()]))) == trig.DRAIN_RETRY
+        acks = [r.levelno for r in caplog.records if "no ack from JetStream" in r.getMessage()]
+        assert acks == [logging.WARNING, logging.ERROR]  # a plain timeout is not an alarm; a refusal is
+        assert any(r.levelno == logging.ERROR and "Permissions Violation" in r.getMessage() for r in caplog.records)
+        js = FakeJetStream()
+        assert asyncio.run(publisher.drain(js)) == trig.DRAIN_EMPTY
+        assert publisher._refused is None  # fixed permissions: back to quiet timeouts
+
+    def test_a_refused_connect_logs_error(self, trig, tmp_path, caplog, monkeypatch):
+        import asyncio
+
+        import nats.errors
+
+        monkeypatch.setattr(trig, "PUBLISH_RETRY_MIN_SECONDS", 0)
+        stop = threading.Event()
+        stop.set()
+
+        async def refused():
+            raise nats.errors.AuthorizationError()
+
+        async def down():
+            raise nats.errors.NoServersError()
+
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(trig.Publisher(str(tmp_path / "r.db"), "nats://x:4222", "seed", connect=refused).main(stop))
+            asyncio.run(trig.Publisher(str(tmp_path / "r.db"), "nats://x:4222", "seed", connect=down).main(stop))
+        assert [(r.levelno, "AuthorizationError" in r.getMessage()) for r in caplog.records if "connect to" in r.getMessage()] == [(logging.ERROR, True), (logging.WARNING, False)]
 
     def test_a_rerun_that_changed_the_event_mid_send_is_not_sent_again(self, trig, tmp_path, caplog):
         # One Nats-Msg-Id per item: a second send would be dropped as a duplicate inside the window,
