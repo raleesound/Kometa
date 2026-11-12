@@ -619,16 +619,15 @@ def release_arrival(conn, rating_key):
 
 
 def mark_published(conn, library, rating_key, raw=None, now=None):
-    """Mark the row published. With ``raw`` (the payload text that was sent), only while the row
-    still holds exactly that payload: a rerun that replaced it in the meantime keeps its own event
-    queued (the stream's duplicate window drops a resend of the same Nats-Msg-Id). Returns True when
-    a row was marked."""
+    """JetStream acknowledged the row's event: the item is announced. The contract has one
+    Nats-Msg-Id per item (arrived:<library>:<ratingKey>), so a later payload could only ever be
+    dropped as a duplicate or announce the item twice: the row is marked published even when a rerun
+    replaced its payload meanwhile. Returns False when it was replaced (``raw``, the payload text
+    that was sent, no longer matches), so the caller can say the change went unannounced."""
     stamp = _stamp(now or datetime.now(timezone.utc))
-    if raw is None:
-        cursor = conn.execute("UPDATE arrivals SET published_at = ? WHERE library = ? AND rating_key = ?", (stamp, library, int(rating_key)))
-    else:
-        cursor = conn.execute("UPDATE arrivals SET published_at = ? WHERE library = ? AND rating_key = ? AND complete = 1 AND payload = ?", (stamp, library, int(rating_key), raw))
-    return cursor.rowcount > 0
+    row = conn.execute("SELECT payload FROM arrivals WHERE library = ? AND rating_key = ?", (library, int(rating_key))).fetchone()
+    conn.execute("UPDATE arrivals SET published_at = ? WHERE library = ? AND rating_key = ? AND published_at IS NULL", (stamp, library, int(rating_key)))
+    return row is not None and (raw is None or row["payload"] == raw)
 
 
 def queue_build(conn, library, mapping_name, source_file, now=None):

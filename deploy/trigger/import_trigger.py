@@ -57,6 +57,7 @@ import json
 import logging
 import os
 import queue
+import signal
 import subprocess  # nosec B404 - runs kometa.py with a fixed argv, no shell
 import sys
 import threading
@@ -651,6 +652,101 @@ class _Busy:
 RUN_BUSY: Any = _Busy()
 
 
+class _Stopped:
+    def __repr__(self) -> str:
+        return "RUN_STOPPED"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+# A queued collection run that did not start, or was stopped, because an arrival was due.
+RUN_STOPPED: Any = _Stopped()
+
+
+def _spawn(command: list[str]) -> Any:
+    # Its own session: Kometa does its work, and holds the run lock, in a ProcessPoolExecutor child.
+    return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)  # nosec B603 - fixed argv
+
+
+def _signal_group(proc: Any, sig: int) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+class BuildGate:
+    """Arrivals first. A queued collection run (up to RUN_TIMEOUT_SECONDS under the run lock) starts
+    only while the item worker is waiting for work, and the worker stops one it finds running before
+    it runs a batch. A stopped run stays queued, uncharged, and runs again once the worker is idle."""
+
+    def __init__(self) -> None:
+        self.woken = threading.Event()
+        self._mu = threading.Lock()
+        self._idle = False
+        self._proc: Any = None
+        self._stopped: Any = None
+
+    def worker_idle(self) -> None:
+        with self._mu:
+            self._idle = True
+        self.woken.set()
+
+    def worker_busy(self) -> None:
+        with self._mu:
+            self._idle = False
+            proc = self._proc
+            if proc is not None and proc.poll() is None:
+                log.info("stopping the queued collection run: an arrival is due")
+                self._stopped = proc
+                _signal_group(proc, signal.SIGTERM)
+
+    def start(self, command: list[str]) -> Any:
+        """The started run, or None while the worker has work."""
+        with self._mu:
+            if not self._idle:
+                return None
+            self._proc = _spawn(command)
+            return self._proc
+
+    def finish(self, proc: Any) -> bool:
+        """The run ended. True when the worker stopped it."""
+        with self._mu:
+            if self._proc is proc:
+                self._proc = None
+            stopped = self._stopped is proc
+            if stopped:
+                self._stopped = None
+            return stopped
+
+
+GATE = BuildGate()
+
+
+def run_command(command: list[str], gate: BuildGate | None = None) -> Any:
+    """Run Kometa; the finished process (returncode, stdout, stderr), or RUN_STOPPED when ``gate``
+    kept it from starting or stopped it. A timeout kills the whole process group (the child holding
+    the run lock with it) and raises subprocess.TimeoutExpired."""
+    proc = _spawn(command) if gate is None else gate.start(command)
+    if proc is None:
+        return RUN_STOPPED
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=RUN_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            _signal_group(proc, signal.SIGKILL)
+            proc.communicate()
+            raise
+    finally:
+        stopped = gate is not None and gate.finish(proc)
+    if stopped:
+        return RUN_STOPPED
+    # A child left behind (the parent exited first) must not keep the run lock.
+    _signal_group(proc, signal.SIGKILL)
+    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+
+
 def wait_for_run_lock(path: str | None = None) -> bool:
     """Block until no Kometa run holds the run lock. Returns True when it actually had to wait.
     A shared lock is granted only once the holder's exclusive lock is released, so this waits on
@@ -667,16 +763,23 @@ def wait_for_run_lock(path: str | None = None) -> bool:
     return waited
 
 
-def run_unless_busy(run: Callable[..., Any], *args: Any, wait: Callable[[], bool] | None = None) -> bool:
+def run_unless_busy(run: Callable[..., Any], *args: Any, wait: Callable[[], bool] | None = None) -> Any:
     """Run, and while the run reports the lock busy, wait for the lock and run again. A busy
-    result is never charged as a failed attempt."""
+    result is never charged as a failed attempt. Passes RUN_STOPPED through; otherwise a bool."""
     wait = wait or wait_for_run_lock
     spurious = 0
     while True:
         result = run(*args)
+        if result is RUN_STOPPED:
+            return result
         if result is not RUN_BUSY:
             return bool(result)
-        if not wait():
+        try:
+            waited = wait()
+        except OSError as e:
+            log.error("cannot wait on the run lock %s: %s; counting it as a failed run", RUN_LOCK_PATH, e)
+            return False
+        if not waited:
             spurious += 1
             if spurious >= MAX_SPURIOUS_BUSY:
                 log.error("Kometa keeps reporting the run lock busy while nobody holds it (%s); counting it as a failed run", RUN_LOCK_PATH)
@@ -699,7 +802,7 @@ def run_kometa(library: str, rating_keys: list[str]) -> Any:
     ]
     log.info("running operations for %d item(s) in %s: %s", len(rating_keys), library, ",".join(rating_keys))
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=RUN_TIMEOUT_SECONDS)  # nosec B603 - fixed argv
+        result = run_command(command)
     except subprocess.TimeoutExpired:
         log.error("Kometa run for %s timed out after %ss", library, RUN_TIMEOUT_SECONDS)
         return False
@@ -861,8 +964,9 @@ def process_due(
     pending.settle()
 
 
-def run_build(library: str, mapping_name: str) -> Any:
-    """A scoped Kometa run of one collection (an arrival is waiting for it and it is not in Plex)."""
+def run_build(library: str, mapping_name: str, gate: BuildGate | None = None) -> Any:
+    """A scoped Kometa run of one collection (an arrival is waiting for it and it is not in Plex).
+    RUN_STOPPED when an arrival came due first (``gate``, GATE by default)."""
     command = [
         "python3",
         KOMETA_PY,
@@ -878,13 +982,15 @@ def run_build(library: str, mapping_name: str) -> Any:
     ]
     log.info("running collection %s in %s for an arrival waiting on it", mapping_name, library)
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=RUN_TIMEOUT_SECONDS)  # nosec B603 - fixed argv
+        result = run_command(command, gate=gate or GATE)
     except subprocess.TimeoutExpired:
         log.error("Kometa run of %s timed out after %ss", mapping_name, RUN_TIMEOUT_SECONDS)
         return False
     except OSError as e:
         log.error("could not start Kometa for %s: %s", mapping_name, e)
         return False
+    if result is RUN_STOPPED:
+        return RUN_STOPPED
     if result.returncode == EXIT_LOCK_BUSY:
         return RUN_BUSY
     if result.returncode != 0:
@@ -903,7 +1009,11 @@ def run_builds(record_path: str | None = None, run: Callable[[str, str], Any] = 
     try:
         for build in live_record.pending_builds(conn):
             library, mapping_name = build["library"], build["mapping_name"]
-            if run_unless_busy(run, library, mapping_name):
+            result = run_unless_busy(run, library, mapping_name)
+            if result is RUN_STOPPED:
+                log.info("arrivals first: running %s once the item runs are done", mapping_name)
+                return
+            if result:
                 live_record.finish_build(conn, library, mapping_name)
                 log.info("built %s in %s", mapping_name, library)
             elif live_record.fail_build(conn, library, mapping_name, BUILD_MAX_ATTEMPTS):
@@ -928,10 +1038,9 @@ def builder(woken: threading.Event, stop: threading.Event | None = None, run_all
         woken.clear()
 
 
-def start_builder() -> threading.Event:
-    woken = threading.Event()
-    threading.Thread(target=builder, args=(woken,), daemon=True, name="collection-builder").start()
-    return woken
+def start_builder(gate: BuildGate = GATE) -> None:
+    """The builder wakes each time the item worker goes idle (gate.worker_idle)."""
+    threading.Thread(target=builder, args=(gate.woken,), daemon=True, name="collection-builder").start()
 
 
 def worker_step(
@@ -939,8 +1048,14 @@ def worker_step(
     connect: Callable[[], Any] = connect_plex,
     run: Callable[[str, list[str]], Any] = run_kometa,
     after: Callable[[], None] | None = None,
+    gate: BuildGate | None = None,
 ) -> None:
+    if gate is not None:
+        gate.worker_idle()
     due = pending.wait_due()
+    if gate is not None:
+        # Stop a queued collection run first: it would hold the run lock for the whole batch.
+        gate.worker_busy()
     try:
         process_due(pending, due, connect, run)
     except Exception as e:
@@ -954,12 +1069,12 @@ def worker_step(
             log.exception("after-batch step failed: %s", e)
 
 
-def worker(pending: Pending, connect: Callable[[], Any] = connect_plex, after: Callable[[], None] | None = None) -> None:
+def worker(pending: Pending, connect: Callable[[], Any] = connect_plex, after: Callable[[], None] | None = None, gate: BuildGate | None = None) -> None:
     if after is not None:
-        # Collection runs or outbox rows a crash left behind.
+        # Outbox rows a crash left behind. Queued collection runs start once this goes idle.
         after()
     while True:
-        worker_step(pending, connect, after=after)
+        worker_step(pending, connect, after=after, gate=gate)
 
 
 # Publisher.drain() results.
@@ -968,6 +1083,20 @@ DRAIN_RETRY = "retry"
 DRAIN_WAIT = "wait"
 # An ack that did not come in time is worth a retry on a backoff; nothing else is.
 TIMEOUT_ERRORS = {"TimeoutError", "FlushTimeoutError"}
+# NATS is down or the stream does not exist yet (plex-bot creates it): expected, waits for a wake.
+# Any other failure (a permissions violation, a bad request) is a misconfiguration and logs ERROR.
+NOT_YET_ERRORS = {
+    "NoStreamResponseError",  # nats-py's JetStream publish with no stream (it re-raises NoRespondersError)
+    "NoRespondersError",
+    "NotFoundError",
+    "ServiceUnavailableError",
+    "ConnectionClosedError",
+    "ConnectionDrainingError",
+    "ConnectionReconnectingError",
+    "NoServersError",
+    "StaleConnectionError",
+    "OutboundBufferLimitError",
+}
 
 
 class Publisher:
@@ -1063,10 +1192,13 @@ class Publisher:
                             return DRAIN_RETRY
                         # No stream yet (NoRespondersError / 503), or the connection is down: nothing
                         # a timer would fix. The next reconnect, arrival or restart drains again.
-                        log.warning("%s held in the outbox until NATS can take it: %s: %s", msg_id, type(e).__name__, e)
+                        level = logging.WARNING if type(e).__name__ in NOT_YET_ERRORS else logging.ERROR
+                        log.log(level, "%s held in the outbox until NATS can take it: %s: %s", msg_id, type(e).__name__, e)
                         return DRAIN_WAIT
-                    await asyncio.to_thread(live_record.mark_published, conn, row["library"], row["rating_key"], row["raw"])
+                    unchanged = await asyncio.to_thread(live_record.mark_published, conn, row["library"], row["rating_key"], row["raw"])
                     log.info("published %s %s", ARRIVED_SUBJECT, msg_id)
+                    if not unchanged:
+                        log.warning("%s: a later run changed the event while it was being sent; the item is announced once, with what was sent", msg_id)
         except Exception as e:
             log.warning("publishing arrivals failed, will retry: %s: %s", type(e).__name__, e)
             return DRAIN_RETRY
@@ -1153,15 +1285,14 @@ def main() -> None:
     assert_run_items_supported()
     pending = Pending(QUEUE_PATH)
     publisher = start_publisher()
-    builds = start_builder()
+    start_builder(GATE)
 
     def after_batch() -> None:
-        # Neither waits on the other or on the next batch: a scoped collection run can take a while.
+        # The builder is woken when the worker goes idle; a batch that comes due stops its run.
         if publisher is not None:
             publisher.wake()
-        builds.set()
 
-    threading.Thread(target=worker, args=(pending,), kwargs={"after": after_batch}, daemon=True, name="kometa-runner").start()
+    threading.Thread(target=worker, args=(pending,), kwargs={"after": after_batch, "gate": GATE}, daemon=True, name="kometa-runner").start()
     listen_forever(pending)
 
 

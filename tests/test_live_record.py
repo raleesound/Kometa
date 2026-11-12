@@ -1170,15 +1170,20 @@ class TestOutboxLifetime:
         # Recorded as announced: a rerun of the old item never queues it either.
         assert live_record.has_arrival(db, 11) and live_record.queue_arrival(db, "Movies", 11, {"added_at": before}) is False
 
-    def test_a_publish_never_marks_an_event_a_rerun_replaced_meanwhile(self, db):
+    def test_an_acked_event_is_announced_even_when_a_rerun_replaced_it_meanwhile(self, db):
+        # One Nats-Msg-Id per item: resending the rerun's payload would be dropped as a duplicate
+        # inside the window, or announce the item twice after it. The ack is the announcement.
         live_record.queue_arrival(db, "Movies", 11, {"collections": [{"name": "A"}]})
         [sent] = live_record.unpublished_arrivals(db)
         live_record.queue_arrival(db, "Movies", 11, {"collections": [{"name": "B"}]})
         assert live_record.mark_published(db, "Movies", 11, sent["raw"]) is False
-        [queued] = live_record.unpublished_arrivals(db)
-        assert {c["name"] for c in queued["payload"]["collections"]} == {"A", "B"}
-        assert live_record.mark_published(db, "Movies", 11, queued["raw"]) is True
         assert live_record.unpublished_arrivals(db) == []
+        assert live_record.queue_arrival(db, "Movies", 11, {"collections": [{"name": "C"}]}) is False
+
+    def test_an_unchanged_event_reports_a_clean_mark(self, db):
+        live_record.queue_arrival(db, "Movies", 11, {"collections": [{"name": "A"}]})
+        [sent] = live_record.unpublished_arrivals(db)
+        assert live_record.mark_published(db, "Movies", 11, sent["raw"]) is True
 
 
 class TestBuildQueue:

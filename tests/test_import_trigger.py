@@ -886,7 +886,7 @@ class TestWorker:
 class TestRunKometa:
     def test_command_is_item_scoped(self, trig, monkeypatch):
         calls = []
-        monkeypatch.setattr(trig.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(returncode=0, stdout="", stderr=""))
+        monkeypatch.setattr(trig, "run_command", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(returncode=0, stdout="", stderr=""))
         assert trig.run_kometa("Movies", ["10", "11"])
         cmd = calls[0]
         assert cmd[cmd.index("--run-items") + 1] == "10|11"
@@ -897,7 +897,7 @@ class TestRunKometa:
     def test_run_on_no_library_is_an_error_not_a_retry(self, trig, monkeypatch, caplog, stream):
         # Live 11-12: Kometa exited 0 having matched no library; that was logged as finished.
         out = {"stdout": "", "stderr": "", stream: "[CRITICAL] | Config Error: No libraries were found in config"}
-        monkeypatch.setattr(trig.subprocess, "run", lambda cmd, **kw: SimpleNamespace(returncode=0, **out))
+        monkeypatch.setattr(trig, "run_command", lambda cmd, **kw: SimpleNamespace(returncode=0, **out))
         assert trig.run_kometa("Involuntary Film Club", ["10"])  # settled: retrying cannot help
         assert any(r.levelname == "ERROR" for r in caplog.records)
         assert not any("finished operations" in r.getMessage() for r in caplog.records)
@@ -906,17 +906,17 @@ class TestRunKometa:
         def missing(cmd, **kw):
             raise FileNotFoundError("python")
 
-        monkeypatch.setattr(trig.subprocess, "run", missing)
+        monkeypatch.setattr(trig, "run_command", missing)
         assert not trig.run_kometa("Movies", ["10"])
 
     def test_failure_and_timeout_return_false(self, trig, monkeypatch):
-        monkeypatch.setattr(trig.subprocess, "run", lambda cmd, **kw: SimpleNamespace(returncode=1, stderr="boom"))
+        monkeypatch.setattr(trig, "run_command", lambda cmd, **kw: SimpleNamespace(returncode=1, stderr="boom"))
         assert not trig.run_kometa("Movies", ["10"])
 
         def timeout(cmd, **kw):
             raise trig.subprocess.TimeoutExpired(cmd, 1)
 
-        monkeypatch.setattr(trig.subprocess, "run", timeout)
+        monkeypatch.setattr(trig, "run_command", timeout)
         assert not trig.run_kometa("Movies", ["10"])
 
 
@@ -983,7 +983,7 @@ class TestRunLock:
         assert result == [True]
 
     def test_exit_75_is_busy_not_failure(self, trig, monkeypatch):
-        monkeypatch.setattr(trig.subprocess, "run", lambda cmd, **kw: SimpleNamespace(returncode=trig.EXIT_LOCK_BUSY, stdout="", stderr=""))
+        monkeypatch.setattr(trig, "run_command", lambda cmd, **kw: SimpleNamespace(returncode=trig.EXIT_LOCK_BUSY, stdout="", stderr=""))
         assert trig.run_kometa("Movies", ["10"]) is trig.RUN_BUSY
         assert trig.run_build("Movies", "Picks") is trig.RUN_BUSY
 
@@ -995,7 +995,7 @@ class TestRunLock:
 class TestBuilds:
     def test_command_is_one_collection_in_one_library(self, trig, monkeypatch):
         calls = []
-        monkeypatch.setattr(trig.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(returncode=0, stdout="", stderr=""))
+        monkeypatch.setattr(trig, "run_command", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(returncode=0, stdout="", stderr=""))
         assert trig.run_build("movies-key", "Gremlins Top 100") is True
         cmd = calls[0]
         assert cmd[cmd.index("--run-libraries") + 1] == "movies-key"
@@ -1170,6 +1170,155 @@ class TestBuilder:
         assert calls == [1, 1]
 
 
+# Kometa's shape: the parent runs the work in a ProcessPoolExecutor child, and the CHILD holds the
+# run lock. Killing only the parent would leave the lock held by an orphan.
+FAKE_KOMETA = """
+import fcntl, os, sys, time
+if os.fork() == 0:
+    fh = open(os.environ["FAKE_KOMETA_LOCK"], "a+")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    with open(os.environ["FAKE_KOMETA_READY"], "w") as ready:
+        ready.write("locked\\n")
+    time.sleep(600)
+    os._exit(0)
+os.wait()
+"""
+
+
+def _lock_is_free(path):
+    import fcntl
+
+    with open(path, "a+") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        return True
+
+
+class TestArrivalsFirst:
+    """A queued collection run never holds the run lock while an arrival is due (#5634 S3, B1)."""
+
+    def _fake_kometa(self, trig, tmp_path, monkeypatch):
+        lock, ready, script = tmp_path / "run.lock", tmp_path / "ready", tmp_path / "kometa.py"
+        os.mkfifo(ready)
+        script.write_text(FAKE_KOMETA)
+        monkeypatch.setattr(trig, "KOMETA_PY", str(script))
+        monkeypatch.setattr(trig, "RUN_LOCK_PATH", str(lock))
+        monkeypatch.setenv("FAKE_KOMETA_LOCK", str(lock))
+        monkeypatch.setenv("FAKE_KOMETA_READY", str(ready))
+        return lock, ready
+
+    def _await_locked(self, ready):
+        """Blocks on the FIFO until the fake Kometa's child holds the lock: no sleeps."""
+        got = []
+        reader = threading.Thread(target=lambda: got.append(open(ready).readline()), daemon=True)
+        reader.start()
+        reader.join(60)
+        if reader.is_alive():
+            open(ready, "w").close()  # unblock the reader before failing
+            pytest.fail("the fake build never took the run lock")
+        assert got == ["locked\n"]
+
+    def test_an_arrival_stops_a_running_build_and_is_published_within_seconds(self, trig, pending, tmp_path, monkeypatch):
+        import asyncio
+        import fcntl
+
+        live_record, path = _db(trig, tmp_path)
+        monkeypatch.setattr(trig, "RECORD_PATH", path)
+        lock, ready = self._fake_kometa(trig, tmp_path, monkeypatch)
+        gate = trig.BuildGate()
+        monkeypatch.setattr(trig, "GATE", gate)
+        conn = live_record.connect(path)
+        live_record.queue_build(conn, "Movies", "Picks", "collections/picks.yml")
+        conn.close()
+
+        gate.worker_idle()
+        builder = threading.Thread(target=trig.run_builds, args=(path,), daemon=True)
+        builder.start()
+        self._await_locked(ready)  # a 600 s build now holds the run lock
+
+        ran = []
+
+        def item_run(library, keys):
+            # What Kometa does: exit 75 while the lock is held, else add + queue the arrival.
+            with open(lock, "a+") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return trig.RUN_BUSY
+                conn = live_record.connect(path)
+                live_record.queue_arrival(conn, "Movies", 10, {"v": 1, "rating_key": "10", "collections": []})
+                conn.close()
+                ran.append(keys)
+                return True
+
+        pending.requeue("Movies", "10", 0)
+        pending.due_at = 0
+        started = time.monotonic()
+        step = threading.Thread(target=trig.worker_step, args=(pending,), kwargs={"connect": lambda: FakeServer(items=[matched(10)]), "run": item_run, "gate": gate}, daemon=True)
+        step.start()
+        step.join(60)
+        assert not step.is_alive(), "the arrival is still waiting on the build's run lock"
+        js = FakeJetStream()
+        assert asyncio.run(trig.Publisher(path, "nats://x:4222", "seed").drain(js)) == trig.DRAIN_EMPTY
+        elapsed = time.monotonic() - started
+
+        assert ran == [["10"]] and [p["rating_key"] for _, p, _ in js.published] == ["10"]
+        assert elapsed < 30, elapsed  # the build would have held the lock for 600 s
+        builder.join(30)
+        assert not builder.is_alive()
+        conn = live_record.connect(path)
+        # Stopped, not failed: still queued, no attempt charged, runs once the worker is idle again.
+        assert [(b["mapping_name"], b["attempts"]) for b in live_record.pending_builds(conn)] == [("Picks", 0)]
+        conn.close()
+        assert _lock_is_free(lock)  # the lock-holding child died with the group
+
+    def test_a_build_never_starts_while_the_worker_has_a_batch(self, trig, tmp_path, monkeypatch):
+        live_record, path = _db(trig, tmp_path)
+        gate = trig.BuildGate()
+        monkeypatch.setattr(trig, "GATE", gate)
+        monkeypatch.setattr(trig, "_spawn", lambda cmd: pytest.fail("a build started during a batch"))
+        conn = live_record.connect(path)
+        live_record.queue_build(conn, "Movies", "Picks", "collections/picks.yml")
+        gate.worker_busy()
+        trig.run_builds(path)
+        assert [(b["mapping_name"], b["attempts"]) for b in live_record.pending_builds(conn)] == [("Picks", 0)]
+        conn.close()
+
+    def test_the_builder_wakes_whenever_the_worker_goes_idle(self, trig, pending, monkeypatch):
+        gate = trig.BuildGate()
+        pending.requeue("Movies", "10", 0)
+        pending.due_at = 0
+        trig.worker_step(pending, connect=lambda: FakeServer(items=[]), run=lambda *a: True, gate=gate)
+        assert gate.woken.is_set()
+
+    def test_a_timeout_kills_the_child_holding_the_lock_too(self, trig, tmp_path, monkeypatch):
+        lock, ready = self._fake_kometa(trig, tmp_path, monkeypatch)
+        real_spawn = trig._spawn
+
+        def spawn_then_wait_for_the_lock(command):
+            proc = real_spawn(command)
+            self._await_locked(ready)  # the timeout below fires with the child holding the lock
+            return proc
+
+        monkeypatch.setattr(trig, "_spawn", spawn_then_wait_for_the_lock)
+        monkeypatch.setattr(trig, "RUN_TIMEOUT_SECONDS", 0)
+        assert trig.run_kometa("Movies", ["10"]) is False
+        assert _lock_is_free(lock)
+
+    def test_an_error_waiting_on_the_lock_is_a_failed_run_not_a_spin(self, trig):
+        calls = []
+
+        def wait():
+            calls.append(1)
+            raise PermissionError("lock dir unreadable")
+
+        assert trig.run_unless_busy(lambda: trig.RUN_BUSY, wait=wait) is False
+        assert calls == [1]
+
+
 class FakeJetStream:
     def __init__(self, failures=()):
         self.failures = list(failures)
@@ -1183,6 +1332,14 @@ class FakeJetStream:
 
 class StreamNotFound(Exception):
     """Stands in for nats.js.errors.NotFoundError / NoRespondersError: no stream captures the subject yet."""
+
+
+class NoStreamResponseError(Exception):
+    """Named like nats.js.errors.NoStreamResponseError: what nats-py raises publishing with no stream."""
+
+
+class PermissionsViolation(Exception):
+    """Any other publish error: a misconfiguration nobody is waiting out."""
 
 
 class TestPublisher:
@@ -1231,6 +1388,41 @@ class TestPublisher:
         publisher = trig.Publisher(path, "nats://x:4222", "seed")
         for timeout in (TimeoutError(), asyncio.TimeoutError(), type("TimeoutError", (Exception,), {})()):
             assert asyncio.run(publisher.drain(FakeJetStream(failures=[timeout]))) == trig.DRAIN_RETRY
+
+    def test_no_stream_yet_is_a_warning_and_a_misconfiguration_is_an_error(self, trig, tmp_path, caplog):
+        import asyncio
+        import logging
+
+        live_record, path = _db(trig, tmp_path)
+        self._queue(live_record, path, 11)
+        publisher = trig.Publisher(path, "nats://x:4222", "seed")
+        with caplog.at_level(logging.WARNING, logger=trig.log.name):
+            assert asyncio.run(publisher.drain(FakeJetStream(failures=[NoStreamResponseError()]))) == trig.DRAIN_WAIT
+            assert asyncio.run(publisher.drain(FakeJetStream(failures=[PermissionsViolation("publish denied")]))) == trig.DRAIN_WAIT
+        levels = [(r.levelno, r.getMessage().split(": ")[1]) for r in caplog.records if "held in the outbox" in r.getMessage()]
+        assert levels == [(logging.WARNING, "NoStreamResponseError"), (logging.ERROR, "PermissionsViolation")]
+
+    def test_a_rerun_that_changed_the_event_mid_send_is_not_sent_again(self, trig, tmp_path, caplog):
+        # One Nats-Msg-Id per item: a second send would be dropped as a duplicate inside the window,
+        # or announce the item twice after it. The ack is the announcement.
+        import asyncio
+        import logging
+
+        live_record, path = _db(trig, tmp_path)
+        self._queue(live_record, path, 11)
+
+        class RerunMidSend(FakeJetStream):
+            async def publish(self, subject, payload, **kw):
+                await super().publish(subject, payload, **kw)
+                conn = live_record.connect(path)
+                live_record.queue_arrival(conn, "Movies", 11, {"v": 1, "rating_key": 11, "collections": [{"name": "Late"}]})
+                conn.close()
+
+        js = RerunMidSend()
+        with caplog.at_level(logging.WARNING, logger=trig.log.name):
+            assert asyncio.run(trig.Publisher(path, "nats://x:4222", "seed").drain(js)) == trig.DRAIN_EMPTY
+        assert len(js.published) == 1
+        assert any("announced once" in r.getMessage() for r in caplog.records)
 
     def test_no_stream_waits_for_a_wake_not_a_timer(self, trig, tmp_path, monkeypatch):
         import asyncio

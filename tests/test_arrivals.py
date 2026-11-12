@@ -196,11 +196,21 @@ class TestNothingWaiting:
         [row] = outbox(db)
         assert (row["payload"]["tmdb_id"], row["payload"]["imdb_id"], row["payload"]["collections"]) == (None, "tt0000511", [])
 
-    def test_an_item_with_no_id_at_all_is_left_alone(self, db):
+    def test_an_item_kometa_has_no_id_for_fails_loud_so_the_trigger_retries_it(self, db, quiet):
+        # Exit 0 here would drop the arrival: the trigger only announces from Plex's own ids when
+        # an item runs out of retries.
         plex = FakePlex(ext_ids={}, collections={"Picks": {"sort": 0, "keys": []}})
         record(db, wanted=[(511, False, None)])
-        assert arrivals.handle_item(db, plex, 11, now=NOW) is True
+        assert arrivals.handle_item(db, plex, 11, now=NOW) is False
         assert plex.adds == [] and outbox(db) == []
+        assert any("11" in m for m in quiet.error_messages) and quiet.info_messages == []
+
+    def test_values_the_contract_would_reject_go_out_as_null(self, db):
+        plex = FakePlex(ext_ids={11: 511}, imdb_ids={11: "nm0000001"}, collections={})
+        plex.items[11].year = 0
+        arrivals.handle_item(db, plex, 11, now=NOW)
+        [row] = outbox(db)
+        assert (row["payload"]["imdb_id"], row["payload"]["year"]) == (None, None)
 
 
 # ── ids ───────────────────────────────────────────────────────────────
@@ -339,9 +349,20 @@ class TestRun:
         record(conn, wanted=[(511, False, None)])
         conn.close()
         plex = FakePlex(ext_ids={11: 511}, collections={"Picks": {"sort": 0, "keys": []}})
-        config = SimpleNamespace(default_dir=str(tmp_path), run_items=[11, 77])  # 77 is in another library
+        config = SimpleNamespace(default_dir=str(tmp_path), run_items=[11])
         assert arrivals.run(config, plex, now=NOW) is True
         assert plex.adds == [("Picks", 11)]
+
+    def test_a_key_the_run_did_not_load_fails_the_run_so_it_is_retried(self, tmp_path, quiet):
+        # Exit 0 would make the trigger forget it unannounced.
+        conn = live_record.connect(live_record.db_path(str(tmp_path)))
+        record(conn, wanted=[(511, False, None)])
+        conn.close()
+        plex = FakePlex(ext_ids={11: 511}, collections={"Picks": {"sort": 0, "keys": []}})
+        config = SimpleNamespace(default_dir=str(tmp_path), run_items=[11, 77])
+        assert arrivals.run(config, plex, now=NOW) is False
+        assert plex.adds == [("Picks", 11)]
+        assert any("77" in m for m in quiet.error_messages)
 
     def test_a_failing_item_makes_the_run_report_failure(self, tmp_path, monkeypatch):
         plex = FakePlex(ext_ids={11: 511, 12: 512}, collections={})
@@ -466,6 +487,33 @@ class TestPartialFailure:
         entries = {c["name"]: (c["added"], c["slotted"]) for c in row["payload"]["collections"]}
         assert entries == {"Picks": (True, False), "Top": (True, True)}
         assert plex.collections["Top"]["keys"] == [11, 1]
+
+    def test_a_run_killed_right_after_the_add_still_reports_the_add(self, db):
+        # Plex took the add, then the run died (timeout kill) before the verify read. The retry finds
+        # the film already a member; the event must still say the trigger added it.
+        class Killed(BaseException):
+            pass
+
+        plex = FakePlex(ext_ids={11: 511}, collections={"Picks": {"sort": 0, "keys": []}})
+        record(db, name="Picks", wanted=[(511, False, None)])
+        reads = []
+        real = plex.get_collection_items
+
+        def dies_after_the_add(collection, smart):
+            reads.append(1)
+            if len(reads) == 2:
+                raise Killed()
+            return real(collection, smart)
+
+        plex.get_collection_items = dies_after_the_add
+        with pytest.raises(Killed):
+            arrivals.handle_item(db, plex, 11, now=NOW)
+        assert outbox(db) == []  # held: the run never finished
+        plex.get_collection_items = real
+        assert arrivals.handle_item(db, plex, 11, now=NOW + timedelta(minutes=3)) is True
+        [row] = outbox(db)
+        assert [(c["name"], c["added"]) for c in row["payload"]["collections"]] == [("Picks", True)]
+        assert plex.adds == [("Picks", 11)]
 
     def test_giving_up_publishes_what_the_last_run_managed(self, db):
         plex = FakePlex(ext_ids={1: 501, 11: 511}, collections={"Picks": {"sort": 0, "keys": []}, "Top": {"sort": arrivals.CUSTOM_SORT, "keys": [1]}}, move_lands=False)

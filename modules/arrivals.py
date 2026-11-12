@@ -13,6 +13,7 @@ added again, an item already in its slot is not moved, and the record ignores re
 The run holds the Kometa run lock, so a scheduled sweep never interleaves with these writes.
 """
 
+import re
 from datetime import datetime, timezone
 
 from modules import live_record, util
@@ -23,6 +24,9 @@ logger = util.logger
 PAYLOAD_VERSION = 1
 # plexapi Collection.collectionSort: 0 release date, 1 alphabetical, 2 custom (plex.collection_order_keys).
 CUSTOM_SORT = 2
+# kometa-contract item-arrived: imdb_id ^tt\d+$, year 1870-2200; anything else goes out as null.
+IMDB_ID = re.compile(r"tt\d+")
+YEARS = (1870, 2200)
 
 
 def _ext_ids(library, rating_key):
@@ -99,10 +103,12 @@ def _entry(waiting):
     return {"name": waiting["name"], "mapping_name": waiting["mapping_name"], "source_file": waiting["source_file"], "added": False, "position": waiting["position"] + 1 if custom else None, "slotted": False}
 
 
-def _add_to(conn, library, item, rating_key, ext_id, waiting, now, entry):
+def _add_to(conn, library, item, rating_key, ext_id, waiting, now, entry, checkpoint=None):
     """Put the item into one waiting collection, filling in ``entry`` as it goes (so a failure part-way
     still says what happened). Returns the entry, or None when the collection is not in Plex and a
-    run of it was queued instead: the event lists only collections the item belongs to now."""
+    run of it was queued instead: the event lists only collections the item belongs to now.
+    ``checkpoint(entry)`` runs as soon as Plex took the add, so a run killed before it finishes still
+    reports the add (a retry finds the item already a member)."""
     name = waiting["name"]
     custom = entry["position"] is not None
     collection = None
@@ -121,10 +127,12 @@ def _add_to(conn, library, item, rating_key, ext_id, waiting, now, entry):
 
     if rating_key not in {int(member.ratingKey) for member in order}:
         library.alter_collection([item], name)
+        entry["added"] = True
+        if checkpoint is not None:
+            checkpoint(entry)
         _, order = _read_collection(library, name)
         if rating_key not in {int(member.ratingKey) for member in order}:
             raise Failed(f"Arrival Error: {util.item_title(item)} is still not in {name} after adding it")
-        entry["added"] = True
         logger.info(f"Arrival: added {util.item_title(item)} to {name}")
 
     if custom:
@@ -144,19 +152,44 @@ def handle_item(conn, library, rating_key, now=None):
     tmdb_id, tvdb_id, imdb_id = _ext_ids(library, rating_key)
     ext_id = tmdb_id if library.is_movie else tvdb_id
     if ext_id is None and imdb_id is None:
-        logger.info(f"Arrival: {rating_key} has no TMDb, TVDb or IMDb id in {library.name}; not announcing it")
-        return True
+        # Kometa could not map it (yet). A failed item is retried; once the retries run out the
+        # trigger announces it from Plex's own ids, if Plex has any.
+        logger.error(f"Arrival Error: {rating_key} has no TMDb, TVDb or IMDb id in {library.name}; cannot add or announce it")
+        return False
     item = library.fetch_item(rating_key)
     id_type = "tmdb" if library.is_movie else "tvdb"
     ok = True
     collections = []
     waiting_for = live_record.find_waiting(conn, id_type, ext_id, now=moment) if ext_id is not None else []
+
+    def payload(entries):
+        return {
+            "v": PAYLOAD_VERSION,
+            "library": library.name,
+            "rating_key": str(rating_key),
+            "media_type": "movie" if library.is_movie else "show",
+            "tmdb_id": tmdb_id,
+            "tvdb_id": tvdb_id,
+            "imdb_id": imdb_id if isinstance(imdb_id, str) and IMDB_ID.fullmatch(imdb_id) else None,
+            "title": item.title or str(rating_key),
+            "year": year if isinstance(year, int) and YEARS[0] <= year <= YEARS[1] else None,
+            "added_at": _stamp(getattr(item, "addedAt", None) or moment),
+            "arrived_at": _stamp(moment),
+            "collections": entries,
+        }
+
+    year = getattr(item, "year", None)
     for waiting in waiting_for:
         if waiting["library"] != library.name:
             continue
         entry = _entry(waiting)
+
+        def checkpoint(done, so_far=list(collections)):
+            # Held: only the end of this run (or the trigger giving up) lets it out.
+            live_record.queue_arrival(conn, library.name, rating_key, payload(so_far + [dict(done)]), now=moment, complete=False)
+
         try:
-            if _add_to(conn, library, item, rating_key, ext_id, waiting, moment, entry) is not None:
+            if _add_to(conn, library, item, rating_key, ext_id, waiting, moment, entry, checkpoint=checkpoint) is not None:
                 collections.append(entry)
         except Exception as e:
             if entry["added"]:
@@ -167,23 +200,9 @@ def handle_item(conn, library, rating_key, now=None):
             logger.error(f"Arrival Error: {util.item_title(item)} into {waiting['name']}: {e}")
     if not collections and ok:
         logger.info(f"Arrival: no collection is waiting for {util.item_title(item)}")
-    payload = {
-        "v": PAYLOAD_VERSION,
-        "library": library.name,
-        "rating_key": str(rating_key),
-        "media_type": "movie" if library.is_movie else "show",
-        "tmdb_id": tmdb_id,
-        "tvdb_id": tvdb_id,
-        "imdb_id": imdb_id,
-        "title": item.title or str(rating_key),
-        "year": getattr(item, "year", None),
-        "added_at": _stamp(getattr(item, "addedAt", None) or moment),
-        "arrived_at": _stamp(moment),
-        "collections": collections,
-    }
     # A failed collection means the trigger runs the item again: hold the event until then, so it
     # goes out once, complete.
-    live_record.queue_arrival(conn, library.name, rating_key, payload, now=moment, complete=ok)
+    live_record.queue_arrival(conn, library.name, rating_key, payload(collections), now=moment, complete=ok)
     return ok
 
 
@@ -202,6 +221,10 @@ def run(config, library, now=None):
         key_map = library.movie_rating_key_map if library.is_movie else library.show_rating_key_map
         for rating_key in config.run_items:
             if rating_key not in key_map and rating_key not in library.cached_items:
+                # Not in this run's view of the library (not loaded yet, or another library):
+                # failing it makes the trigger retry and, at the end, announce it from Plex.
+                ok = False
+                logger.error(f"Arrival Error: item {rating_key} is not in {library.name} as this run loaded it")
                 continue
             try:
                 ok = handle_item(conn, library, int(rating_key), now=now) and ok
