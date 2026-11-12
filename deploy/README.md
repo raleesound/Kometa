@@ -93,15 +93,19 @@ uses for its version/update check. It does not choose what gets built —
 
 ### Before recreating anything: is Kometa mid-run?
 
-A recreate kills a run in progress. Kometa holds an exclusive `flock` on
-`CONFIG_DIR/.kometa.run.lock` for the whole run (the file always exists; what
-matters is whether it is locked). From the host:
+A recreate kills a run in progress. Every Kometa run (scheduled sweeps and
+the trigger's item-scoped runs alike) holds an exclusive `flock` on
+`$CONFIG_DIR/.kometa.run.lock` while it runs (`kometa.py` `process()`). The
+file stays behind after the first run, so check whether it is *locked*, not
+whether it exists. From the deploy dir on the host:
 
 ```
-flock -n -s /home/rob/docker/volumes/kometa/.kometa.run.lock true && echo idle || echo RUNNING
+source .env && flock -n -s "$CONFIG_DIR/.kometa.run.lock" true && echo idle || echo RUNNING
 ```
 
-Only recreate when it says `idle`. Scheduled runs are `KOMETA_TIMES` (host TZ).
+Only recreate when it says `idle`. "idle" means no run is in progress; the
+scheduler container itself stays up and sleeps until the next `KOMETA_TIMES`
+slot (host TZ). `deploy.sh` does not check this for you.
 
 ### Containers are recreated by hand, never by compose
 
