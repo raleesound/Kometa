@@ -292,7 +292,7 @@ logger = MyLogger("Kometa", default_dir, run_args["width"], run_args["divider"][
 from modules import util  # noqa: E402
 
 util.logger = logger
-from modules import live_record, timings  # noqa: E402
+from modules import arrivals, live_record, timings  # noqa: E402
 
 # Must be set before modules.cache/modules.request are imported below - both read this at import/decoration time, not per-call.
 timings.ENABLED = run_args["timings"]
@@ -404,28 +404,46 @@ def run_lock_path():
     return os.path.join(default_dir, ".kometa.run.lock")
 
 
+# Exit codes the import trigger acts on.
+RUN_LOCK_BUSY = 75  # EX_TEMPFAIL: another run holds the run lock; the trigger waits for it and runs again
+RUN_ITEMS_FAILED = 1  # a per-item run or its arrival step failed; the trigger retries the items
+
+# Set when a per-item run's arrival step or a library in it failed, so the run exits RUN_ITEMS_FAILED.
+item_run_failed = False
+
+
 def process(attrs):
     # Two Kometa runs sharing one config directory contend over config.cache and can issue
     # duplicate edits to the same Plex items. An item-scoped run that arrives during a sweep
-    # has nothing to add — the sweep will reach that item anyway — so it steps aside.
+    # cannot step aside silently: its arrival step (#5634) is not something the sweep repeats
+    # for it, so it exits RUN_LOCK_BUSY and the trigger runs it once the lock is free.
+    # A scheduled sweep instead waits: the lock holder is then an item run (the trigger kills those
+    # after RUN_TIMEOUT_SECONDS), and skipping would drop the day's sweep for a minute's overlap.
     lock_file = None
     if fcntl is not None:
         try:
             lock_file = open(run_lock_path(), "a+")
-            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                if "time" not in attrs:
+                    raise
+                logger.info("Another Kometa run holds the lock; the scheduled run starts when it finishes")
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
         except OSError:
             if lock_file is not None:
                 lock_file.close()
             if run_args["run-items"]:
-                logger.info("Another Kometa run holds the lock; the running sweep will cover these items")
-                return 0
+                logger.info("Another Kometa run holds the lock; exiting so the trigger runs these items after it")
+                return RUN_LOCK_BUSY
             logger.error("Another Kometa run holds the lock; refusing to start a second one")
-            return 1
+            return RUN_LOCK_BUSY
     try:
         return _process(attrs)
     finally:
         if lock_file is not None:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
             lock_file.close()
 
 
@@ -452,15 +470,30 @@ def should_sync_collection(builder):
 live_recorder = None  # live_record.RunRecorder for the current run; set in run_libraries()
 
 
-def record_live_collection(config, library, metadata, builder, mapping_name, add_ran, sync_ran, sync_ok=True):
+def record_live_collection(config, library, metadata, builder, mapping_name, add_ran, sync_ran, sync_ok=True, observed_at=None):
     """Write this collection's membership, wanted ids and order to the live record (#5634).
 
-    A per-item run (--run-items) never touches the record: it does not rebuild collections.
-    RunRecorder logs and swallows every failure, so recording never fails the collection run.
+    A per-item run (--run-items) never writes snapshots: it does not rebuild collections (its arrival
+    step writes through modules.arrivals instead). ``observed_at`` is when this collection's run began
+    reading Plex, so the record keeps arrival adds made after it. RunRecorder logs and swallows every
+    failure, so recording never fails the collection run.
     """
     if config.run_items or live_recorder is None:
         return
-    live_recorder.record(library, metadata, builder, mapping_name, add_ran, sync_ran, sync_ok=sync_ok)
+    live_recorder.record(library, metadata, builder, mapping_name, add_ran, sync_ran, sync_ok=sync_ok, observed_at=observed_at)
+
+
+def run_arrivals(config, library):
+    """Per-item run: put the items into the collections the live record says are waiting for them
+    (#5634 S3). A failure makes the run exit RUN_ITEMS_FAILED so the trigger retries."""
+    global item_run_failed
+    if not config.run_items or library.is_music:
+        return
+    logger.info("")
+    logger.separator(f"Arrivals in {library.original_mapping_name}", space=False, border=False)
+    logger.info("")
+    if not arrivals.run(config, library):
+        item_run_failed = True
 
 
 def record_live_failed(config, library, mapping_name):
@@ -974,6 +1007,10 @@ def start(attrs):
         logger.remove_main_handler()
     except Exception as e:
         log_critical_exception(e)
+        if run_args["run-items"]:
+            sys.exit(RUN_ITEMS_FAILED)
+    if run_args["run-items"] and item_run_failed:
+        sys.exit(RUN_ITEMS_FAILED)
 
 
 def run_config(config, stats):
@@ -1128,7 +1165,8 @@ def run_config(config, stats):
 
 
 def run_libraries(config) -> tuple[LibraryRunStatus, bool]:
-    global live_recorder
+    global live_recorder, item_run_failed
+    item_run_failed = False
     live_recorder = None if config.run_items else live_record.RunRecorder(config.default_dir, logger)
     # Decided now: run_collection clears run_args["resume"] once it reaches the resume target.
     partial_run = is_partial_run(config, run_args)
@@ -1257,6 +1295,8 @@ def run_libraries(config) -> tuple[LibraryRunStatus, bool]:
                         if mapping_name not in library.collection_names:
                             library.collection_names.append(mapping_name)
 
+            run_arrivals(config, library)
+
             for run_type in library.run_order:
                 if run_type == "collections" and runs[run_type]:
                     time_start = datetime.now()
@@ -1330,6 +1370,8 @@ def run_libraries(config) -> tuple[LibraryRunStatus, bool]:
         except Exception as e:
             library.notify(get_critical_error_message(e))
             log_critical_exception(e)
+            if config.run_items:
+                item_run_failed = True
     if collections_ran and not partial_run:
         expire_live_record(config)
     return library_status, collections_ran
@@ -1552,7 +1594,7 @@ def run_collection(config, library, metadata, requested_collections):
             library.status[str(mapping_name)]["errors"].append(e)
         sync_ok = not library.status[str(mapping_name)]["errors"]
         if live_ran is not None:
-            record_live_collection(config, library, metadata, live_ran[0], mapping_name, live_ran[1], live_ran[2], sync_ok=sync_ok)
+            record_live_collection(config, library, metadata, live_ran[0], mapping_name, live_ran[1], live_ran[2], sync_ok=sync_ok, observed_at=collection_start)
         elif not sync_ok:
             record_live_failed(config, library, mapping_name)
         collection_run_time = str(datetime.now() - collection_start).split(".")[0]

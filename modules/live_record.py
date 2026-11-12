@@ -5,11 +5,14 @@ wants into a SQLite file next to config.yml. The arrival handler (S3) reads it t
 newly imported film to every collection waiting on it, in its recorded position, without
 waiting for the next scheduled sweep.
 
-Two processes write this file: the scheduled/scoped Kometa run and the import trigger.
+Two processes write this file: the scheduled/scoped Kometa run and the import trigger. Every
+Kometa run (sweep, scoped or item run) holds the run lock, so their writes never interleave; the
+trigger process itself only drains the arrival outbox and the scoped-build queue.
 WAL mode plus a busy timeout lets them interleave; every write is one short transaction.
 Only the stdlib sqlite3 module is used.
 """
 
+import json
 import os
 import sqlite3
 import time
@@ -18,8 +21,24 @@ from datetime import datetime, timedelta, timezone
 DB_NAME = "live-collections.db"
 # Bump on any schema change: an older record is dropped and rebuilt (it is derived data; the next
 # sweep repopulates it).
-SCHEMA_VERSION = 2
-TABLES = ("collections", "members", "wanted", "history")
+SCHEMA_VERSION = 3
+TABLES = ("collections", "members", "wanted", "history", "arrivals", "builds", "record_meta")
+# What an out-of-date record keeps when it is dropped and rebuilt: the outbox remembers which items
+# were announced, and losing it would announce them all again.
+KEEP_ON_REBUILD = ("arrivals", "record_meta")
+# Items Plex added before the arrivals outbox existed are recorded as announced, not announced: the
+# first deploy must not post a week of catch-up arrivals at once.
+ARRIVALS_SINCE = "arrivals_since"
+# Versions that can be upgraded in place (version -> statements bringing it to version + 1). Older
+# versions are dropped and rebuilt. In-place matters: a dropped record leaves the arrival handler
+# blind until the next sweep repopulates it.
+MIGRATIONS = {
+    2: (
+        "ALTER TABLE members ADD COLUMN source TEXT",
+        "ALTER TABLE members ADD COLUMN added_at TEXT",
+        "ALTER TABLE history ADD COLUMN source TEXT",
+    ),
+}
 # Readers (the arrival handler) can afford to wait; a Kometa run must not stall on a held lock,
 # so its writes use a short timeout and give up for the rest of the run after repeated failures.
 BUSY_TIMEOUT_MS = 30000
@@ -59,6 +78,8 @@ CREATE TABLE IF NOT EXISTS members (
     rating_key INTEGER NOT NULL,
     ext_id INTEGER,
     position INTEGER,
+    source TEXT,
+    added_at TEXT,
     PRIMARY KEY (library, name, rating_key)
 );
 CREATE TABLE IF NOT EXISTS wanted (
@@ -78,15 +99,44 @@ CREATE TABLE IF NOT EXISTS history (
     recorded_at TEXT NOT NULL,
     event TEXT NOT NULL,
     rating_key INTEGER,
-    ext_id INTEGER
+    ext_id INTEGER,
+    source TEXT
 );
 CREATE INDEX IF NOT EXISTS history_by_collection ON history (library, name, id);
+"""
+# Tables added after v2. CREATE IF NOT EXISTS, so they double as the v2 -> v3 migration.
+SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS arrivals (
+    library TEXT NOT NULL,
+    rating_key INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    published_at TEXT,
+    complete INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (library, rating_key)
+);
+CREATE INDEX IF NOT EXISTS arrivals_unpublished ON arrivals (published_at, created_at);
+CREATE TABLE IF NOT EXISTS builds (
+    library TEXT NOT NULL,
+    mapping_name TEXT NOT NULL,
+    source_file TEXT,
+    requested_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (library, mapping_name)
+);
+CREATE TABLE IF NOT EXISTS record_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 MEMBER_ADDED = "member_added"
 MEMBER_REMOVED = "member_removed"
 WANTED_ADDED = "wanted_added"
 WANTED_REMOVED = "wanted_removed"
+# Who changed a collection: a Kometa collection run, or the arrival handler (item run, S3).
+SOURCE_RUN = "run"
+SOURCE_TRIGGER = "trigger"
 
 
 def db_path(config_dir):
@@ -114,10 +164,10 @@ def _set_wal(conn, timeout_ms):
             delay = min(delay * 2, 0.25)
 
 
-def connect(path, timeout_ms=BUSY_TIMEOUT_MS, log=None):
+def connect(path, timeout_ms=BUSY_TIMEOUT_MS, log=None, check_same_thread=True):
     """Open the record, creating the schema on first use. A record from an older schema version is
-    dropped and rebuilt (logged to ``log`` when given). Autocommit; callers open their own transactions."""
-    conn = sqlite3.connect(path, timeout=timeout_ms / 1000, isolation_level=None)
+    upgraded in place when MIGRATIONS covers it, otherwise dropped and rebuilt (logged to ``log`` when given). Autocommit; callers open their own transactions."""
+    conn = sqlite3.connect(path, timeout=timeout_ms / 1000, isolation_level=None, check_same_thread=check_same_thread)
     try:
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout = {int(timeout_ms)}")
@@ -127,16 +177,24 @@ def connect(path, timeout_ms=BUSY_TIMEOUT_MS, log=None):
             conn.execute("BEGIN IMMEDIATE")
             try:
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
-                if version < SCHEMA_VERSION:
+                if version in MIGRATIONS:
+                    while version < SCHEMA_VERSION:
+                        for statement in MIGRATIONS[version]:
+                            conn.execute(statement)
+                        version += 1
+                    _create(conn)
+                    if log is not None:
+                        log.info(f"Live Record: upgraded the record in place to schema v{SCHEMA_VERSION}")
+                elif version < SCHEMA_VERSION:
                     if version > 0:
+                        keep = KEEP_ON_REBUILD if _columns(conn, "arrivals") >= ARRIVALS_COLUMNS else ()
                         for table in TABLES:
-                            conn.execute(f"DROP TABLE IF EXISTS {table}")  # nosec B608 - table names are constants
+                            if table not in keep:
+                                conn.execute(f"DROP TABLE IF EXISTS {table}")  # nosec B608 - table names are constants
                         if log is not None:
                             log.warning(f"Live Record: schema v{version} is out of date, dropped the record and rebuilt it as v{SCHEMA_VERSION}; the next sweep repopulates it")
-                    for statement in SCHEMA.split(";"):
-                        if statement.strip():
-                            conn.execute(statement)
-                    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                    _create(conn)
+                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -145,6 +203,27 @@ def connect(path, timeout_ms=BUSY_TIMEOUT_MS, log=None):
         conn.close()
         raise
     return conn
+
+
+# The outbox columns every reader and writer here uses: an outbox without them is rebuilt, not kept.
+ARRIVALS_COLUMNS = frozenset({"library", "rating_key", "payload", "created_at", "published_at", "complete"})
+
+
+def _columns(conn, table):
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}  # nosec B608 - table name is a constant
+
+
+def _create(conn):
+    for statement in (SCHEMA + SCHEMA_V3).split(";"):
+        if statement.strip():
+            conn.execute(statement)
+    conn.execute("INSERT OR IGNORE INTO record_meta (key, value) VALUES (?, ?)", (ARRIVALS_SINCE, _now()))
+
+
+def arrivals_since(conn):
+    """When the outbox started (an aware datetime): items Plex added before it are not announced."""
+    row = conn.execute("SELECT value FROM record_meta WHERE key = ?", (ARRIVALS_SINCE,)).fetchone()
+    return None if row is None else datetime.fromisoformat(row["value"])
 
 
 def _now():
@@ -176,18 +255,37 @@ def write_collection(conn, snapshot):
     previous_members (list of (rating_key, ext_id) the collection held before this run, or None if
     unknown; used only when there is no earlier record to diff against),
     wanted (list of (ext_id, filtered, held_back, position); filtered is True/False, or None when
-    run_missing never evaluated the id).
+    run_missing never evaluated the id),
+    observed_at (optional aware datetime: when this run started reading the collection from Plex).
 
     When this run could not establish a custom order (sort failed or skipped) the last good order
     is carried over by id instead of being erased.
+
+    A snapshot never reverts a newer arrival: a member the arrival handler added after
+    ``observed_at`` is kept (and its id is not put back in wanted) even though this run did not see
+    it. Without ``observed_at`` the snapshot is taken as current and replaces everything.
     """
     library, name = snapshot["library"], snapshot["name"]
     members = None if snapshot["members"] is None else [list(m) for m in snapshot["members"]]
     wanted = [list(w) for w in snapshot["wanted"]]
     order_recorded = bool(snapshot["order_recorded"])
     now = _now()
+    observed_at = snapshot.get("observed_at")
     conn.execute("BEGIN IMMEDIATE")
     try:
+        newer = []
+        if observed_at is not None:
+            newer = conn.execute(
+                "SELECT rating_key, ext_id, position, added_at FROM members WHERE library = ? AND name = ? AND source = ? AND added_at > ?",
+                (library, name, SOURCE_TRIGGER, _stamp(observed_at)),
+            ).fetchall()
+        if newer:
+            newer_ids = {row["ext_id"] for row in newer if row["ext_id"] is not None}
+            wanted = [w for w in wanted if w[0] not in newer_ids]
+            if members is not None:
+                seen = {m[0] for m in members}
+                members.extend([row["rating_key"], row["ext_id"], row["position"]] for row in newer if row["rating_key"] not in seen)
+        kept = {row["rating_key"]: row["added_at"] for row in newer}
         prior = conn.execute("SELECT members_tracked, collection_order, order_recorded, order_recorded_at FROM collections WHERE library = ? AND name = ?", (library, name)).fetchone()
         old_members = None
         if prior is not None and prior["members_tracked"]:
@@ -249,13 +347,16 @@ def write_collection(conn, snapshot):
         )
         conn.execute("DELETE FROM members WHERE library = ? AND name = ?", (library, name))
         if members:
-            conn.executemany("INSERT OR REPLACE INTO members (library, name, rating_key, ext_id, position) VALUES (?, ?, ?, ?, ?)", [(library, name, rk, ext_id, pos) for rk, ext_id, pos in members])
+            conn.executemany(
+                "INSERT OR REPLACE INTO members (library, name, rating_key, ext_id, position, source, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(library, name, rk, ext_id, pos, SOURCE_TRIGGER if rk in kept else SOURCE_RUN, kept.get(rk)) for rk, ext_id, pos in members],
+            )
         conn.execute("DELETE FROM wanted WHERE library = ? AND name = ?", (library, name))
         conn.executemany(
             "INSERT OR REPLACE INTO wanted (library, name, ext_id, filtered, held_back, position) VALUES (?, ?, ?, ?, ?, ?)",
             [(library, name, ext_id, _bool_or_none(filtered), int(bool(held)), pos) for ext_id, filtered, held, pos in wanted],
         )
-        conn.executemany("INSERT INTO history (library, name, recorded_at, event, rating_key, ext_id) VALUES (?, ?, ?, ?, ?, ?)", [(library, name, now, event, rk, ext_id) for event, rk, ext_id in events])
+        conn.executemany("INSERT INTO history (library, name, recorded_at, event, rating_key, ext_id, source) VALUES (?, ?, ?, ?, ?, ?, ?)", [(library, name, now, event, rk, ext_id, SOURCE_RUN) for event, rk, ext_id in events])
         _trim_history(conn, library, name)
         conn.execute("COMMIT")
     except Exception:
@@ -328,8 +429,9 @@ def expire(conn, max_age=EXPIRE_AFTER, now=None):
     try:
         expired = [(row["library"], row["name"]) for row in conn.execute("SELECT library, name FROM collections WHERE last_synced < ? ORDER BY library, name", (cutoff,)).fetchall()]
         for library, name in expired:
-            for table in TABLES:
+            for table in ("collections", "members", "wanted", "history"):
                 conn.execute(f"DELETE FROM {table} WHERE library = ? AND name = ?", (library, name))  # nosec B608 - table names are constants
+        # Published arrivals are kept: they are what stops a show announcing again on its next episode.
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -340,7 +442,7 @@ def expire(conn, max_age=EXPIRE_AFTER, now=None):
 # ── Read API (used by the arrival handler, S3) ─────────────────────────
 
 
-def find_waiting(conn, id_type, ext_id, include_unknown=True, stale_after=STALE_AFTER, now=None):
+def find_waiting(conn, id_type, ext_id, include_unknown=False, stale_after=STALE_AFTER, now=None):
     """Every built collection still waiting on this TMDb ('tmdb') or TVDb ('tvdb') id.
 
     An id run_missing filtered out is never returned. ``filter_state`` is 'passed' when run_missing
@@ -390,6 +492,15 @@ def slot_after(conn, library, name, position):
     return None if row is None else row["rating_key"]
 
 
+def positions(conn, library, name):
+    """Recorded custom-order positions of a collection, members and wanted ids alike: {ext_id: position}."""
+    rows = conn.execute(
+        "SELECT ext_id, position FROM members WHERE library = ? AND name = ? AND ext_id IS NOT NULL AND position IS NOT NULL " "UNION ALL SELECT ext_id, position FROM wanted WHERE library = ? AND name = ? AND position IS NOT NULL",
+        (library, name, library, name),
+    )
+    return {row["ext_id"]: row["position"] for row in rows}
+
+
 def get_members(conn, library, name):
     """Members in recorded order (positioned members first, by position)."""
     rows = conn.execute("SELECT rating_key, ext_id, position FROM members WHERE library = ? AND name = ? ORDER BY position IS NULL, position, rating_key", (library, name))
@@ -402,8 +513,150 @@ def get_collection(conn, library, name):
 
 
 def get_history(conn, library, name, limit=200):
-    rows = conn.execute("SELECT recorded_at, event, rating_key, ext_id FROM history WHERE library = ? AND name = ? ORDER BY id DESC LIMIT ?", (library, name, limit))
+    rows = conn.execute("SELECT recorded_at, event, rating_key, ext_id, source FROM history WHERE library = ? AND name = ? ORDER BY id DESC LIMIT ?", (library, name, limit))
     return [dict(row) for row in rows]
+
+
+# ── Arrival API (the item run writes, the import trigger drains; S3) ───
+
+
+def record_arrival(conn, library, name, rating_key, ext_id, position=None, now=None):
+    """The arrival handler put ``rating_key`` into collection ``name``: record it as a member, drop
+    its id from wanted and log a member_added event with source=trigger. Idempotent: an item already
+    recorded as a member changes nothing. Returns True when the record changed."""
+    stamp = _stamp(now or datetime.now(timezone.utc))
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        exists = conn.execute("SELECT 1 FROM members WHERE library = ? AND name = ? AND rating_key = ?", (library, name, int(rating_key))).fetchone() is not None
+        dropped = conn.execute("DELETE FROM wanted WHERE library = ? AND name = ? AND ext_id = ?", (library, name, int(ext_id))).rowcount
+        if not exists:
+            conn.execute(
+                "INSERT INTO members (library, name, rating_key, ext_id, position, source, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (library, name, int(rating_key), int(ext_id), position, SOURCE_TRIGGER, stamp),
+            )
+            conn.execute(
+                "INSERT INTO history (library, name, recorded_at, event, rating_key, ext_id, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (library, name, stamp, MEMBER_ADDED, int(rating_key), int(ext_id), SOURCE_TRIGGER),
+            )
+            _trim_history(conn, library, name)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return not exists or bool(dropped)
+
+
+def _merge_attempts(old, new):
+    """A retry no longer sees what an earlier, failed attempt finished (those collections stopped
+    waiting, or it finds the item already a member). Keep the earlier attempt's collections and
+    its "added": the event reports what the trigger did across all attempts."""
+    if "collections" not in new:
+        return new
+    before = {entry["name"]: entry for entry in old.get("collections", [])}
+    merged = []
+    for entry in new.get("collections", []):
+        earlier = before.pop(entry["name"], None)
+        if earlier is not None and earlier.get("added"):
+            entry["added"] = True
+        merged.append(entry)
+    new["collections"] = list(before.values()) + merged
+    return new
+
+
+def queue_arrival(conn, library, rating_key, payload, now=None, complete=True):
+    """Put one kometa.item.arrived event in the outbox. A re-run of an item that is still unpublished
+    replaces its payload (keeping what the earlier attempt added); one that was already published is
+    left alone (no second announcement). ``complete=False`` (a collection failed, the trigger runs the
+    item again) holds the row back from publishing until a later run completes it or
+    release_arrival gives up waiting. Returns True when queued."""
+    stamp = _stamp(now or datetime.now(timezone.utc))
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT payload, published_at FROM arrivals WHERE library = ? AND rating_key = ?", (library, int(rating_key))).fetchone()
+        if row is not None and row["published_at"] is not None:
+            conn.execute("COMMIT")
+            return False
+        since = arrivals_since(conn)
+        added_at = payload.get("added_at")
+        if row is None and since is not None and added_at and datetime.fromisoformat(added_at) < since:
+            # Added before the outbox existed (the first deploy's catch-up): on record, never announced.
+            conn.execute(
+                "INSERT INTO arrivals (library, rating_key, payload, created_at, published_at, complete) VALUES (?, ?, ?, ?, ?, 1)",
+                (library, int(rating_key), json.dumps(payload, sort_keys=True), stamp, stamp),
+            )
+            conn.execute("COMMIT")
+            return False
+        if row is not None:
+            payload = _merge_attempts(json.loads(row["payload"]), payload)
+        conn.execute(
+            "INSERT OR REPLACE INTO arrivals (library, rating_key, payload, created_at, published_at, complete) VALUES (?, ?, ?, ?, NULL, ?)",
+            (library, int(rating_key), json.dumps(payload, sort_keys=True), stamp, 1 if complete else 0),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return True
+
+
+def unpublished_arrivals(conn, limit=100):
+    """Outbox rows ready to publish and not yet acknowledged by JetStream, oldest first: library,
+    rating_key, payload (dict). Rows held back by a failed run are not ready."""
+    rows = conn.execute("SELECT library, rating_key, payload FROM arrivals WHERE published_at IS NULL AND complete = 1 ORDER BY created_at, library, rating_key LIMIT ?", (limit,))
+    return [{"library": row["library"], "rating_key": row["rating_key"], "payload": json.loads(row["payload"]), "raw": row["payload"]} for row in rows]
+
+
+def has_arrival(conn, rating_key):
+    """Whether the outbox has any row (held, queued or published) for this ratingKey."""
+    return conn.execute("SELECT 1 FROM arrivals WHERE rating_key = ? LIMIT 1", (int(rating_key),)).fetchone() is not None
+
+
+def release_arrival(conn, rating_key):
+    """The trigger stopped retrying an item: publish what its last run managed rather than nothing.
+    Plex ratingKeys are unique across a server's libraries. Returns True when a held row was released."""
+    cursor = conn.execute("UPDATE arrivals SET complete = 1 WHERE rating_key = ? AND published_at IS NULL AND complete = 0", (int(rating_key),))
+    return cursor.rowcount > 0
+
+
+def mark_published(conn, library, rating_key, raw=None, now=None):
+    """JetStream acknowledged the row's event: the item is announced. The contract has one
+    Nats-Msg-Id per item (arrived:<library>:<ratingKey>), so a later payload could only ever be
+    dropped as a duplicate or announce the item twice: the row is marked published even when a rerun
+    replaced its payload meanwhile. Returns False when it was replaced (``raw``, the payload text
+    that was sent, no longer matches), so the caller can say the change went unannounced."""
+    stamp = _stamp(now or datetime.now(timezone.utc))
+    row = conn.execute("SELECT payload FROM arrivals WHERE library = ? AND rating_key = ?", (library, int(rating_key))).fetchone()
+    conn.execute("UPDATE arrivals SET published_at = ? WHERE library = ? AND rating_key = ? AND published_at IS NULL", (stamp, library, int(rating_key)))
+    return row is not None and (raw is None or row["payload"] == raw)
+
+
+def queue_build(conn, library, mapping_name, source_file, now=None):
+    """A collection waiting on an arrival does not exist in Plex yet: ask the trigger for a scoped
+    Kometa run of it (the run creates it with its full metadata)."""
+    conn.execute(
+        "INSERT INTO builds (library, mapping_name, source_file, requested_at, attempts) VALUES (?, ?, ?, ?, 0) " "ON CONFLICT (library, mapping_name) DO UPDATE SET source_file = excluded.source_file, requested_at = excluded.requested_at",
+        (library, mapping_name, source_file, _stamp(now or datetime.now(timezone.utc))),
+    )
+
+
+def pending_builds(conn):
+    rows = conn.execute("SELECT library, mapping_name, source_file, attempts FROM builds ORDER BY requested_at, library, mapping_name")
+    return [dict(row) for row in rows]
+
+
+def finish_build(conn, library, mapping_name):
+    conn.execute("DELETE FROM builds WHERE library = ? AND mapping_name = ?", (library, mapping_name))
+
+
+def fail_build(conn, library, mapping_name, max_attempts):
+    """Charge a failed scoped run an attempt; past ``max_attempts`` the request is dropped (the
+    scheduled sweep still builds the collection). Returns True when dropped."""
+    conn.execute("UPDATE builds SET attempts = attempts + 1 WHERE library = ? AND mapping_name = ?", (library, mapping_name))
+    row = conn.execute("SELECT attempts FROM builds WHERE library = ? AND mapping_name = ?", (library, mapping_name)).fetchone()
+    if row is not None and row["attempts"] >= max_attempts:
+        finish_build(conn, library, mapping_name)
+        return True
+    return False
 
 
 # ── Snapshot from a finished CollectionBuilder ─────────────────────────
@@ -552,11 +805,14 @@ class RunRecorder:
         self.failures = 0
         return result
 
-    def record(self, library, metadata, builder, mapping_name, add_ran, sync_ran, sync_ok=True):
-        """Record one collection. ``sync_ok`` is False when a later step of its run failed. Returns True when written."""
+    def record(self, library, metadata, builder, mapping_name, add_ran, sync_ran, sync_ok=True, observed_at=None):
+        """Record one collection. ``sync_ok`` is False when a later step of its run failed; ``observed_at``
+        is when its run started reading Plex (naive = local time). Returns True when written."""
         try:
             snapshot = build_snapshot(builder, library, metadata, add_ran, sync_ran, mapping_name=mapping_name)
             snapshot["sync_ok"] = sync_ok
+            if observed_at is not None:
+                snapshot["observed_at"] = observed_at if observed_at.tzinfo else observed_at.astimezone()
         except Exception as e:
             self.log.stacktrace()
             self.log.error(f"Live Record Error: {mapping_name}: {e}")

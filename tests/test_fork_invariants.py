@@ -56,7 +56,12 @@ MUST_BE_PRESENT = [
     (
         "kometa.py",
         "run_lock_path",
-        "one Kometa run at a time per config dir; item runs step aside for a sweep",
+        "one Kometa run at a time per config dir; item runs wait for a sweep, never run beside it",
+    ),
+    (
+        "modules/arrivals.py",
+        "live_record.queue_arrival(",
+        "every arrival lands in the outbox the trigger publishes as kometa.item.arrived",
     ),
     (
         "modules/logs.py",

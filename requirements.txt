@@ -6,6 +6,8 @@ letterboxdpy==6.5.7
 gitpython==3.1.59
 jsonschema==4.26.0
 lxml==6.1.1
+nats-py==2.16.0
+nkeys==0.2.1
 num2words==0.5.14
 packaging==26.3
 pathvalidate==3.3.1
