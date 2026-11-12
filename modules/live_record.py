@@ -22,8 +22,8 @@ from datetime import datetime, timedelta, timezone
 DB_NAME = "live-collections.db"
 # Bump on any schema change: an older record is dropped and rebuilt (it is derived data; the next
 # sweep repopulates it).
-SCHEMA_VERSION = 4
-TABLES = ("collections", "members", "wanted", "history", "arrivals", "builds", "record_meta")
+SCHEMA_VERSION = 5
+TABLES = ("collections", "members", "wanted", "history", "arrivals", "builds", "record_meta", "watch_seen")
 # What an out-of-date record keeps when it is dropped and rebuilt: the outbox remembers which items
 # were announced, and losing it would announce them all again.
 KEEP_ON_REBUILD = ("arrivals", "record_meta")
@@ -41,6 +41,9 @@ MIGRATIONS = {
     ),
     # v4: the Letterboxd list URLs a live_watch collection is built from (JSON list, NULL = not watched).
     3: ("ALTER TABLE collections ADD COLUMN watch_urls TEXT",),
+    # v5: builds.gen (added in _create when the table predates it; a request made while its run is in flight survives that run) and watch_seen (CREATE IF NOT EXISTS in _create):
+    # the last content hash of each watched list the trigger acted on.
+    4: (),
 }
 # Readers (the arrival handler) can afford to wait; a Kometa run must not stall on a held lock,
 # so its writes use a short timeout and give up for the rest of the run after repeated failures.
@@ -126,11 +129,17 @@ CREATE TABLE IF NOT EXISTS builds (
     source_file TEXT,
     requested_at TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
+    gen INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (library, mapping_name)
 );
 CREATE TABLE IF NOT EXISTS record_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS watch_seen (
+    url TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    seen_at TEXT NOT NULL
 );
 """
 
@@ -221,6 +230,8 @@ def _create(conn):
     for statement in (SCHEMA + SCHEMA_V3).split(";"):
         if statement.strip():
             conn.execute(statement)
+    if "gen" not in _columns(conn, "builds"):
+        conn.execute("ALTER TABLE builds ADD COLUMN gen INTEGER NOT NULL DEFAULT 0")
     conn.execute("INSERT OR IGNORE INTO record_meta (key, value) VALUES (?, ?)", (ARRIVALS_SINCE, _now()))
 
 
@@ -460,6 +471,41 @@ def watched_urls(conn, stale_after=STALE_AFTER, now=None):
     return sorted(urls)
 
 
+def watchers(conn, url, stale_after=STALE_AFTER, now=None):
+    """Every (library, mapping_name, source_file) of a live_watch collection built from this list URL.
+    Same filter as watched_urls: present, synced within ``stale_after``."""
+    cutoff = _stamp((now or datetime.now(timezone.utc)) - stale_after)
+    found = []
+    rows = conn.execute("SELECT library, mapping_name, name, source_file, watch_urls FROM collections WHERE watch_urls IS NOT NULL AND present = 1 AND last_synced >= ? ORDER BY library, name", (cutoff,))
+    for row in rows:
+        if url in json.loads(row["watch_urls"]):
+            found.append({"library": row["library"], "mapping_name": row["mapping_name"] or row["name"], "source_file": row["source_file"]})
+    return found
+
+
+def queue_watch_builds(conn, url, content_hash, now=None, stale_after=STALE_AFTER):
+    """A watched list changed: queue a scoped run of every collection built from it, and remember
+    (url, hash) in the same transaction so a redelivery queues nothing. Returns the collections
+    queued; None when this (url, hash) was already acted on; [] when no collection watches the url."""
+    stamp = _stamp(now or datetime.now(timezone.utc))
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT hash FROM watch_seen WHERE url = ?", (url,)).fetchone()
+        if row is not None and row["hash"] == content_hash:
+            conn.execute("COMMIT")
+            return None
+        found = watchers(conn, url, stale_after=stale_after, now=now)
+        for build in found:
+            queue_build(conn, build["library"], build["mapping_name"], build["source_file"], now=now)
+        if found:
+            conn.execute("INSERT INTO watch_seen (url, hash, seen_at) VALUES (?, ?, ?) ON CONFLICT (url) DO UPDATE SET hash = excluded.hash, seen_at = excluded.seen_at", (url, content_hash, stamp))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return found
+
+
 def find_waiting(conn, id_type, ext_id, include_unknown=False, stale_after=STALE_AFTER, now=None):
     """Every built collection still waiting on this TMDb ('tmdb') or TVDb ('tvdb') id.
 
@@ -649,30 +695,41 @@ def mark_published(conn, library, rating_key, raw=None, now=None):
 
 
 def queue_build(conn, library, mapping_name, source_file, now=None):
-    """A collection waiting on an arrival does not exist in Plex yet: ask the trigger for a scoped
-    Kometa run of it (the run creates it with its full metadata)."""
+    """Ask the trigger for a scoped Kometa run of a collection (it is not in Plex yet and an arrival
+    waits on it, or a list it is built from changed). A request for a collection already queued is a
+    new one: its generation moves on and its failed attempts are forgiven, so a run that was already
+    in flight cannot settle it."""
     conn.execute(
-        "INSERT INTO builds (library, mapping_name, source_file, requested_at, attempts) VALUES (?, ?, ?, ?, 0) " "ON CONFLICT (library, mapping_name) DO UPDATE SET source_file = excluded.source_file, requested_at = excluded.requested_at",
+        "INSERT INTO builds (library, mapping_name, source_file, requested_at, attempts, gen) VALUES (?, ?, ?, ?, 0, 0) "
+        "ON CONFLICT (library, mapping_name) DO UPDATE SET source_file = excluded.source_file, requested_at = excluded.requested_at, attempts = 0, gen = gen + 1",
         (library, mapping_name, source_file, _stamp(now or datetime.now(timezone.utc))),
     )
 
 
 def pending_builds(conn):
-    rows = conn.execute("SELECT library, mapping_name, source_file, attempts FROM builds ORDER BY requested_at, library, mapping_name")
+    rows = conn.execute("SELECT library, mapping_name, source_file, attempts, gen FROM builds ORDER BY requested_at, library, mapping_name")
     return [dict(row) for row in rows]
 
 
-def finish_build(conn, library, mapping_name):
-    conn.execute("DELETE FROM builds WHERE library = ? AND mapping_name = ?", (library, mapping_name))
+def finish_build(conn, library, mapping_name, gen=None):
+    """The run is done. With ``gen`` (from pending_builds), only the request that run served is
+    settled: one queued again meanwhile stays. Returns True when the row was deleted."""
+    if gen is None:
+        return conn.execute("DELETE FROM builds WHERE library = ? AND mapping_name = ?", (library, mapping_name)).rowcount > 0
+    return conn.execute("DELETE FROM builds WHERE library = ? AND mapping_name = ? AND gen = ?", (library, mapping_name, gen)).rowcount > 0
 
 
-def fail_build(conn, library, mapping_name, max_attempts):
+def fail_build(conn, library, mapping_name, max_attempts, gen=None):
     """Charge a failed scoped run an attempt; past ``max_attempts`` the request is dropped (the
-    scheduled sweep still builds the collection). Returns True when dropped."""
-    conn.execute("UPDATE builds SET attempts = attempts + 1 WHERE library = ? AND mapping_name = ?", (library, mapping_name))
-    row = conn.execute("SELECT attempts FROM builds WHERE library = ? AND mapping_name = ?", (library, mapping_name)).fetchone()
+    scheduled sweep still builds the collection). Returns True when dropped. A request queued again
+    while the run was in flight (``gen`` moved on) is a new one and is not charged."""
+    where, args = "library = ? AND mapping_name = ?", [library, mapping_name]
+    if gen is not None:
+        where, args = where + " AND gen = ?", args + [gen]
+    conn.execute(f"UPDATE builds SET attempts = attempts + 1 WHERE {where}", args)  # nosec B608 - fixed clauses
+    row = conn.execute(f"SELECT attempts FROM builds WHERE {where}", args).fetchone()  # nosec B608 - fixed clauses
     if row is not None and row["attempts"] >= max_attempts:
-        finish_build(conn, library, mapping_name)
+        finish_build(conn, library, mapping_name, gen)
         return True
     return False
 

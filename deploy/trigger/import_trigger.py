@@ -44,6 +44,12 @@ What makes it more than a shell-out:
   once JetStream acknowledged it: a NATS outage, or no stream yet, only delays it.
   A waiting collection that is not in Plex yet is queued as a scoped Kometa run
   of that collection, which this process runs after the batch.
+* **Watched lists (#5634 S6).** A Letterboxd list a live_watch collection is built from changes:
+  the bridge publishes letterboxd.watchedlist.updated, this process pulls it from its durable
+  (kometa-trigger-watchedlists) on the same NATS identity and queues a scoped run of just the
+  collections the live record says use that list url, through the same builder as above. The
+  message is acknowledged once the run is in the record's durable builds queue (not after it);
+  (url, hash) is remembered in the same transaction, so a redelivery queues nothing.
 * **One Kometa run at a time.** An item run that finds a sweep holding the run
   lock exits 75; this process waits for the lock to come free and runs it again
   without charging it an attempt.
@@ -94,6 +100,16 @@ NATS_URL = os.environ.get("NATS_URL", "nats://10.43.155.192:4222")
 NATS_CLIENT_NAME = "kometa-trigger"
 NATS_INBOX_PREFIX = "_INBOX_kometa_trigger"
 ARRIVED_SUBJECT = "kometa.item.arrived"
+WATCHED_SUBJECT = "letterboxd.watchedlist.updated"
+# The watched-list durable letterboxd-bridge creates and owns (@ai-app-factory/letterboxd-contract);
+# this identity may only read it: consumer info, pull, ack.
+WATCH_STREAM = "LETTERBOXD"
+WATCH_DURABLE = "kometa-trigger-watchedlists"
+# The consumer's max_deliver: a delivery that fails on its last turn is dropped by the server.
+WATCH_MAX_DELIVER = 4
+# One pull request the server holds open until a message exists or this long passes; an idle
+# expiry just asks again. It is a long poll, not a timer: the server wakes the pull on a message.
+WATCH_PULL_SECONDS = int(os.environ.get("WATCH_PULL_SECONDS", "300"))
 PUBLISH_TIMEOUT_SECONDS = 10
 PUBLISH_RETRY_MIN_SECONDS = 5
 PUBLISH_RETRY_MAX_SECONDS = 300
@@ -997,7 +1013,8 @@ def process_due(
 
 
 def run_build(library: str, mapping_name: str, gate: BuildGate | None = None) -> Any:
-    """A scoped Kometa run of one collection (an arrival is waiting for it and it is not in Plex).
+    """A scoped Kometa run of one collection (an arrival is waiting for it and it is not in Plex, or a
+    list it is built from changed).
     RUN_STOPPED when an arrival came due first (``gate``, GATE by default)."""
     command = [
         "python3",
@@ -1018,7 +1035,7 @@ def run_build(library: str, mapping_name: str, gate: BuildGate | None = None) ->
     if protected:
         log.info("running collection %s in %s to completion: arrivals stopped it %d times, they wait for it this once", mapping_name, library, stops)
     else:
-        log.info("running collection %s in %s for an arrival waiting on it", mapping_name, library)
+        log.info("running collection %s in %s (queued: an arrival is waiting on it, or a watched list changed)", mapping_name, library)
     try:
         result = run_command(command, gate=gate, protected=protected)
     except subprocess.TimeoutExpired:
@@ -1054,9 +1071,9 @@ def run_builds(record_path: str | None = None, run: Callable[[str, str], Any] = 
                 return
             GATE.forget((library, mapping_name))
             if result:
-                live_record.finish_build(conn, library, mapping_name)
+                live_record.finish_build(conn, library, mapping_name, build["gen"])
                 log.info("built %s in %s", mapping_name, library)
-            elif live_record.fail_build(conn, library, mapping_name, BUILD_MAX_ATTEMPTS):
+            elif live_record.fail_build(conn, library, mapping_name, BUILD_MAX_ATTEMPTS, build["gen"]):
                 log.warning("giving up on running %s after %d attempts; the scheduled sweep builds it", mapping_name, BUILD_MAX_ATTEMPTS)
     except Exception as e:
         log.exception("queued collection runs failed: %s", e)
@@ -1151,16 +1168,11 @@ def _refusal(e: BaseException) -> str | None:
     return None
 
 
-class Publisher:
-    """Publishes the live record's arrival outbox to JetStream as kometa.item.arrived.
+class NatsClient:
+    """The kometa-trigger NATS identity's connection handling: a connect with the seed, wake-ups
+    from other threads, a sleep that ends on a wake or a deadline. One asyncio loop per client."""
 
-    Runs its own asyncio loop on a thread. It drains the outbox when woken (after every batch, on
-    every NATS reconnect) and, after a failed publish, again on a backoff. A row is marked published
-    only once JetStream acknowledged it, so a NATS outage or a stream that does not exist yet (the
-    consumer, plex-bot, creates it) only delays an event, never drops it. Each event carries
-    Nats-Msg-Id arrived:<library>:<ratingKey>, so a re-send inside the stream's duplicate window is
-    stored once.
-    """
+    what = "events"
 
     def __init__(self, record_path: str, url: str, seed: str, connect: Callable[..., Any] | None = None):
         self.record_path = record_path
@@ -1173,7 +1185,7 @@ class Publisher:
         self._refused: str | None = None
 
     def wake(self) -> None:
-        """Thread-safe: drain the outbox now."""
+        """Thread-safe: run the client's work now."""
         loop, woken = self.loop, self._woken
         if loop is not None and woken is not None:
             loop.call_soon_threadsafe(woken.set)
@@ -1184,7 +1196,7 @@ class Publisher:
             self._woken.set()
 
     async def _on_disconnect(self) -> None:
-        log.warning("NATS disconnected; arrival events wait in the outbox")
+        log.warning("NATS disconnected; %s wait", self.what)
 
     async def _on_error(self, e: Exception) -> None:
         refused = _refusal(e)
@@ -1222,6 +1234,58 @@ class Publisher:
         except asyncio.TimeoutError:
             pass
         woken.clear()
+
+    async def _connect_forever(self, stop: threading.Event | None) -> bool:
+        """Connect, retrying on a backoff. False when ``stop`` ended it first."""
+        self.loop = asyncio.get_running_loop()
+        self._woken = asyncio.Event()
+        delay = PUBLISH_RETRY_MIN_SECONDS
+        while self.nc is None:
+            try:
+                self.nc = await self._open()
+            except Exception as e:
+                # The type only: the client's errors are not worth risking next to a seed.
+                log.log(logging.ERROR if _refusal(e) else logging.WARNING, "NATS connect to %s failed (%s); retrying in %ds", self.url, type(e).__name__, delay)
+                await self._sleep(delay)
+                delay = min(delay * 2, PUBLISH_RETRY_MAX_SECONDS)
+            if stop is not None and stop.is_set():
+                return False
+        log.info("connected to NATS at %s as %s", self.url, NATS_CLIENT_NAME)
+        return True
+
+    async def _close(self) -> None:
+        # A crash restarts main() on a new loop with a new connection: close this one.
+        try:
+            await self.nc.close()
+        except Exception as e:
+            log.warning("closing the NATS connection failed: %s", type(e).__name__)
+
+    async def main(self, stop: threading.Event | None = None) -> None:
+        raise NotImplementedError
+
+    def run_forever(self) -> None:
+        while True:
+            try:
+                asyncio.run(self.main())
+            except Exception as e:
+                log.exception("%s crashed, restarting: %s", type(self).__name__, e)
+            self.loop = None
+            self.nc = None
+            time.sleep(PUBLISH_RETRY_MIN_SECONDS)
+
+
+class Publisher(NatsClient):
+    """Publishes the live record's arrival outbox to JetStream as kometa.item.arrived.
+
+    Runs its own asyncio loop on a thread. It drains the outbox when woken (after every batch, on
+    every NATS reconnect) and, after a failed publish, again on a backoff. A row is marked published
+    only once JetStream acknowledged it, so a NATS outage or a stream that does not exist yet (the
+    consumer, plex-bot, creates it) only delays an event, never drops it. Each event carries
+    Nats-Msg-Id arrived:<library>:<ratingKey>, so a re-send inside the stream's duplicate window is
+    stored once.
+    """
+
+    what = "arrival events wait in the outbox"
 
     async def drain(self, js: Any) -> str:
         """Publish every unpublished arrival, oldest first. DRAIN_EMPTY when the outbox is empty;
@@ -1268,20 +1332,8 @@ class Publisher:
             conn.close()
 
     async def main(self, stop: threading.Event | None = None) -> None:
-        self.loop = asyncio.get_running_loop()
-        self._woken = asyncio.Event()
-        delay = PUBLISH_RETRY_MIN_SECONDS
-        while self.nc is None:
-            try:
-                self.nc = await self._open()
-            except Exception as e:
-                # The type only: the client's errors are not worth risking next to a seed.
-                log.log(logging.ERROR if _refusal(e) else logging.WARNING, "NATS connect to %s failed (%s); retrying in %ds", self.url, type(e).__name__, delay)
-                await self._sleep(delay)
-                delay = min(delay * 2, PUBLISH_RETRY_MAX_SECONDS)
-            if stop is not None and stop.is_set():
-                return
-        log.info("connected to NATS at %s as %s", self.url, NATS_CLIENT_NAME)
+        if not await self._connect_forever(stop):
+            return
         try:
             js = self.nc.jetstream()
             delay = PUBLISH_RETRY_MIN_SECONDS
@@ -1295,32 +1347,145 @@ class Publisher:
                     delay = PUBLISH_RETRY_MIN_SECONDS
                     await self._sleep(None)
         finally:
-            # A crash restarts main() on a new loop with a new connection: close this one.
+            await self._close()
+
+
+# queue_watched_list() results.
+WATCH_QUEUED = "queued"
+WATCH_DUPLICATE = "duplicate"
+WATCH_UNKNOWN = "unknown"
+WATCH_POISON = "poison"
+
+
+def queue_watched_list(body: bytes, record_path: str | None = None) -> str:
+    """Queue a scoped run of every collection built from the list a letterboxd.watchedlist.updated
+    event names. One short transaction in the live record that also remembers (url, hash), so the
+    same event again queues nothing. Raises only when the record cannot be written (the message is
+    then left for redelivery)."""
+    try:
+        event = json.loads(body)
+        url, content_hash = event["url"], event["hash"]
+        if not (isinstance(url, str) and url and isinstance(content_hash, str) and content_hash):
+            raise ValueError("url and hash must be non-empty strings")
+    except (ValueError, KeyError, TypeError) as e:
+        log.error("dropping an unreadable %s event (%s): %d bytes", WATCHED_SUBJECT, type(e).__name__, len(body or b""))
+        return WATCH_POISON
+    conn = live_record.connect(record_path or RECORD_PATH, check_same_thread=False)
+    try:
+        queued = live_record.queue_watch_builds(conn, url, content_hash)
+    finally:
+        conn.close()
+    if queued is None:
+        log.info("watched list %s (%s) was already handled; nothing to run", url, content_hash[:12])
+        return WATCH_DUPLICATE
+    if not queued:
+        log.warning("watched list %s changed but no live_watch collection is built from it; nothing to run", url)
+        return WATCH_UNKNOWN
+    log.info("watched list %s changed (%s): queued %s", url, content_hash[:12], ", ".join(f"{b['mapping_name']} in {b['library']}" for b in queued))
+    return WATCH_QUEUED
+
+
+class WatchConsumer(NatsClient):
+    """Consumes letterboxd.watchedlist.updated from the bridge's durable and queues the scoped runs.
+
+    Pulls with a long request the server answers the moment a message exists. A message is
+    acknowledged only after queue_watched_list returned (the run is in the record's durable builds
+    queue); a record that cannot be written leaves it unacknowledged for the durable's backoff
+    redelivery. An unreadable one is terminated (redelivery cannot fix it). The durable is the
+    bridge's to create: until it exists the first pull fails (no responders) and this binds again on a
+    backoff and says so.
+    """
+
+    what = "watched-list events wait on the durable"
+
+    def __init__(self, record_path: str, url: str, seed: str, on_queued: Callable[[], None], connect: Callable[..., Any] | None = None):
+        super().__init__(record_path, url, seed, connect)
+        self.on_queued = on_queued
+        # A pull answered (even with nothing to deliver) since the last rebind: the backoff starts over.
+        self.pulled = False
+
+    async def handle(self, msg: Any) -> None:
+        try:
+            outcome = await asyncio.to_thread(queue_watched_list, msg.data, self.record_path)
+        except Exception as e:
             try:
-                await self.nc.close()
-            except Exception as e:
-                log.warning("closing the NATS connection failed: %s", type(e).__name__)
+                delivered = msg.metadata.num_delivered
+            except Exception:
+                delivered = 0
+            last = delivered >= WATCH_MAX_DELIVER
+            log.log(logging.ERROR if last else logging.WARNING, "could not queue a watched-list event (delivery %d of %d%s): %s: %s", delivered, WATCH_MAX_DELIVER, ", the last: it is dropped" if last else "; redelivered on a backoff", type(e).__name__, e)
+            return
+        if outcome == WATCH_POISON:
+            await msg.term()
+            return
+        await msg.ack()
+        if outcome == WATCH_QUEUED:
+            self.on_queued()
 
-    def run_forever(self) -> None:
-        while True:
+    async def consume(self, sub: Any, stop: threading.Event | None) -> None:
+        while stop is None or not stop.is_set():
             try:
-                asyncio.run(self.main())
+                msgs = await sub.fetch(1, timeout=WATCH_PULL_SECONDS)
             except Exception as e:
-                log.exception("arrival publisher crashed, restarting: %s", e)
-            self.loop = None
-            self.nc = None
-            time.sleep(PUBLISH_RETRY_MIN_SECONDS)
+                if type(e).__name__ in TIMEOUT_ERRORS or isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+                    continue  # the pull expired with nothing to deliver: ask again
+                raise
+            self.pulled = True
+            for msg in msgs:
+                await self.handle(msg)
+
+    async def main(self, stop: threading.Event | None = None) -> None:
+        if not await self._connect_forever(stop):
+            return
+        try:
+            js = self.nc.jetstream()
+            delay = PUBLISH_RETRY_MIN_SECONDS
+            while stop is None or not stop.is_set():
+                sub = None
+                try:
+                    sub = await js.pull_subscribe_bind(WATCH_DURABLE, stream=WATCH_STREAM)
+                    await self.consume(sub, stop)
+                except Exception as e:
+                    # The durable not existing yet (the bridge creates it), NATS down, a refusal: bind again.
+                    level = logging.WARNING if type(e).__name__ in NOT_YET_ERRORS or type(e).__name__ in TIMEOUT_ERRORS else logging.ERROR
+                    log.log(level, "watched-list consumer %s on %s is not pulling (%s: %s); binding again in %ds", WATCH_DURABLE, WATCH_STREAM, type(e).__name__, e, delay)
+                    if sub is not None:
+                        try:
+                            await sub.unsubscribe()  # a bind makes a new inbox subscription: drop this one
+                        except Exception as unsub_error:
+                            log.warning("could not drop the old pull subscription: %s", type(unsub_error).__name__)
+                    if self.pulled:
+                        delay, self.pulled = PUBLISH_RETRY_MIN_SECONDS, False
+                    await self._sleep(delay)
+                    delay = min(delay * 2, PUBLISH_RETRY_MAX_SECONDS)
+        finally:
+            await self._close()
 
 
-def start_publisher() -> Publisher | None:
+def take_seed() -> str:
+    """The NATS seed, removed from the environment so no Kometa run inherits it."""
+    return os.environ.pop("NATS_NKEY_SEED", "").strip()
+
+
+def start_publisher(seed: str | None = None) -> Publisher | None:
     """Start the outbox publisher. Without a seed, say so loudly: events stay in the outbox."""
-    seed = os.environ.pop("NATS_NKEY_SEED", "").strip()
+    seed = take_seed() if seed is None else seed
     if not seed:
         log.error("NATS_NKEY_SEED is not set: kometa.item.arrived events stay in the outbox (%s) until it is", RECORD_PATH)
         return None
     publisher = Publisher(RECORD_PATH, NATS_URL, seed)
     threading.Thread(target=publisher.run_forever, daemon=True, name="arrival-publisher").start()
     return publisher
+
+
+def start_watch_consumer(seed: str, on_queued: Callable[[], None]) -> WatchConsumer | None:
+    """Start the watched-list consumer. Without a seed, say so loudly: watched lists are not rebuilt on change."""
+    if not seed:
+        log.error("NATS_NKEY_SEED is not set: %s events are not consumed, so a changed watched list is not rebuilt until the scheduled sweep", WATCHED_SUBJECT)
+        return None
+    consumer = WatchConsumer(RECORD_PATH, NATS_URL, seed, on_queued)
+    threading.Thread(target=consumer.run_forever, daemon=True, name="watchedlist-consumer").start()
+    return consumer
 
 
 def assert_run_items_supported() -> None:
@@ -1346,8 +1511,10 @@ def main() -> None:
     logging.getLogger("websocket").setLevel(logging.WARNING)
     assert_run_items_supported()
     pending = Pending(QUEUE_PATH)
-    publisher = start_publisher()
+    seed = take_seed()
+    publisher = start_publisher(seed)
     start_builder(GATE)
+    start_watch_consumer(seed, GATE.woken.set)
 
     def after_batch() -> None:
         # The builder is woken when the worker goes idle; a batch that comes due stops its run.

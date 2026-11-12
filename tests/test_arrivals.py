@@ -75,6 +75,8 @@ def quiet(monkeypatch):
 @pytest.fixture
 def db(tmp_path):
     conn = live_record.connect(live_record.db_path(str(tmp_path)))
+    # The record stamps "announcing starts now" from the real clock; these tests live at the fixed NOW above.
+    conn.execute("UPDATE record_meta SET value = ? WHERE key = ?", ("2000-01-01T00:00:00+00:00", live_record.ARRIVALS_SINCE))
     yield conn
     conn.close()
 
@@ -335,7 +337,7 @@ class TestAbsent:
         record(db, name="Picks", wanted=[(511, False, None)], present=present)
         assert arrivals.handle_item(db, plex, 11, now=NOW) is True
         assert plex.adds == []
-        assert live_record.pending_builds(db) == [{"library": "movies-config-key", "mapping_name": "Picks", "source_file": "picks", "attempts": 0}]
+        assert live_record.pending_builds(db) == [{"library": "movies-config-key", "mapping_name": "Picks", "source_file": "picks", "attempts": 0, "gen": 0}]
         # The item is not in that collection yet, so the event does not list it.
         assert outbox(db)[0]["payload"]["collections"] == []
 
