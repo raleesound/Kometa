@@ -1,0 +1,16 @@
+# Cinema Gremlins charts: house collections, ranked by Gizmo from the
+# Gremlins' Letterboxd ratings. How to add one: the gremlin-charts skill
+# (.agent/skills/gremlin-charts.md in the monorepo). Sort titles
+# "!020_LB_!NN_<slug>" put these ahead of every other Letterboxd chart.
+# live_watch / acquire (#5634 S6, S9b) are added here only once live.
+# Posters are host-local like every movies/assets PNG (deploy.sh syncs YAML
+# only): file_poster PNGs are copied to CONFIG_DIR/movies/assets/ by hand.
+collections:
+  "The Cinema Gremlins' Top 100":
+    letterboxd_list: https://letterboxd.com/thisnames2long/list/the-cinema-gremlins-top-100/
+    sort_title: "!020_LB_!01_the_cinema_gremlins_top_100"
+    collection_order: custom
+    summary: "The films the Cinema Gremlins love most, from every star each of us has given on Letterboxd.\n\nHow it's ranked: a film needs at least three Gremlins' ratings to place. Its score starts from our average, pulled toward the group's overall average as if it had five more ratings, so a couple of perfect scores can't carry it. Then it gives up 0.3 for every tenfold its Letterboxd audience grows past 50,000 ratings.\n\nWhy: ranked on our stars alone, this came out as every other top 100, the classics everyone has seen and everyone loves. The popularity weight makes room for the films we love more than the rest of Letterboxd does, without letting a film three of us found…"
+    file_poster: config/movies/assets/gremlin-the-cinema-gremlins-top-100.png
+    sync_mode: sync
+    radarr_add_missing: true
