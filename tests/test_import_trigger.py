@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import threading
 import time
@@ -21,8 +22,13 @@ from plexapi.exceptions import NotFound
 TRIGGER_PATH = Path(__file__).resolve().parent.parent / "deploy" / "trigger" / "import_trigger.py"
 
 
+KOMETA_CONFIG = "plex:\n  url: http://plex:32400\n  token: t\nlibraries:\n  Movies:\n    operations: {}\n  TV Shows:\n"
+
+
 @pytest.fixture
-def trig(monkeypatch):
+def trig(monkeypatch, tmp_path):
+    config = tmp_path / "config.yml"
+    config.write_text(KOMETA_CONFIG)
     spec = importlib.util.spec_from_file_location("import_trigger_under_test", TRIGGER_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -30,6 +36,7 @@ def trig(monkeypatch):
     monkeypatch.setattr(module, "RETRY_SECONDS", 150)
     monkeypatch.setattr(module, "NEW_ITEM_WINDOW_SECONDS", 6 * 3600)
     monkeypatch.setattr(module, "MAX_CATCH_UP_SECONDS", 7 * 86400)
+    monkeypatch.setattr(module, "CONFIG_PATH", str(config))
     return module
 
 
@@ -97,6 +104,44 @@ class FakeServer:
 
 
 # ── the new-item filter ──────────────────────────────────────────────────────
+
+
+class TestManagedLibraries:
+    def test_reads_library_keys_and_library_name(self, trig):
+        Path(trig.CONFIG_PATH).write_text("libraries:\n  Movies:\n  Shows:\n    library_name: TV Shows\n")
+        assert trig.managed_libraries() == {"Movies", "TV Shows"}
+
+    def test_unmanaged_library_is_never_queued(self, trig, pending):
+        # Live 11-12: a film in "Involuntary Film Club" produced a Kometa run
+        # that matched no library, exited 0 and was logged as finished.
+        assert trig.consider(pending, "Involuntary Film Club", movie(10)) is None
+        assert pending.items == {}
+        assert trig.consider(pending, "Movies", movie(11)) == "11"
+
+    def test_sweep_skips_unmanaged_sections(self, trig, pending):
+        ifc = FakeSection(4, "Involuntary Film Club", "movie", [movie(10)])
+        movies = FakeSection(2, "Movies", "movie", [movie(11)])
+        assert trig.catch_up(FakeServer(sections=[ifc, movies]), pending, now=NOW) == 1
+        assert ifc.searches == [] and pending.items == {"Movies": {"11": 0}}
+
+    def test_config_change_is_picked_up(self, trig, pending):
+        assert trig.consider(pending, "Anime", movie(10)) is None
+        path = Path(trig.CONFIG_PATH)
+        path.write_text(KOMETA_CONFIG + "  Anime:\n")
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+        assert trig.consider(pending, "Anime", movie(10)) == "10"
+
+    @pytest.mark.parametrize("text", ["{not yaml: [", "- a list\n"])
+    def test_unreadable_config_queues_everything_loudly(self, trig, pending, caplog, text):
+        Path(trig.CONFIG_PATH).write_text(text)
+        assert trig.consider(pending, "Involuntary Film Club", movie(10)) == "10"
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+
+    def test_missing_config_queues_everything_loudly(self, trig, pending, caplog):
+        Path(trig.CONFIG_PATH).unlink()
+        assert trig.consider(pending, "Involuntary Film Club", movie(10)) == "10"
+        assert any(r.levelname == "ERROR" for r in caplog.records)
 
 
 class TestProcessedEntries:
@@ -283,6 +328,7 @@ class TestHandleNotification:
 
     def test_library_comes_from_the_item_first(self, trig, pending):
         # A library created after connect is missing from the cached section map.
+        Path(trig.CONFIG_PATH).write_text(KOMETA_CONFIG + "  New Library:\n")
         film = movie(10)
         film.librarySectionTitle = "New Library"
         server = FakeServer(sections=[], items=[film])

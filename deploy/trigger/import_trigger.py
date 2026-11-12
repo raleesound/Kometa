@@ -278,6 +278,35 @@ def load_plex() -> tuple[str, str]:
     return plex["url"].rstrip("/"), plex["token"]
 
 
+_managed: tuple[float, frozenset[str] | None] = (-1.0, None)
+
+
+def managed_libraries() -> frozenset[str] | None:
+    """The Plex libraries Kometa runs on: the ``libraries`` keys of config.yml,
+    or their ``library_name``. Re-read when the file changes. None when the
+    config cannot be read, so the trigger then queues every library rather
+    than none."""
+    global _managed
+    try:
+        mtime = os.stat(CONFIG_PATH).st_mtime
+        if mtime == _managed[0]:
+            return _managed[1]
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            libraries = (yaml.safe_load(fh) or {}).get("libraries") or {}
+        names = frozenset(str((attrs.get("library_name") if isinstance(attrs, dict) else None) or name) for name, attrs in libraries.items())
+    except (OSError, yaml.YAMLError, AttributeError, TypeError) as e:
+        log.error("cannot read the Kometa libraries from %s (%s); queueing arrivals from every library", CONFIG_PATH, e)
+        return None
+    _managed = (mtime, names)
+    log.info("Kometa libraries: %s", ", ".join(sorted(names)) or "none")
+    return names
+
+
+def is_managed(library: str) -> bool:
+    managed = managed_libraries()
+    return managed is None or library in managed
+
+
 def connect_plex() -> Any:
     from plexapi.server import PlexServer
 
@@ -316,6 +345,10 @@ def consider(pending: Pending, library: str, item: Any, now: float | None = None
     """Queue an item if it is a new import. Returns the queued key, or None."""
     added_at = epoch(getattr(item, "addedAt", None))
     if added_at is None or not library:
+        return None
+    # Kometa would run on nothing for another library, exit 0, and look done.
+    if not is_managed(library):
+        log.debug("ignoring %s: %s is not a Kometa library", item.ratingKey, library)
         return None
     key = target_key(item)
     if not key or not pending.admit(library, str(item.ratingKey), key, added_at, now=now):
@@ -412,7 +445,7 @@ def catch_up(server: Any, pending: Pending, now: float | None = None) -> int:
     queued = 0
     for section in server.library.sections():
         libtype = SECTION_LIBTYPES.get(section.type)
-        if not libtype:
+        if not libtype or not is_managed(section.title):
             continue
         for item in section.search(libtype=libtype, filters={"addedAt>>": since}):
             if consider(pending, section.title, item, now=now):
