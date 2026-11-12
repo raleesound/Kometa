@@ -40,11 +40,12 @@ def _read_collection(library, name):
 
 
 def _stamp(moment):
+    """ISO 8601 UTC with a Z suffix, whole seconds: the contract's datetime format."""
     if moment is None:
         return None
     if moment.tzinfo is None:
         moment = moment.astimezone()
-    return moment.astimezone(timezone.utc).isoformat()
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _predecessor(order, rating_key, key_map, recorded, position):
@@ -92,9 +93,13 @@ def _slot(conn, library, name, item, rating_key, position):
 
 
 def _add_to(conn, library, item, rating_key, ext_id, waiting, now):
-    """Put the item into one waiting collection. Returns the payload entry for it."""
+    """Put the item into one waiting collection. Returns its payload entry (the kometa-contract
+    arrivedCollectionSchema), or None when the collection is not in Plex and a run of it was queued
+    instead: the event lists only collections the item belongs to now."""
     name = waiting["name"]
-    entry = {"name": name, "mapping_name": waiting["mapping_name"], "source_file": waiting["source_file"], "position": waiting["position"], "added": False, "slotted": None, "queued_build": False}
+    custom = live_record._is_custom_order(waiting["collection_order"]) and waiting["position"] is not None
+    # The record counts from 0; the event's position is 1-based and only set for a custom order.
+    entry = {"name": name, "mapping_name": waiting["mapping_name"], "source_file": waiting["source_file"], "added": False, "position": waiting["position"] + 1 if custom else None, "slotted": False}
     collection = None
     order = []
     if waiting["present"]:
@@ -107,8 +112,7 @@ def _add_to(conn, library, item, rating_key, ext_id, waiting, now):
         # Adding the tag would make a bare collection without its metadata, so ask for a scoped run.
         live_record.queue_build(conn, library.original_mapping_name, waiting["mapping_name"], waiting["source_file"], now=now)
         logger.info(f"Arrival: {name} is waiting for {util.item_title(item)} but is not in Plex; queued a run of it")
-        entry["queued_build"] = True
-        return entry
+        return None
 
     if rating_key not in {int(member.ratingKey) for member in order}:
         library.alter_collection([item], name)
@@ -118,13 +122,11 @@ def _add_to(conn, library, item, rating_key, ext_id, waiting, now):
         entry["added"] = True
         logger.info(f"Arrival: added {util.item_title(item)} to {name}")
 
-    custom = live_record._is_custom_order(waiting["collection_order"])
-    if custom and waiting["position"] is not None:
+    if custom:
         if int(collection.collectionSort) == CUSTOM_SORT:
             entry["slotted"] = _slot(conn, library, name, item, rating_key, waiting["position"])
         else:
             logger.warning(f"Arrival: {name} is recorded as custom-ordered but Plex sorts it by {collection.collectionSort}; not moving {util.item_title(item)}")
-            entry["slotted"] = False
 
     live_record.record_arrival(conn, library.name, name, rating_key, ext_id, position=waiting["position"], now=now)
     return entry
@@ -136,18 +138,21 @@ def handle_item(conn, library, rating_key, now=None):
     moment = now or datetime.now(timezone.utc)
     tmdb_id, tvdb_id, imdb_id = _ext_ids(library, rating_key)
     ext_id = tmdb_id if library.is_movie else tvdb_id
-    if ext_id is None:
-        logger.info(f"Arrival: {rating_key} has no {'TMDb' if library.is_movie else 'TVDb'} id in {library.name}; nothing is waiting for it")
+    if ext_id is None and imdb_id is None:
+        logger.info(f"Arrival: {rating_key} has no TMDb, TVDb or IMDb id in {library.name}; not announcing it")
         return True
     item = library.fetch_item(rating_key)
     id_type = "tmdb" if library.is_movie else "tvdb"
     ok = True
     collections = []
-    for waiting in live_record.find_waiting(conn, id_type, ext_id, include_unknown=True, now=moment):
+    waiting_for = live_record.find_waiting(conn, id_type, ext_id, include_unknown=True, now=moment) if ext_id is not None else []
+    for waiting in waiting_for:
         if waiting["library"] != library.name:
             continue
         try:
-            collections.append(_add_to(conn, library, item, rating_key, ext_id, waiting, moment))
+            entry = _add_to(conn, library, item, rating_key, ext_id, waiting, moment)
+            if entry is not None:
+                collections.append(entry)
         except Exception as e:
             ok = False
             logger.stacktrace()
@@ -157,14 +162,14 @@ def handle_item(conn, library, rating_key, now=None):
     payload = {
         "v": PAYLOAD_VERSION,
         "library": library.name,
-        "rating_key": rating_key,
+        "rating_key": str(rating_key),
         "media_type": "movie" if library.is_movie else "show",
         "tmdb_id": tmdb_id,
         "tvdb_id": tvdb_id,
         "imdb_id": imdb_id,
-        "title": item.title,
+        "title": item.title or str(rating_key),
         "year": getattr(item, "year", None),
-        "added_at": _stamp(getattr(item, "addedAt", None)),
+        "added_at": _stamp(getattr(item, "addedAt", None) or moment),
         "arrived_at": _stamp(moment),
         "collections": collections,
     }

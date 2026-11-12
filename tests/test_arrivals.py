@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -130,9 +133,10 @@ class TestAdd:
         assert payload["v"] == arrivals.PAYLOAD_VERSION == 1
         assert (payload["media_type"], payload["tmdb_id"], payload["tvdb_id"], payload["imdb_id"]) == ("movie", 511, None, "tt0000511")
         assert payload["title"] == "Item 11" and payload["year"] == 2011
-        assert payload["arrived_at"] == NOW.isoformat()
-        assert payload["added_at"] == (NOW - timedelta(minutes=5)).isoformat()
-        assert payload["collections"] == [{"name": "Picks", "mapping_name": "Picks", "source_file": "picks", "position": None, "added": True, "slotted": None, "queued_build": False}]
+        assert payload["rating_key"] == "11"
+        assert payload["arrived_at"] == "2026-11-12T18:00:00Z"
+        assert payload["added_at"] == "2026-11-12T17:55:00Z"
+        assert payload["collections"] == [{"name": "Picks", "mapping_name": "Picks", "source_file": "picks", "added": True, "position": None, "slotted": False}]
 
     def test_every_waiting_collection_gets_it(self, db):
         plex = FakePlex(ext_ids={11: 511}, collections={"A": {"sort": 0, "keys": []}, "B": {"sort": 0, "keys": []}})
@@ -174,7 +178,15 @@ class TestNothingWaiting:
         [row] = outbox(db)
         assert row["payload"]["collections"] == []
 
-    def test_an_item_with_no_tmdb_id_is_left_alone(self, db):
+    def test_an_item_with_only_an_imdb_id_is_announced_with_no_collections(self, db):
+        plex = FakePlex(ext_ids={}, imdb_ids={11: "tt0000511"}, collections={"Picks": {"sort": 0, "keys": []}})
+        record(db, wanted=[(511, False, None)])
+        assert arrivals.handle_item(db, plex, 11, now=NOW) is True
+        assert plex.adds == []
+        [row] = outbox(db)
+        assert (row["payload"]["tmdb_id"], row["payload"]["imdb_id"], row["payload"]["collections"]) == (None, "tt0000511", [])
+
+    def test_an_item_with_no_id_at_all_is_left_alone(self, db):
         plex = FakePlex(ext_ids={}, collections={"Picks": {"sort": 0, "keys": []}})
         record(db, wanted=[(511, False, None)])
         assert arrivals.handle_item(db, plex, 11, now=NOW) is True
@@ -218,7 +230,8 @@ class TestSlot:
         assert plex.collections["Top"]["keys"] == [1, 2, 11, 3]
         assert plex.moves == [("Top", 11, 2)]
         entry = outbox(db)[0]["payload"]["collections"][0]
-        assert entry["added"] is True and entry["slotted"] is True and entry["position"] == 2
+        # The record counts from 0, the event from 1.
+        assert entry["added"] is True and entry["slotted"] is True and entry["position"] == 3
         assert {m["rating_key"]: m["position"] for m in live_record.get_members(db, "Movies", "Top")}[11] == 2
 
     def test_position_zero_goes_to_the_start(self, db):
@@ -240,7 +253,8 @@ class TestSlot:
         record(db, name="Picks", members=[(1, 501, None)], wanted=[(511, False, None)], order=None)
         arrivals.handle_item(db, plex, 11, now=NOW)
         assert plex.moves == []
-        assert outbox(db)[0]["payload"]["collections"][0]["slotted"] is None
+        entry = outbox(db)[0]["payload"]["collections"][0]
+        assert entry["slotted"] is False and entry["position"] is None
 
     def test_plex_not_in_custom_order_is_not_moved_even_if_the_record_says_custom(self, db):
         plex = FakePlex(ext_ids={1: 501, 11: 511}, collections={"Top": {"sort": 1, "keys": [1]}})
@@ -302,7 +316,8 @@ class TestAbsent:
         assert arrivals.handle_item(db, plex, 11, now=NOW) is True
         assert plex.adds == []
         assert live_record.pending_builds(db) == [{"library": "movies-config-key", "mapping_name": "Picks", "source_file": "picks", "attempts": 0}]
-        assert outbox(db)[0]["payload"]["collections"][0]["queued_build"] is True
+        # The item is not in that collection yet, so the event does not list it.
+        assert outbox(db)[0]["payload"]["collections"] == []
 
 
 # ── the run ───────────────────────────────────────────────────────────
@@ -361,3 +376,62 @@ class TestStaleSnapshot:
         record(db, members=[(1, 501, None), (11, 511, None)], wanted=[], observed_at=NOW + timedelta(hours=1))
         sources = {r["rating_key"]: r["source"] for r in db.execute("SELECT rating_key, source FROM members WHERE name = 'Picks'")}
         assert sources == {1: live_record.SOURCE_RUN, 11: live_record.SOURCE_RUN}
+
+
+# ── the wire contract (kometa-contract item-arrived fixtures, #5634 S3n) ──
+
+FIXTURES = Path(__file__).parent / "fixtures" / "kometa_contract"
+ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
+
+
+def _shape(value):
+    """Keys and JSON types, recursively: what the strict zod schema checks besides value ranges."""
+    if isinstance(value, dict):
+        return {key: _shape(inner) for key, inner in value.items()}
+    if isinstance(value, list):
+        return [_shape(value[0])] if value else []
+    return type(value).__name__
+
+
+def _fixture(name):
+    return json.loads((FIXTURES / name).read_text())
+
+
+def _check_values(payload):
+    assert payload["v"] == 1
+    assert re.fullmatch(r"\d+", payload["rating_key"])
+    assert payload["media_type"] in ("movie", "show")
+    assert ISO_UTC.match(payload["added_at"]) and ISO_UTC.match(payload["arrived_at"])
+    assert payload["imdb_id"] is None or re.fullmatch(r"tt\d+", payload["imdb_id"])
+    assert any(payload[key] is not None for key in ("tmdb_id", "tvdb_id", "imdb_id"))
+    for entry in payload["collections"]:
+        assert isinstance(entry["added"], bool) and isinstance(entry["slotted"], bool)
+        assert entry["position"] is None or (isinstance(entry["position"], int) and entry["position"] >= 1)
+
+
+class TestContract:
+    def test_a_movie_event_matches_the_fixture(self, db):
+        # One collection the film was added to and slotted in, one it was already in (not custom).
+        fixture = _fixture("item-arrived.json")
+        plex = FakePlex(ext_ids={1: 501, 11: 9426}, imdb_ids={11: "tt0091064"}, collections={"Body Horror": {"sort": arrivals.CUSTOM_SORT, "keys": [1]}, "Cronenberg": {"sort": 0, "keys": [11]}})
+        record(db, name="Body Horror", members=[(1, 501, 0)], wanted=[(9426, False, 6)], order="custom.asc")
+        record(db, name="Cronenberg", wanted=[(9426, False, None)])
+        arrivals.handle_item(db, plex, 11, now=NOW)
+        payload = outbox(db)[0]["payload"]
+        payload = json.loads(json.dumps(payload))  # the wire form
+        _check_values(payload)
+        assert _shape(payload) == _shape(fixture)
+        assert [(c["added"], c["position"], c["slotted"]) for c in payload["collections"]] == [(c["added"], c["position"], c["slotted"]) for c in fixture["collections"]]
+
+    def test_a_plain_show_event_matches_the_fixture(self, db):
+        fixture = _fixture("item-arrived-plain.json")
+        plex = FakePlex(is_movie=False, ext_ids={40: 81189}, collections={})
+        arrivals.handle_item(db, plex, 40, now=NOW)
+        payload = json.loads(json.dumps(outbox(db)[0]["payload"]))
+        _check_values(payload)
+        assert _shape(payload) == _shape(fixture)
+        assert payload["collections"] == [] and payload["imdb_id"] is None and payload["tmdb_id"] is None
+
+    @pytest.mark.parametrize("name", ["item-arrived.json", "item-arrived-plain.json"])
+    def test_the_fixtures_pass_the_value_checks(self, name):
+        _check_values(_fixture(name))

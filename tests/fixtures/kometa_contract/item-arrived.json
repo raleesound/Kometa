@@ -1,0 +1,31 @@
+{
+  "v": 1,
+  "library": "Movies",
+  "rating_key": "48213",
+  "media_type": "movie",
+  "tmdb_id": 9426,
+  "tvdb_id": null,
+  "imdb_id": "tt0091064",
+  "title": "The Fly",
+  "year": 1986,
+  "added_at": "2026-11-12T14:02:11Z",
+  "arrived_at": "2026-11-12T14:03:40Z",
+  "collections": [
+    {
+      "name": "Body Horror",
+      "mapping_name": "Body Horror",
+      "source_file": "collections/letterboxd-lists.yml",
+      "added": true,
+      "position": 7,
+      "slotted": true
+    },
+    {
+      "name": "Cronenberg",
+      "mapping_name": "David Cronenberg",
+      "source_file": "collections/directors.yml",
+      "added": false,
+      "position": null,
+      "slotted": false
+    }
+  ]
+}
