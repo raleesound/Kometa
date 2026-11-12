@@ -1,0 +1,158 @@
+# build_collection: false entries — these exist purely to push missing
+# films into Radarr and do NOT render as Plex collection shelves.
+collections:
+  All MCU:
+    letterboxd_list: https://letterboxd.com/filmflora/list/all-mcu-movies-in-order-of-the-release-date/
+    radarr_add_missing: true
+    sonarr_add_missing: true
+    build_collection: false
+
+  Letterboxd top 250:
+    letterboxd_list: https://letterboxd.com/dave/list/official-top-250-narrative-feature-films/
+    radarr_add_missing: true
+    build_collection: false
+
+  Letterboxd top 250 most fans:
+    letterboxd_list: https://letterboxd.com/jack/list/official-top-250-films-with-the-most-fans/
+    radarr_add_missing: true
+    build_collection: false
+
+  Letterboxd top 250 women:
+    letterboxd_list: https://letterboxd.com/jack/list/women-directors-the-official-top-250-narrative/
+    radarr_add_missing: false
+    build_collection: false
+
+  Letterboxd top 250 horror:
+    letterboxd_list: https://letterboxd.com/darrencb/list/letterboxds-top-250-horror-films/
+    radarr_add_missing: true
+    build_collection: false
+
+  Letterboxd top 100 animation:
+    letterboxd_list: https://letterboxd.com/lifeasfiction/list/letterboxd-100-animation/
+    radarr_add_missing: true
+    build_collection: false
+
+  Letterboxd top 100 black directors:
+    letterboxd_list: https://letterboxd.com/jack/list/black-directors-the-official-top-100-narrative/
+    radarr_add_missing: false
+    build_collection: false
+
+  Letterboxd top 250 documentaries:
+    letterboxd_list: https://letterboxd.com/jack/list/official-top-250-documentary-films/
+    radarr_add_missing: false
+    build_collection: false
+
+  Coen Brothers:
+    letterboxd_list: https://letterboxd.com/screeningnotes/list/coen-brothers/
+    radarr_add_missing: true
+    build_collection: false
+
+  The Daniels:
+    letterboxd_list: https://letterboxd.com/simononfilm/list/the-daniels/
+    radarr_add_missing: true
+    build_collection: false
+
+  # Hand-picked tentpole films missing from the new mood collections.
+  # Seeds Radarr only; the collections themselves stay radarr_add_missing:false
+  # and will pick these up automatically once downloaded. Added 2026-08-11.
+  Tentpole Fills:
+    tmdb_movie:
+      - 583  # Life of Brian (1979)
+      - 63  # Twelve Monkeys (1995)
+      - 12573  # A Serious Man (2009)
+      - 86838  # Seven Psychopaths (2012)
+      - 109414  # This Is the End (2013)
+      - 107985  # The World's End (2013)
+      - 19833  # In the Loop (2009)
+      - 9434  # Grosse Pointe Blank (1997)
+      - 13667  # Better Off Dead... (1985)
+      - 19494  # Nine to Five (1980)
+      - 11353  # Bowfinger (1999)
+      - 1599  # I ♥ Huckabees (2004)
+      - 6957  # The 40 Year Old Virgin (2005)
+      - 39513  # Paul (2011)
+      - 9397  # Evolution (2001)
+      - 13997  # Black Sheep (1996)
+      - 11566  # Dave (1993)
+      - 459992  # Long Shot (2019)
+      - 11459  # Sky High (2005)
+      - 1019939  # Hundreds of Beavers (2024)
+      - 674324  # The Banshees of Inisherin (2022)
+      - 308266  # War Dogs (2016)
+      - 17610  # Year One (2009)
+      - 10897  # The Little Rascals (1994)
+      - 73861  # A Serbian Film (2010)
+      - 14135  # Bad Boy Bubby (1993)
+      - 1483  # Begotten (1991)
+      - 12877  # Dead Man's Shoes (2004)
+      - 4241  # Visitor Q (2001)
+      - 15742  # Taxidermia (2006)
+      - 477428  # The Painted Bird (2019)
+      - 46767  # In a Glass Cage (1986)
+      - 215743  # Moebius (2013)
+      - 10102  # La Grande Bouffe (1973)
+      - 15356  # The Girl Next Door (2007)
+      - 42148  # Pixote (1980)
+      - 34869  # Cargo 200 (2007)
+      - 21345  # City of Life and Death (2009)
+      - 310135  # Turbo Kid (2015)
+      - 18462  # Night of the Comet (1984)
+      - 19596  # Electric Dreams (1984)
+      - 10019  # Mannequin (1987)
+      - 19053  # Valley Girl (1983)
+      - 35933  # Max Headroom: 20 Minutes into the Future (1985)
+      - 79940  # Tim and Eric's Billion Dollar Movie (2012)
+      - 16133  # Survive Style 5+ (2004)
+      - 5910  # Fireworks (1997)
+      - 18311  # Days of Being Wild (1990)
+      - 33431  # A Snake of June (2003)
+      - 10128  # Alien Nation (1988)
+      - 94329  # The Raid (2012)
+      - 10045  # District B13 (2004)
+      - 8909  # Wanted (2008)
+      - 4141  # Shoot 'Em Up (2007)
+      - 8961  # Bad Boys II (2003)
+      - 58574  # Sherlock Holmes: A Game of Shadows (2011)
+      - 10027  # Unleashed (2005)
+      - 9705  # Swordfish (2001)
+      - 75780  # Jack Reacher (2012)
+      - 117263  # Olympus Has Fallen (2013)
+      - 23629  # Sucker Punch (2011)
+      - 117251  # White House Down (2013)
+      - 26302  # The Color of Pomegranates (1969)
+      - 27040  # Meshes of the Afternoon (1943)
+      - 5729  # L'Âge d'or (1930)
+      - 36877  # The Blood of a Poet (1932)
+      - 33257  # Fando and Lis (1972)
+      - 18919  # Faust (1994)
+      - 19035  # Dimensions of Dialogue (1983)
+      - 27904  # Syndromes and a Century (2006)
+      - 40651  # Institute Benjamenta, or This Dream People Call Human Life (1995)
+      - 15318  # The Taste of Tea (2004)
+      - 118014  # The Seashell and the Clergyman (1928)
+      - 104242  # I Will Walk Like a Crazy Horse (1973)
+      - 670428  # PG: Psycho Goreman (2020)
+      - 10185  # The Midnight Meat Train (2008)
+      - 39857  # The Untold Story (1993)
+      - 624779  # VFW (2019)
+      - 601844  # Becky (2020)
+      - 566805  # Mad Heidi (2022)
+      - 582049  # Random Acts of Violence (2019)
+      - 21407  # The Collector (2009)
+      - 22007  # Train (2008)
+      - 41966  # Pin : A Plastic Nightmare (1988)
+      - 8810  # Mad Max 2 (1981)
+      - 2161  # Fantastic Voyage (1966)
+      - 1714  # Fahrenheit 451 (1966)
+      - 14801  # Colossus: The Forbin Project (1970)
+      - 11935  # Capricorn One (1977)
+      - 11223  # Coma (1978)
+      - 18775  # Demon Seed (1977)
+      - 19757  # Ikarie XB 1 (1963)
+      - 10640  # Futureworld (1976)
+      - 16380  # When Worlds Collide (1951)
+      - 21874  # Looker (1981)
+      - 32940  # The Terminal Man (1974)
+      - 38849  # Android (1982)
+    radarr_add_missing: true
+    build_collection: false

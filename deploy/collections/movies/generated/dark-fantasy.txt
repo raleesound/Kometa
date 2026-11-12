@@ -1,0 +1,23 @@
+# generated 2026-08-30T06:50:11-0400 by letterboxd-kometa-sync
+# source: letterboxd.com/thisnames2long/list/dark-fantasy/ (TOP-UP over upstream)
+# 19 of 20 additions resolved (15 via Plex, 4 via TMDb); 1 unresolved
+
+tmdb:766  # Army of Darkness (1992)
+tmdb:118412  # Berserk: The Golden Age Arc II – The Battle for Doldrey (2012)
+tmdb:41215  # Black Death (2010)
+tmdb:27232  # Conquest (1983)
+tmdb:11849  # Dungeons & Dragons (2000)
+tmdb:109279  # Hearts and Armour (1983)
+tmdb:26452  # Hercules (1983)
+tmdb:879  # Hook (1991)
+tmdb:28678  # Ironmaster (1983)
+tmdb:11834  # Jabberwocky (1977)
+tmdb:689390  # Merlin (1998)
+tmdb:1417  # Pan's Labyrinth (2006)
+tmdb:18937  # Quest for Camelot (1998)
+tmdb:5086  # Quest for the Mighty Sword (1990)
+tmdb:14506  # The Adventures of Baron Munchausen (1988)
+tmdb:105242  # The Sword of the Barbarians (1982)
+tmdb:10166  # The Witches (1990)
+tmdb:36819  # Time Bandits (1981)
+tmdb:15999  # Vampire Hunter D: Bloodlust (2000)

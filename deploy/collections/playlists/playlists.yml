@@ -1,0 +1,9 @@
+playlists:
+  Rob's Letterboxd Watchlist:
+    libraries: Movies
+    # letterboxd_list: https://letterboxd.com/thisnames2long/watchlist/
+    radarr_add_missing: true
+    imdb_list: 
+      list_id: ls592044531
+    #delete_playlist: true
+    sync_to_users: Rob

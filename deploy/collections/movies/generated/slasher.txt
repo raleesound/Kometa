@@ -1,0 +1,22 @@
+# generated 2026-08-30T06:50:11-0400 by letterboxd-kometa-sync
+# source: letterboxd.com/thisnames2long/list/slasher/ (TOP-UP over upstream)
+# 18 of 18 additions resolved (17 via Plex, 1 via TMDb); 0 unresolved
+
+tmdb:28109  # 100 Tears (2007)
+tmdb:109425  # Blood Games (1990)
+tmdb:84253  # Blood Lake (1987)
+tmdb:55723  # ChromeSkull: Laid to Rest 2 (2011)
+tmdb:109074  # Day of the Reaper (1984)
+tmdb:44936  # Don't Go in the Woods (1981)
+tmdb:296503  # Dude Bro Party Massacre III (2015)
+tmdb:85165  # Evil Laugh (1986)
+tmdb:139008  # Grave Robbers (1989)
+tmdb:16915  # Gutterballs (2008)
+tmdb:81478  # Killing Spree (1987)
+tmdb:36911  # Shredder (2001)
+tmdb:97814  # Skinned Deep (2004)
+tmdb:76450  # Skinner (1993)
+tmdb:996619  # Slaughter Day (1991)
+tmdb:85160  # Slaughterhouse (1987)
+tmdb:54109  # The Witch Who Came from the Sea (1976)
+tmdb:17319  # Wrestlemaniac (2006)

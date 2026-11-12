@@ -1,0 +1,253 @@
+collections:
+  Whodunnit:
+    sort_title: "!030_whodunnit"
+    letterboxd_list: https://letterboxd.com/ashleepradella/list/whodunnit/
+    file_poster: /config/movies/assets/whodunnit.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  GWAR:
+    sort_title: "!030_gwar"
+    letterboxd_list: https://letterboxd.com/seanriggen/list/gwar/
+    file_poster: /config/movies/assets/gwar.png
+    radarr_add_missing: true
+    sync_mode: sync
+
+  Horror Documentary:
+    sort_title: "!030_horror_documentary"
+    letterboxd_list: https://letterboxd.com/zdawg12/list/horror-documentary/
+    file_poster: /config/movies/assets/horror-documentary.png
+    radarr_add_missing: true
+    sync_mode: sync
+
+  Sleaze:
+    sort_title: "!030_sleaze"
+    letterboxd_list: https://letterboxd.com/overcaffeinated/list/sleaze/
+    file_poster: /config/movies/assets/sleaze.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Criterion Collection:
+    sort_title: "!025_Criterion"
+    letterboxd_list: https://letterboxd.com/stereochromatic/list/criterion-collection/
+    file_poster: /config/movies/assets/criterion-collection.jpg
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Troma:
+    sort_title: "!030_troma"
+    letterboxd_list: https://letterboxd.com/vive_le_filth/list/troma/
+    file_poster: /config/movies/assets/troma.png
+    radarr_add_missing: true
+    sync_mode: sync
+
+  Movies That Feel Like an Xbox 360 Game:
+    sort_title: "!030_movies_that_feel_like_xbox_360_vibes"
+    letterboxd_list: https://letterboxd.com/lcdneworder/list/movies-that-feel-like-an-xbox-360-game/
+    file_poster: /config/movies/assets/xbox-360-vibes.png
+    summary: 7th gen cinema, movies that pair well with Hot Pockets and a can of Monster. Gritty, edgy action blockbusters mostly popular from the late 2000's up to about roughly 2013. Expect copious amounts of digital blood and filters aplenty. Other visual signifiers include heavy emphasis on guns and the military (with occasional ventures into the realms of sword and sorcery, zombie apocalypses and dystopian sci-fi), gratuitous gore and swearing, conspicuous CGI and of course, heavy usage of desaturated brown/grey/dark blue and dark green colour palettes. Actual video game adaptations are cheating.
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Titles You Can Sing to Deck the Halls:
+    sort_title: "!030_titles_to_deck_the_halls"
+    letterboxd_list: https://letterboxd.com/gemko/list/titles-you-can-sing-to-deck-the-halls/
+    file_poster: /config/movies/assets/titles-to-deck-the-halls.png
+    summary: Fa la la la la, la la la la.
+    radarr_add_missing: true
+    sync_mode: sync
+
+  White People Did What? They Got Stuck Where?:
+    sort_title: "!030_white_people_did_what"
+    letterboxd_list: https://letterboxd.com/mammothmafia/list/white-people-did-what-they-got-stuck-where/
+    file_poster: /config/movies/assets/white-people-did-what.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Visually Insane:
+    sort_title: "!030_visually_insane"
+    letterboxd_list: https://letterboxd.com/etolkin/list/filmlist:28697007/
+    file_poster: /config/movies/assets/visually-insane.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  High Art Genre Movies:
+    sort_title: "!030_high_art_genre_movies"
+    letterboxd_list: https://letterboxd.com/darrencb/list/high-art-genre-movies/
+    file_poster: /config/movies/assets/high-art-genre-movies.png
+    radarr_add_missing: false
+    summary: Movies made by auteur directors with a very arthouse sensibility, that happen to be genre movies (e.g. horror films, heist films, martial arts films etc).
+    sync_mode: sync
+
+  Nothing Happens, Yeah But The Vibes:
+    sort_title: "!030_nothing_happens_vibes"
+    letterboxd_list: https://letterboxd.com/funeralroses/list/nothing-happens-yeah-but-the-vibes/
+    file_poster: /config/movies/assets/nothing-happens-vibes.png
+    radarr_add_missing: false
+    summary: movies without a strong central plot or a typical three act structure, where instead it's mostly just characters wandering around, talking, making connections, and living life 💓
+    sync_mode: sync
+
+  When You're Feeling a Little Lost:
+    sort_title: "!030_feeling_a_little_lost"
+    letterboxd_list: https://letterboxd.com/yazzjames/list/when-youre-feeling-a-little-lost/
+    file_poster: /config/movies/assets/feeling-a-little-lost.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  New French Extremity:
+    sort_title: "!030_new_french_extremity"
+    letterboxd_list: https://letterboxd.com/ryanismorning/list/new-french-extremity/
+    file_poster: /config/movies/assets/new-french-extremity.png
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Neo-Expressionism, The Forgotten Studio Style:
+    sort_title: "!030_neo_expressionism"
+    letterboxd_list: https://letterboxd.com/comrade_yui/list/neo-expressionism-the-forgotten-studio-style/
+    file_poster: /config/movies/assets/neo-expressionism.png
+    summary: |
+      the rise and fall of analog anti-naturalism: beginning in the late 70s, many films, especially hollywood genres, began to move away from the focus on verisimilitude and location-shooting that became prominent in the 50s and fully flowered in the early 70s. neo-expressionism fully became the default style of many famous films from 1983-1996. it faded in the mid-2000s, as greenscreen began to replace sets and lighting in the american cinema began to flatten and resemble television. tim burton, alex proyas, russell mulcahy, early ridley scott, and clive barker are the masters of neo-expressionism.
+
+      the essential characteristics of neo-expressionism:
+
+      /// 1. the embrace of artifice. these are films which no longer pretend to be set in our own world, but instead inhabit a constructed dream-world of sets, matte paintings, and often special effects.
+
+      /// 2. the post-MTV/commercial hyper-aesthetic. liquid lighting, wet streets, reflective surfaces, strong monochromatic colors, hard shadows, weather effects, gauze, lens flares, dutch angles.
+
+      /// 3. subtextual horror/noir. many neo-expressionist films are visually oriented in classic horror/noir plots, often featuring monsters, detectives, killers, and assorted goth trappings. even if the film is not a noir or horror story, it is constructed using the classic visual grammar of those works.
+
+      /// 4. decadence. these are films which prioritize a visual experience over narrative cohesion or the minutia of plot, as opposed to the more actorly/scriptural focus of new hollywood films. the actors are here to be in harmony with the overall aesthetic, not to showcase their talents. the scripts are often full of dead-ends.
+
+      /// 5. practical effects, first and foremost. some later neo-expressionist films utilize advances in CGI, but everything is always first grounded in real optical effects, whether that be constructed sets, matte paintings, gels, smoke, stop motion, suitmation, or compositing. the CGI is used to augment the practical effects, never to replace it. 
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Horror!!!!:
+    sort_title: "!030_horror"
+    letterboxd_list: https://letterboxd.com/ale_x/list/horror/
+    file_poster: /config/movies/assets/horror.png
+    summary: |
+      Your shameless horror & thriller movie plug.
+
+      450+ Organized by color for your own visual pleasure.
+
+      ⛓ Consistently adding to the list.
+        suggestions are welcome 🦇
+
+
+      -Recently added films will be at the bottom of the list for a few days.
+      -Sequels are not usually listed, but by including the first I also include the entire franchise.
+    radarr_add_missing: true
+    sync_mode: sync
+
+  Adventure Sports:
+    sort_title: "!030_adventure_sports"
+    letterboxd_list: https://letterboxd.com/fregata/list/adventure-sports/
+    file_poster: /config/movies/assets/adventure-sports.png
+    item_radarr_tag: adventure-sports
+    radarr_add_missing: true
+    sync_mode: sync
+
+  before you die:
+    sort_title: "!030_before_you_die"
+    letterboxd_list: https://letterboxd.com/grlcries/list/before-you-die/
+    file_poster: /config/movies/assets/before-you-die.png
+    radarr_add_missing: true
+    sonarr_add_missing: true
+    sync_mode: sync
+
+  Liminal Spaces:
+    sort_title: "!030_liminal_spaces"
+    letterboxd_list: https://letterboxd.com/johnnycross/list/backrooms-weirdcore-dreamcore-traumacore/
+    file_poster: /config/movies/assets/liminal-spaces.png
+    summary: Backrooms, weirdcore, dreamcore, traumacore — the empty, wrong-feeling architecture of liminal space, and the dream-logic disorientation that comes with it.
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Shot on 16mm:
+    sort_title: "!030_shot_on_16mm"
+    letterboxd_list: https://letterboxd.com/suspirliam/list/shot-on-16mm/
+    file_poster: /config/movies/assets/shot-on-16mm.png
+    summary: "that grain tho :)"
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Retro-Futurism:
+    sort_title: "!030_retro_futurism"
+    letterboxd_list: https://letterboxd.com/natasha72/list/retro-futurism/
+    file_poster: /config/movies/assets/retro-futurism.png
+    summary: The future as the past imagined it — chrome rocket fins, tape-reel supercomputers, jumpsuited technocracy and the dystopias that came with them. Every era's tomorrow, preserved at the moment it went obsolete.
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Splatter:
+    sort_title: "!030_splatter"
+    letterboxd_list: https://letterboxd.com/serenditpity/list/horror-sub-genre-splatter-horror/
+    file_poster: /config/movies/assets/splatter.png
+    summary: Horror that treats the human body as a special effect. Arterial spray, practical gore, and the gleeful excess of a latex budget spent all at once.
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Disturbing:
+    sort_title: "!030_disturbing"
+    letterboxd_list: https://letterboxd.com/horriblereviews/list/horrible-reviews-the-most-disturbing-movies/
+    file_poster: /config/movies/assets/disturbing.png
+    summary: Films that stay with you for the wrong reasons. Transgressive, bleak, and frequently unpleasant on purpose — watch with care.
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Vaporwave:
+    sort_title: "!030_vaporwave"
+    letterboxd_list: https://letterboxd.com/mandelbroset/list/vaporwave-aesthetic/
+    file_poster: /config/movies/assets/vaporwave.png
+    summary: Dead malls, CRT glow, chrome-and-magenta sunsets and corporate futures that never arrived. Cinema that looks the way a slowed-down mall jingle sounds.
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Surreal:
+    sort_title: "!030_surreal"
+    letterboxd_list: https://letterboxd.com/edoardocan/list/the-ultimate-guide-to-surreal-cinema/
+    file_poster: /config/movies/assets/surreal.png
+    summary: Dream logic over plot logic — the surrealist canon from Buñuel and Cocteau through Jodorowsky, Švankmajer and the Quays. Films that refuse to explain themselves.
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Dumb Comedy:
+    sort_title: "!030_dumb_comedy"
+    letterboxd_list: https://letterboxd.com/basically4gato/list/dumb-funny/
+    file_poster: /config/movies/assets/dumb-comedy.png
+    summary: Proudly, gloriously stupid. No lesson, no subtext, just committed idiots doing bits at full volume.
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Absurd Comedy:
+    sort_title: "!030_absurd_comedy"
+    letterboxd_list: https://letterboxd.com/omwfeeling/list/surreal-absurdist-humor/
+    file_poster: /config/movies/assets/absurd-comedy.png
+    summary: Comedy built on faulty premises played straight — deadpan surrealism, escalating nonsense, and jokes whose engine is that nobody on screen finds it strange.
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Fun Adventure:
+    sort_title: "!030_fun_adventure"
+    letterboxd_list: https://letterboxd.com/althestrange/list/als-top-100-action-and-adventure-films/
+    file_poster: /config/movies/assets/fun-adventure.png
+    summary: Action with the safety on — capers, chases and set pieces built for grinning rather than wincing. The popcorn end of the genre.
+    radarr_add_missing: false
+    sync_mode: sync
+
+  Regional Horror:
+    sort_title: "!030_regional_horror"
+    letterboxd_list: https://letterboxd.com/fieldmouse/list/regional-horror/
+    file_poster: /config/movies/assets/regional-horror.png
+    summary: Horror made far from Hollywood, by locals, on local money — where the accents, landscapes and civic weirdness of a specific place bleed into the film itself.
+    radarr_add_missing: true
+    sync_mode: sync
+
+  SOV Horror:
+    sort_title: "!030_sov_horror"
+    letterboxd_list: https://letterboxd.com/sidewalkcrack/list/sov-horror/
+    file_poster: /config/movies/assets/sov-horror.png
+    summary: Shot-on-video horror — camcorder gore sold on VHS out of the back of a van. Tracking lines, blown-out lighting, and an enthusiasm no budget could buy.
+    radarr_add_missing: true
+    sync_mode: sync

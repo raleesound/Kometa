@@ -1,0 +1,7 @@
+collections:
+  'Giallo':
+    sort_title: '!030_giallo'
+    letterboxd_list: 'https://letterboxd.com/biscottikyle/list/giallo/'
+    file_poster: '/config/movies/assets/giallo.png'
+    radarr_add_missing: false
+    sync_mode: 'sync'

@@ -1,0 +1,54 @@
+# Franchise/author collections sourced from IMDb lists rather than
+# Letterboxd — not tied to any curator's personal list.
+collections:
+  A24 Films:
+    sort_title: "!070_A24"
+    radarr_add_missing: true
+    url_poster: https://raw.githubusercontent.com/Kometa-Team/Default-Images/master/studio/A24.jpg
+    imdb_list:
+      list_id: https://www.imdb.com/list/ls505551455/
+    summary: All films published by A24.
+
+  Godzilla Collection (All):
+    url_poster: https://theposterdb.com/api/assets/20701
+    radarr_add_missing: true
+    imdb_list:
+      - list_id: https://www.imdb.com/list/ls064848981/
+    summary: All Godzilla films from all universes
+
+  Shakespeare Collection:
+    sort_title: "!160_Shakespeare"
+    collection_order: random
+    url_poster: https://theposterdb.com/api/assets/67682
+    imdb_list:
+      list_id: https://www.imdb.com/list/ls060637860/
+    imdb_search:
+      genre.not: documentary
+      keyword: shakespeare
+      limit: 250
+      sort_by: rating.desc
+      votes.gte: 100
+    summary: Films adapted from or inspired by the works of William Shakespeare
+
+  Stephen King Collection:
+    sort_title: "!160_King"
+    collection_order: random
+    url_poster: https://theposterdb.com/api/assets/47899
+    imdb_list:
+      - list_id: https://www.imdb.com/list/ls045501557/
+      - list_id: https://www.imdb.com/list/ls068855741/
+    summary: Films adapted from or inspired by the works of Stephen King
+
+  HP Lovecraft Collection:
+    sort_title: "!160_Lovecraft"
+    url_poster: https://theposterdb.com/api/assets/401874
+    imdb_list:
+      - list_id: https://www.imdb.com/list/ls095961664/
+    summary: Films adapted from or inspired by the works of HP Lovecraft
+
+  Roald Dahl Collection:
+    sort_title: "!160_Dahl"
+    url_poster: https://theposterdb.com/api/assets/60411
+    imdb_list:
+      list_id: https://www.imdb.com/list/ls046555751/
+    summary: Films adapted from or inspired by the works of Roald Dahl

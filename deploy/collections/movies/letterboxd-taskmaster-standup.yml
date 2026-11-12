@@ -1,0 +1,7 @@
+collections:
+  "Taskmaster Contestants' Stand-Up Comedy Specials":
+    sort_title: '!030_taskmaster_standup'
+    letterboxd_list: 'https://letterboxd.com/perfumegen1us/list/taskmaster-contestants-stand-up-comedy-specials/'
+    file_poster: '/config/movies/assets/taskmaster-standup.png'
+    radarr_add_missing: true
+    sync_mode: 'sync'

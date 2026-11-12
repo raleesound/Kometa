@@ -1,0 +1,14 @@
+# generated 2026-08-30T06:50:11-0400 by letterboxd-kometa-sync
+# source: letterboxd.com/thisnames2long/list/christmas-1/ (TOP-UP over upstream)
+# 10 of 10 additions resolved (7 via Plex, 3 via TMDb); 0 unresolved
+
+tmdb:55465  # A Very Harold & Kumar Christmas (2011)
+tmdb:10147  # Bad Santa (2003)
+tmdb:338964  # Bad Santa 2 (2016)
+tmdb:364  # Batman Returns (1992)
+tmdb:298016  # It's a SpongeBob Christmas! (2012)
+tmdb:732670  # LEGO Star Wars Holiday Special (2020)
+tmdb:13378  # Mickey's Twice Upon a Christmas (2004)
+tmdb:567604  # Once Upon a Deadpool (2018)
+tmdb:24951  # Prancer (1989)
+tmdb:147939  # Teenage Mutant Ninja Turtles: We Wish You a Turtle Christmas (1994)

@@ -1,0 +1,12 @@
+# generated 2026-08-30T06:50:11-0400 by letterboxd-kometa-sync
+# source: letterboxd.com/thisnames2long/list/satire/ (TOP-UP over upstream)
+# 8 of 8 additions resolved (8 via Plex, 0 via TMDb); 0 unresolved
+
+tmdb:22642  # A Bucket of Blood (1959)
+tmdb:92591  # Bernie (2011)
+tmdb:536554  # M3GAN (2022)
+tmdb:592831  # Megalopolis (2024)
+tmdb:341012  # Popstar: Never Stop Never Stopping (2016)
+tmdb:1071215  # Thanksgiving (2023)
+tmdb:77953  # The Campaign (2012)
+tmdb:835113  # Woman of the Hour (2023)

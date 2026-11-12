@@ -1,0 +1,55 @@
+collections:
+  'Walt Disney Animation':
+    sort_title: '!029_disney_animation'
+    letterboxd_list: 'https://letterboxd.com/strauss/list/walt-disney-animation-studios/'
+    file_poster: '/config/movies/assets/disney-animation.png'
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
+
+  'Pixar':
+    sort_title: '!029_pixar'
+    letterboxd_list: 'https://letterboxd.com/jack/list/pixar/'
+    file_poster: '/config/movies/assets/pixar.png'
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
+
+  'Studio Ghibli':
+    sort_title: '!029_ghibli'
+    letterboxd_list: 'https://letterboxd.com/hmv/list/studio-ghibli-every-film-ranked/'
+    file_poster: '/config/movies/assets/ghibli.png'
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
+
+  'DreamWorks Animation':
+    sort_title: '!029_dreamworks'
+    letterboxd_list: 'https://letterboxd.com/yaanu/list/a-complete-list-of-dreamworks-animation-theatrical/'
+    file_poster: '/config/movies/assets/dreamworks.png'
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
+
+  'Illumination':
+    sort_title: '!029_illumination'
+    letterboxd_list: 'https://letterboxd.com/kermitkid/list/illumination-ranked-as-of-minions-and-monsters/'
+    file_poster: '/config/movies/assets/illumination.png'
+    radarr_add_missing: true
+    sync_mode: 'sync'
+    content_rating: 'G'
+    visible_home: true
+    visible_shared: true
+    visible_library: true
