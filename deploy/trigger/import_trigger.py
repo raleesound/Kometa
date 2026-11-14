@@ -1517,12 +1517,11 @@ def sync_collection_defs(record_path: str | None = None, config_path: str | None
 
 @contextlib.contextmanager
 def run_lock_free() -> Iterator[bool]:
-    """Yield True while holding a shared, non-blocking flock on Kometa's run lock (nobody is mid-run, and none starts until this exits); False when a run holds it.
-    Kometa itself is never locked out for long: it waits and retries when the lock is busy."""
-    path = os.path.join(os.path.dirname(CONFIG_PATH), ".kometa.run.lock")
-    with open(path, "a+") as lock_file:
+    """Yield True while holding a non-blocking flock on Kometa's run lock (nobody is mid-run, and none starts until this exits); False when anything holds it.
+    The hold is exclusive so a Kometa item run that fails to start waits on the kernel (wait_for_run_lock takes a shared lock) instead of seeing a spurious free lock."""
+    with open(RUN_LOCK_PATH, "a+") as lock_file:
         try:
-            fcntl.flock(lock_file, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             yield False
             return

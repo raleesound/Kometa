@@ -454,6 +454,7 @@ def test_every_successful_definition_pass_reconciles_exhaustive_tags_and_a_faile
 def test_the_trigger_reconciles_against_its_own_config(env, monkeypatch):
     seen = []
     monkeypatch.setattr(env.trig.exhaustive_reconcile, "reconcile", lambda path, log=None, record_path=None: seen.append((path, record_path)))
+    monkeypatch.setattr(env.trig, "RUN_LOCK_PATH", str(Path(env.trig.CONFIG_PATH).parent / ".kometa.run.lock"))
     env.trig.reconcile_orphans()
     assert seen == [(env.trig.CONFIG_PATH, env.trig.RECORD_PATH)]
     monkeypatch.setattr(env.trig.exhaustive_reconcile, "reconcile", lambda path, log=None, record_path=None: (_ for _ in ()).throw(RuntimeError("x")))
@@ -466,6 +467,7 @@ def test_the_watcher_reconcile_skips_while_a_kometa_run_holds_the_run_lock(env, 
     seen = []
     monkeypatch.setattr(env.trig.exhaustive_reconcile, "reconcile", lambda path, log=None, record_path=None: seen.append(path))
     lock_path = Path(env.trig.CONFIG_PATH).parent / ".kometa.run.lock"
+    monkeypatch.setattr(env.trig, "RUN_LOCK_PATH", str(lock_path))
     with open(lock_path, "a+") as run:
         fcntl.flock(run, fcntl.LOCK_EX | fcntl.LOCK_NB)  # a Kometa run in progress
         env.trig.reconcile_orphans()
@@ -473,11 +475,13 @@ def test_the_watcher_reconcile_skips_while_a_kometa_run_holds_the_run_lock(env, 
     env.trig.reconcile_orphans()  # run over: the lock is free
     assert seen == [env.trig.CONFIG_PATH]
 
-    # and while the reconcile runs, a Kometa run cannot start underneath it
+    # and while the reconcile runs, a Kometa run cannot start underneath it, and a waiter's shared lock is not granted either
     def probe(path, log=None, record_path=None):
         with open(lock_path, "a+") as other:
             with pytest.raises(OSError):
                 fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with pytest.raises(OSError):
+                fcntl.flock(other, fcntl.LOCK_SH | fcntl.LOCK_NB)
 
     monkeypatch.setattr(env.trig.exhaustive_reconcile, "reconcile", probe)
     env.trig.reconcile_orphans()
