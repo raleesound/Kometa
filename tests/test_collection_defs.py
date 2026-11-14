@@ -102,6 +102,7 @@ def test_removed_collection_runs_nothing_and_drops_its_row(env):
     env.sync()
     env.mine.write_text("collections:\n  Cats:\n    letterboxd_list: https://letterboxd.com/a/list/cats/\n")
     assert env.sync() == []
+    assert env.sync() == []  # gone on a second pass in a row: the row goes
     conn = live_record.connect(env.trig.RECORD_PATH)
     assert sorted({r["mapping_name"] for r in conn.execute("SELECT mapping_name FROM collection_defs")}) == ["Cats"]
     env.mine.write_text(FILE)  # coming back is a new definition
@@ -196,7 +197,7 @@ def test_watcher_loop_seeds_then_runs_once_per_burst(env):
     env.mine.write_text(FILE)
     t.start()
     t.join(5)
-    assert woke == [] and fake.settled == 1 and str(env.mine.parent) in fake.dirs  # seeded; the irrelevant event woke nothing
+    assert not t.is_alive() and woke == [] and fake.settled == 1 and str(env.mine.parent) in fake.dirs  # seeded; the irrelevant event woke nothing
     stop2 = threading.Event()
     fake2 = FakeWatcher([True], stop2)
     env.mine.write_text(FILE + "  Birds:\n    letterboxd_list: y\n")
@@ -214,3 +215,101 @@ def test_watcher_loop_survives_a_failed_pass(env):
     t.start()
     t.join(5)
     assert not t.is_alive() and woke == [] and str(env.config.parent) in fake.dirs
+
+
+def test_a_file_truncated_to_nothing_is_not_a_mass_removal_and_its_completion_is_not_a_mass_rebuild(env):
+    env.sync()
+    env.mine.write_text("collections:\n")  # cut at a line boundary: parses, and holds nothing
+    env.sync()
+    env.mine.write_text(FILE)  # the write completes: Cats comes back, unchanged
+    assert env.sync() == [] and env.builds() == []
+
+
+def test_a_truncated_config_is_not_a_mass_removal_either(env):
+    env.sync()
+    env.config.write_text("plex:\n  url: x\nlibraries:\n")
+    env.sync()
+    env.config.write_text("plex:\n  url: x\nlibraries:\n  Movies:\n    collection_files:\n    - file: config/movies/mine.yml\n  TV Shows:\n    collection_files:\n    - file: config/movies/mine.yml\n")
+    assert env.sync() == [] and env.builds() == []
+
+
+def test_a_collection_gone_on_two_passes_in_a_row_is_dropped(env):
+    env.sync()
+    env.mine.write_text("collections:\n  Cats:\n    letterboxd_list: https://letterboxd.com/a/list/cats/\n")
+    env.sync()
+    env.sync()
+    conn = live_record.connect(env.trig.RECORD_PATH)
+    assert {r["mapping_name"] for r in conn.execute("SELECT mapping_name FROM collection_defs")} == {"Cats"}
+
+
+def test_a_seed_that_met_a_held_file_is_not_the_seed(env):
+    env.mine.write_text("collections:\n  Dogs: [\n")
+    env.sync()
+    env.mine.write_text(FILE)
+    env.sync()  # the first complete read seeds, silently
+    assert env.builds() == []
+    env.mine.write_text(FILE + "  Birds:\n    letterboxd_list: y\n")
+    assert {n for _l, n in env.sync()} == {"Birds"}
+
+
+def test_a_pathological_file_is_held_and_the_rest_still_work(env):
+    env.sync()
+    (env.mine.parent / "odd.yml").write_text("collections:\n  Odd:\n    1: a\n    b: 2\n")
+    env.config.write_text(env.config.read_text().replace("    - default: basic\n", "    - default: basic\n    - file: config/movies/odd.yml\n"))
+    env.sync()
+    env.mine.write_text(FILE + "  Birds:\n    letterboxd_list: y\n")
+    assert {n for _l, n in env.sync()} == {"Birds"}
+
+
+def test_a_recreated_directory_is_watched_again(env, tmp_path):
+    watcher = collection_defs.Watcher(collection_defs.relevant_name)
+    directory = tmp_path / "config" / "tv"
+    directory.mkdir()
+    watcher.watch({str(directory)})
+    assert str(directory) in watcher.dirs
+    directory.rmdir()
+    assert watcher.wait(1) and watcher.drain() is True
+    assert str(directory) not in watcher.dirs
+    directory.mkdir()
+    watcher.watch({str(directory)})
+    assert str(directory) in watcher.dirs
+    (directory / "x.yml").write_text("a: 1")
+    assert watcher.wait(1) and watcher.drain() is True
+    watcher.watch({str(tmp_path / "missing")})
+    assert str(tmp_path / "missing") in watcher.failed
+    watcher.close()
+
+
+def test_folder_entries_are_watched_even_when_empty(env, tmp_path):
+    (tmp_path / "config" / "extra").mkdir()
+    env.config.write_text(env.config.read_text().replace("    - default: basic\n", "    - folder: config/extra\n"))
+    _found, _held, dirs = collection_defs.scan(str(env.config), str(tmp_path))
+    assert str(tmp_path / "config" / "extra") in dirs
+
+
+def test_a_watcher_that_cannot_start_does_not_kill_the_thread(env, monkeypatch):
+    def boom(*_a, **_k):
+        raise OSError(24, "too many open files")
+
+    monkeypatch.setattr(collection_defs, "Watcher", boom)
+    env.trig.collection_watcher(lambda: None)
+
+
+def test_queued_collections_wake_the_builder_even_when_the_second_pass_fails(env, monkeypatch):
+    stop, woke = threading.Event(), []
+    real = env.trig.sync_collection_defs
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 2:
+            raise OSError("record busy")
+        return real()
+
+    env.mine.write_text(FILE)
+    real()
+    env.mine.write_text(FILE + "  Birds:\n    letterboxd_list: y\n")
+    monkeypatch.setattr(env.trig, "sync_collection_defs", flaky)
+    fake = FakeWatcher([], stop)
+    env.trig.collection_watcher(lambda: woke.append(1), quiet=0, watcher=fake, stop=stop)
+    assert woke == [1] and len(calls) >= 2

@@ -28,8 +28,11 @@ IN_MOVED_FROM = 0x00000040
 IN_MOVED_TO = 0x00000080
 IN_CREATE = 0x00000100
 IN_DELETE = 0x00000200
+IN_DELETE_SELF = 0x00000400
+IN_MOVE_SELF = 0x00000800
 IN_Q_OVERFLOW = 0x00004000
-WATCH_MASK = IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE
+IN_IGNORED = 0x00008000
+WATCH_MASK = IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF
 EVENT_HEADER = struct.Struct("iIII")
 YAML_SUFFIXES = (".yml", ".yaml")
 # Collection-file entries that are Kometa's own (not ours to watch).
@@ -47,10 +50,10 @@ def resolve(path, root):
 
 
 def listed_files(config, root):
-    """{library key: [(path, template_variables)]} for the local collection files config.yml lists.
+    """({library key: [(path, template_variables)]}, folders) for the local collection files config.yml lists.
 
     ``folder`` entries expand to their *.yml files; ``default``/``git``/``url``/``repo`` entries are Kometa's and skipped."""
-    out = {}
+    out, folders = {}, set()
     for library, attrs in ((config or {}).get("libraries") or {}).items():
         entries = []
         for entry in (attrs.get("collection_files") if isinstance(attrs, dict) else None) or []:
@@ -61,9 +64,10 @@ def listed_files(config, root):
                 entries.append((resolve(entry["file"], root), variables))
             if isinstance(entry.get("folder"), str):
                 folder = resolve(entry["folder"], root)
+                folders.add(folder)
                 entries.extend((path, variables) for path in sorted(glob.glob(os.path.join(folder, "*.yml")) + glob.glob(os.path.join(folder, "*.yaml"))))
         out[str(library)] = entries
-    return out
+    return out, folders
 
 
 def _digest(*parts):
@@ -105,12 +109,14 @@ def scan(config_path, root):
     if not isinstance(config, dict):
         raise ValueError("config.yml is not a mapping document")
     found, held, dirs = {}, {}, {os.path.dirname(config_path)}
-    for library, entries in listed_files(config, root).items():
+    listed, folders = listed_files(config, root)
+    dirs |= folders
+    for library, entries in listed.items():
         for path, variables in entries:
             dirs.add(os.path.dirname(path))
             try:
                 hashes = definitions(path, variables)
-            except (OSError, ValueError, yaml.YAMLError) as e:
+            except Exception as e:  # one unusable file (even a pathological one) must not stop every other collection from being noticed
                 held[path] = type(e).__name__
                 continue
             for name, digest in hashes.items():
@@ -135,11 +141,20 @@ class Watcher:
         if self.fd < 0:
             raise OSError(ctypes.get_errno(), "inotify_init1 failed")
         self.dirs = set()
+        self._wds = {}
+        self.failed = {}
 
     def watch(self, dirs):
+        """Watch each directory not already watched. A directory that cannot be watched (missing, no room) is recorded in
+        ``failed`` with its errno and retried the next time it is asked for."""
         for directory in set(dirs) - self.dirs:
-            if self._add(self.fd, directory.encode(), WATCH_MASK) >= 0:
+            wd = self._add(self.fd, directory.encode(), WATCH_MASK)
+            if wd >= 0:
                 self.dirs.add(directory)
+                self._wds[wd] = directory
+                self.failed.pop(directory, None)
+            else:
+                self.failed[directory] = ctypes.get_errno()
 
     def drain(self):
         """Read what is queued. Returns True when a relevant file changed (or the kernel queue overflowed)."""
@@ -149,10 +164,14 @@ class Watcher:
             return False
         relevant, pos = False, 0
         while pos + EVENT_HEADER.size <= len(data):
-            _wd, mask, _cookie, length = EVENT_HEADER.unpack_from(data, pos)
+            wd, mask, _cookie, length = EVENT_HEADER.unpack_from(data, pos)
             name = data[pos + EVENT_HEADER.size : pos + EVENT_HEADER.size + length].split(b"\0", 1)[0].decode(errors="replace")
             pos += EVENT_HEADER.size + length
-            if mask & IN_Q_OVERFLOW or self.wanted(name):
+            if mask & IN_IGNORED:
+                # The directory was deleted or moved away: its watch is gone, so forget it and let the next pass add it again.
+                self.dirs.discard(self._wds.pop(wd, None))
+                relevant = True
+            elif mask & (IN_Q_OVERFLOW | IN_DELETE_SELF | IN_MOVE_SELF) or self.wanted(name):
                 relevant = True
         return relevant
 

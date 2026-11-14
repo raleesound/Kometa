@@ -744,6 +744,7 @@ def fail_build(conn, library, mapping_name, max_attempts, gen=None):
 
 
 DEFS_SEEDED = "collection_defs_seeded"
+DEFS_GONE = "collection_defs_gone"
 
 
 def apply_collection_defs(conn, found, held_files=(), now=None, renew=True):
@@ -772,11 +773,16 @@ def apply_collection_defs(conn, found, held_files=(), now=None, renew=True):
             if seeded:
                 queue_build(conn, key[0], key[1], source_file, now=now, renew=renew)
                 queued.append(key)
-        for key in set(known) - set(found):
-            if files[key] in held_files:
-                continue
+        # A collection leaves the table only when two passes in a row find it gone: a file read half-written can parse and
+        # simply be short, and the rewrite that completes it must not find every collection "new".
+        gone = {key for key in set(known) - set(found) if files[key] not in held_files}
+        row = conn.execute("SELECT value FROM record_meta WHERE key = ?", (DEFS_GONE,)).fetchone()
+        before = {tuple(k) for k in json.loads(row["value"])} if row else set()
+        for key in gone & before:
             conn.execute("DELETE FROM collection_defs WHERE library = ? AND mapping_name = ?", key)
-        if not seeded:
+        conn.execute("INSERT OR REPLACE INTO record_meta (key, value) VALUES (?, ?)", (DEFS_GONE, json.dumps(sorted(gone - before))))
+        # Seeded only from a complete read: with a file held, its collections would all be "new" when it next reads.
+        if not seeded and found and not held_files:
             conn.execute("INSERT OR IGNORE INTO record_meta (key, value) VALUES (?, ?)", (DEFS_SEEDED, stamp))
         conn.execute("COMMIT")
     except Exception:

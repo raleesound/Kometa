@@ -1505,34 +1505,43 @@ def sync_collection_defs(record_path: str | None = None, config_path: str | None
 
 
 def collection_watcher(on_queued: Callable[[], None], quiet: float | None = None, watcher: Any = None, stop: threading.Event | None = None) -> None:
-    """Notice collection-definition changes: an initial pass (seeding the record on the first ever start), then one pass per
+    """Notice collection-definition changes: an initial pass (seeding the record on the first complete read), then one pass per
     burst of writes. Event driven: it sleeps in select() on the inotify fd until a YAML file in a watched directory changes.
     Never raises; a pass that fails is retried on the next write."""
     quiet = COLLECTION_QUIET_SECONDS if quiet is None else quiet
-    watcher = watcher or collection_defs.Watcher(collection_defs.relevant_name)
+    try:
+        watcher = watcher or collection_defs.Watcher(collection_defs.relevant_name)
+    except Exception as e:
+        log.error("cannot start the collection watcher (%s): new or edited collections wait for the scheduled sweep", e)
+        return
+    config_dir = os.path.dirname(CONFIG_PATH)
     first = True
     while stop is None or not stop.is_set():
+        queued: list[tuple[str, str]] = []
         try:
             if not first:
                 watcher.wait(None)
                 if not watcher.drain():
                     continue
                 watcher.settle(quiet)
+            first = False
             queued, _held, dirs = sync_collection_defs()
             if dirs - watcher.dirs:
                 # Watch before the next read: a write between this pass's read and the watch would otherwise be missed.
                 watcher.watch(dirs)
                 queued += sync_collection_defs()[0]
-            if queued:
-                on_queued()
+            for directory, errno in sorted(getattr(watcher, "failed", {}).items()):
+                log.error("cannot watch %s (errno %s): writes there are not noticed", directory, errno)
         except Exception as e:
             log.error("collection definition pass failed (%s); retrying on the next write", describe_config_error(e))
+            # Without a readable config the collection directories are unknown: watch the config's own, and its subdirectories.
             try:
-                if first:
-                    watcher.watch({os.path.dirname(CONFIG_PATH)})
+                watcher.watch({config_dir} | {entry.path for entry in os.scandir(config_dir) if entry.is_dir() and entry.name not in ("logs", "anidb_cache")})
             except Exception as watch_error:
-                log.error("cannot watch %s: %s", os.path.dirname(CONFIG_PATH), watch_error)
-        first = False
+                log.error("cannot watch %s: %s", config_dir, watch_error)
+        finally:
+            if queued:
+                on_queued()
 
 
 def start_collection_watcher(on_queued: Callable[[], None]) -> None:
