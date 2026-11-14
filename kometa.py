@@ -292,7 +292,7 @@ logger = MyLogger("Kometa", default_dir, run_args["width"], run_args["divider"][
 from modules import util  # noqa: E402
 
 util.logger = logger
-from modules import arrivals, live_record, live_watch, timings  # noqa: E402
+from modules import arrivals, exhaustive_reconcile, live_record, live_watch, timings  # noqa: E402
 
 # Must be set before modules.cache/modules.request are imported below - both read this at import/decoration time, not per-call.
 timings.ENABLED = run_args["timings"]
@@ -1028,7 +1028,12 @@ def start(attrs):
 
 
 def run_config(config, stats):
+    exhaustive_reconcile.forget_run()
     library_status, collections_ran = run_libraries(config)
+
+    # #5634 S9c: a full run (never a scoped one) strips exhaustive-* tags no collection in the config owns any more.
+    if not (run_args["collections-only"] or run_args["overlays-only"] or run_args["metadata-only"] or run_args["operations-only"] or run_args["run-items"] or run_args["tests"] or run_args["no-missing"] or config.requested_files):
+        exhaustive_reconcile.reconcile(config.config_path, log=logger)
 
     playlist_status = {}
     playlist_stats = {}
@@ -1487,7 +1492,7 @@ def run_collection(config, library, metadata, requested_collections):
                     library.status[str(mapping_name)]["sonarr"] += sonarr_add
 
                 if builder.exhaustive:
-                    builder.run_exhaustive()
+                    builder.run_exhaustive(live_recorder.wanted_before(library.name, builder.name) if live_recorder is not None and not config.run_items else None)
 
                 if not builder.found_items and not builder.ignore_blank_results and not builder.obj and builder.mdb_list_arr_ids is None:
                     # Nothing in Plex yet, but its wanted ids are exactly what the arrival handler needs.

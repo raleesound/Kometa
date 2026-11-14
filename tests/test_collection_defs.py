@@ -437,3 +437,24 @@ def test_a_watched_directory_that_is_moved_away_and_recreated_is_watched_again(e
     (directory / "x.yml").write_text("a: 1")
     assert watcher.wait(1) and watcher.drain() is True
     watcher.close()
+
+
+def test_every_successful_definition_pass_reconciles_exhaustive_tags_and_a_failed_one_does_not(env):
+    stop, reconciled = threading.Event(), []
+    env.mine.write_text(FILE)
+    fake = FakeWatcher([True], stop)
+    env.trig.collection_watcher(lambda: None, quiet=0, watcher=fake, stop=stop, reconcile=lambda: reconciled.append(1))
+    assert len(reconciled) == 2  # the seeding pass, then the burst
+    stop2, again = threading.Event(), []
+    env.config.write_text("libraries: [")
+    env.trig.collection_watcher(lambda: None, quiet=0, watcher=FakeWatcher([True], stop2), stop=stop2, reconcile=lambda: again.append(1))
+    assert again == []
+
+
+def test_the_trigger_reconciles_against_its_own_config(env, monkeypatch):
+    seen = []
+    monkeypatch.setattr(env.trig.exhaustive_reconcile, "reconcile", lambda path, log=None: seen.append(path))
+    env.trig.reconcile_orphans()
+    assert seen == [env.trig.CONFIG_PATH]
+    monkeypatch.setattr(env.trig.exhaustive_reconcile, "reconcile", lambda path, log=None: (_ for _ in ()).throw(RuntimeError("x")))
+    env.trig.reconcile_orphans()  # never raises

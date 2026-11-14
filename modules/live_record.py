@@ -1001,6 +1001,17 @@ class RunRecorder:
         # Wrapped so "no record yet" (touch returns None) is not mistaken for a failure.
         return self._run(mapping_name, lambda conn: (touch(conn, library_name, mapping_name),)) is not None
 
+    def wanted_before(self, library_name, name):
+        """How many wanted ids the record holds for the collection, or None when it has no row or the record could not be read."""
+
+        def count(conn):
+            if get_collection(conn, library_name, name) is None:
+                return (None,)
+            return (conn.execute("SELECT COUNT(*) FROM wanted WHERE library = ? AND name = ?", (library_name, name)).fetchone()[0],)
+
+        result = self._run(name, count)
+        return None if result is None else result[0]
+
     def watched(self):
         """The Letterboxd list URLs to watch (sorted), or None when the record could not be read."""
         result = self._run("reading watched lists", lambda conn: (watched_urls(conn), conn.execute("SELECT COUNT(*) FROM collections").fetchone()[0]))
