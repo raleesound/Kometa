@@ -9,7 +9,7 @@ It is built never to guess. ``owned_tags`` answers ``None`` (and why) whenever t
 literally: a file that will not parse or is missing, a remote (url/git/repo) collection file, a template that is not defined in its own
 file, an ``acquire`` value or collection name that is a template variable. Nothing is untagged then. Only labels of the exact form
 ``exhaustive-<slug>`` (lowercase a-z, 0-9, single hyphens) are touched: the bare ``exhaustive`` tag, ``exhaustive_x`` and every other
-tag are never read as ours. Only the stdlib, PyYAML and arrapi are used, so the import trigger can run it.
+tag are never read as ours. Only the stdlib, ruamel.yaml (Kometa's own loader) and arrapi are used, so the import trigger can run it.
 """
 
 import glob
@@ -17,7 +17,7 @@ import logging
 import os
 import re
 
-import yaml
+import ruamel.yaml
 
 from modules import add_budget
 
@@ -28,8 +28,9 @@ _seen = {}
 
 
 def _read_yaml(path):
+    # The loader Kometa itself reads collection files with (YAML 1.2), so 1e3 / 0o17 / Yes mean what the builder sees.
     with open(path, encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
+        return ruamel.yaml.YAML(typ="safe").load(fh)
 
 
 def _resolve(path, root):
@@ -39,7 +40,10 @@ def _resolve(path, root):
 def _local_files(config, root):
     """([paths], reason): every local YAML file config.yml lists as a collection or metadata file. reason is set when one is not local."""
     paths = []
-    for library, attrs in ((config or {}).get("libraries") or {}).items():
+    libraries = (config or {}).get("libraries")
+    if not isinstance(libraries, dict) or not libraries:
+        return paths, "config.yml has no libraries"
+    for library, attrs in libraries.items():
         if isinstance(attrs, dict) and attrs.get("metadata_path"):
             return paths, f"{library} uses the deprecated metadata_path"
         for key in FILE_LISTS:
@@ -103,7 +107,7 @@ def _effective_name(key, sources):
     if any(k in source for source in sources for k in UNRESOLVABLE_NAME_KEYS) or any("name" in source for source in sources[1:]):
         raise ValueError("its name may be changed by a template, alias or translation")
     name = sources[0].get("name", key)
-    # PyYAML (YAML 1.1) and Kometa's ruamel (1.2) read Yes / 12:30 / 010 differently; only a string is the same under both.
+    # A number would be str()-ed by the builder in ways this scan does not model (010, 1e3); only a string is read back verbatim.
     if not isinstance(name, str) or "<<" in name:
         raise ValueError("its name is not a literal")
     return str(name)
@@ -119,6 +123,8 @@ def exhaustive_collections(config_path, root=None):
         files, remote = _local_files(config, root)
         if remote:
             return None, remote
+        if not files:
+            return None, "config.yml lists no collection files"
         found = []
         for library, path in files:
             try:

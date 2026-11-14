@@ -83,8 +83,12 @@ class TestOwnedTags:
         open(config, "w").write(text)
         assert exhaustive_reconcile.owned_tags(config)[0] is None
 
-    @pytest.mark.parametrize("collections", ["  Yes:\n    acquire: exhaustive\n", "  Picks:\n    name: 12:30\n    acquire: exhaustive\n", "  Picks:\n    name: 010\n    acquire: exhaustive\n"])
-    def test_a_name_yaml_1_1_and_1_2_read_differently_answers_none(self, tmp_path, collections):
+    @pytest.mark.parametrize("collections", ["  Picks:\n    name: 010\n    acquire: exhaustive\n"])
+    def test_names_read_the_way_kometa_reads_them(self, tmp_path):
+        config, _ = _config(tmp_path, "  Yes:\n    acquire: exhaustive\n  Picks:\n    name: 12:30\n    acquire: exhaustive\n")
+        assert exhaustive_reconcile.owned_tags(config) == ({"exhaustive-yes", "exhaustive-12-30"}, None)
+
+    def test_a_numeric_name_answers_none(self, tmp_path, collections):
         config, _ = _config(tmp_path, collections)
         assert exhaustive_reconcile.owned_tags(config)[0] is None
 
@@ -96,6 +100,18 @@ class TestOwnedTags:
         assert exhaustive_reconcile.owned_tags(str(config))[0] is None
         (folder / "x.yml").write_text("collections:\n  Picks:\n    acquire: exhaustive\n")
         assert exhaustive_reconcile.owned_tags(str(config)) == ({"exhaustive-picks"}, None)
+
+    @pytest.mark.parametrize("collections", ["  1e3:\n    acquire: exhaustive\n", "  Picks:\n    name: 0o17\n    acquire: exhaustive\n"])
+    def test_names_ruamel_reads_as_numbers_answer_none(self, tmp_path, collections):
+        config, _ = _config(tmp_path, collections)
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_a_config_with_no_libraries_or_no_files_answers_none(self, tmp_path):
+        bare = tmp_path / "bare.yml"
+        bare.write_text("radarr:\n  url: http://r\n  token: x\n")
+        assert exhaustive_reconcile.owned_tags(str(bare))[0] is None
+        bare.write_text("libraries:\n  Movies:\n    plex: {}\n")
+        assert exhaustive_reconcile.owned_tags(str(bare))[0] is None
 
     def test_dynamic_collections_answer_none(self, tmp_path):
         config, movies = _config(tmp_path, "  Picks:\n    tmdb_movie: 1\n")
