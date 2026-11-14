@@ -13,10 +13,11 @@ from modules.builder import BuilderValidationError, CollectionBuilder
 from tests.conftest import FakeLogger
 
 TAG = "exhaustive-picks"
+IDS = {TAG: 1, "other": 2, "exhaustive-other": 3, "kl-picks": 4}
 
 
 def _movie(tmdb_id, *labels):
-    return SimpleNamespace(tmdbId=tmdb_id, title=f"T{tmdb_id}", tags=[SimpleNamespace(id=1, label=label) for label in labels])
+    return SimpleNamespace(tmdbId=tmdb_id, title=f"T{tmdb_id}", tagsIds=[IDS[label] for label in labels])
 
 
 def _radarr(monkeypatch, movies):
@@ -26,6 +27,7 @@ def _radarr(monkeypatch, movies):
     r = Radarr.__new__(Radarr)
     r.api = MagicMock()
     r.api.all_movies.return_value = movies
+    r.api.all_tags.return_value = [SimpleNamespace(id=i, label=label) for label, i in IDS.items()]
     return r
 
 
@@ -77,6 +79,7 @@ def _builder(monkeypatch, radarr, **attrs):
     b.missing_movies = [1, 2, 3, 4]
     b.missing_passed_movies = [1, 2]
     b.missing_filtered_movies = [3]
+    b.has_imdb_filters = False
     b.playlist = False
     b.smart_url = None
     b.collectionless = False
@@ -95,6 +98,13 @@ class TestRunExhaustive:
         # 2 is not in Radarr; 3 was filtered out; 4 was never evaluated so it keeps its tag
         assert _edits(r) == [([1], "add"), ([3], "remove")]
         assert b.exhaustive_tagged == {1, 4}
+
+    def test_imdb_filters_make_filtered_ids_hold_their_tag(self, monkeypatch):
+        r = _radarr(monkeypatch, [_movie(3, TAG)])
+        b = _builder(monkeypatch, r, has_imdb_filters=True)
+        b.run_exhaustive()
+        r.api.edit_multiple_movies.assert_not_called()
+        assert b.exhaustive_tagged == {3}
 
     def test_a_blocker_tags_and_untags_nothing(self, monkeypatch):
         r = _radarr(monkeypatch, [_movie(1), _movie(3, TAG)])

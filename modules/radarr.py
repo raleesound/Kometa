@@ -249,9 +249,11 @@ class Radarr:
         tag = tag.lower()
         in_radarr = set()
         tagged = set()
+        # Compare tag ids: a movie's Tag objects load their label with one request each.
+        tag_ids = {t.id for t in self.api.all_tags() if t.label.lower() == tag}
         for movie in self.api.all_movies():
             in_radarr.add(movie.tmdbId)
-            if any(_t.label.lower() == tag for _t in movie.tags):
+            if tag_ids.intersection(movie.tagsIds):
                 tagged.add(movie.tmdbId)
         to_add = sorted(i for i in keep_ids if i in in_radarr and i not in tagged)
         to_remove = sorted(i for i in tagged if i not in keep_ids and i not in hold_ids)

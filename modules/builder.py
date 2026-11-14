@@ -5106,6 +5106,9 @@ class CollectionBuilder:
         passed = set(self.missing_passed_movies)
         # Ids run_missing never evaluated (a failed TMDb lookup) are neither wanted nor released: their tag, if any, stays.
         unevaluated = set(self.missing_movies) - passed - set(self.missing_filtered_movies)
+        if self.has_imdb_filters:
+            # A failed IMDb lookup counts as filtered out, so with IMDb filters a filtered id may just be unevaluated: its tag stays.
+            unevaluated |= set(self.missing_filtered_movies)
         try:
             self.exhaustive_tagged = self.library.Radarr.sync_tag(tag, passed, unevaluated)
         except Failed as e:
