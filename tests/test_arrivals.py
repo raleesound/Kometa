@@ -169,7 +169,7 @@ class TestAdd:
     def test_a_stale_record_adds_nothing(self, db):
         plex = FakePlex(ext_ids={11: 511}, collections={"Picks": {"sort": 0, "keys": []}})
         record(db, wanted=[(511, False, None)])
-        later = NOW + live_record.STALE_AFTER + timedelta(days=1)
+        later = datetime.now(timezone.utc) + live_record.STALE_AFTER + timedelta(days=1)
         assert arrivals.handle_item(db, plex, 11, now=later) is True
         assert plex.adds == []
 

@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 DB_NAME = "live-collections.db"
 # Bump on any schema change: an older record is dropped and rebuilt (it is derived data; the next
 # sweep repopulates it).
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 TABLES = ("collections", "members", "wanted", "history", "arrivals", "builds", "record_meta", "watch_seen", "collection_defs")
 # What an out-of-date record keeps when it is dropped and rebuilt: the outbox remembers which items
 # were announced, and losing it would announce them all again.
@@ -46,6 +46,8 @@ MIGRATIONS = {
     4: (),
     # v6: collection_defs (CREATE IF NOT EXISTS in _create): the definition hash of each configured collection, which the trigger diffs to run a new or edited collection by itself.
     5: (),
+    # v7: wanted.tagged: the ids an acquire: exhaustive collection has tagged exhaustive-<slug> in Radarr.
+    6: ("ALTER TABLE wanted ADD COLUMN tagged INTEGER NOT NULL DEFAULT 0",),
 }
 # Readers (the arrival handler) can afford to wait; a Kometa run must not stall on a held lock,
 # so its writes use a short timeout and give up for the rest of the run after repeated failures.
@@ -98,6 +100,7 @@ CREATE TABLE IF NOT EXISTS wanted (
     filtered INTEGER,
     held_back INTEGER NOT NULL,
     position INTEGER,
+    tagged INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (library, name, ext_id)
 );
 CREATE INDEX IF NOT EXISTS wanted_by_id ON wanted (ext_id);
@@ -281,6 +284,7 @@ def write_collection(conn, snapshot):
     unknown; used only when there is no earlier record to diff against),
     wanted (list of (ext_id, filtered, held_back, position); filtered is True/False, or None when
     run_missing never evaluated the id),
+    tagged (optional: tmdb ids an acquire: exhaustive collection carries the Radarr tag on after this run; None or absent keeps the last recorded set),
     observed_at (optional aware datetime: when this run started reading the collection from Plex).
 
     When this run could not establish a custom order (sort failed or skipped) the last good order
@@ -318,8 +322,15 @@ def write_collection(conn, snapshot):
         elif prior is None and snapshot.get("previous_members") is not None:
             old_members = {rk: ext_id for rk, ext_id in snapshot["previous_members"]}
         old_wanted = None
+        old_tagged = set()
         if prior is not None:
-            old_wanted = {row["ext_id"] for row in conn.execute("SELECT ext_id FROM wanted WHERE library = ? AND name = ?", (library, name))}
+            old_wanted = set()
+            for row in conn.execute("SELECT ext_id, tagged FROM wanted WHERE library = ? AND name = ?", (library, name)):
+                old_wanted.add(row["ext_id"])
+                if row["tagged"]:
+                    old_tagged.add(row["ext_id"])
+        # None = this run did not evaluate the tag (blocker, Radarr error, not exhaustive): the last recorded set stands.
+        tagged = old_tagged if snapshot.get("tagged") is None else set(snapshot["tagged"])
 
         order_recorded_at = now if order_recorded else None
         if not order_recorded and prior is not None and prior["order_recorded"] and snapshot["collection_order"] and prior["collection_order"] == snapshot["collection_order"]:
@@ -380,8 +391,8 @@ def write_collection(conn, snapshot):
             )
         conn.execute("DELETE FROM wanted WHERE library = ? AND name = ?", (library, name))
         conn.executemany(
-            "INSERT OR REPLACE INTO wanted (library, name, ext_id, filtered, held_back, position) VALUES (?, ?, ?, ?, ?, ?)",
-            [(library, name, ext_id, _bool_or_none(filtered), int(bool(held)), pos) for ext_id, filtered, held, pos in wanted],
+            "INSERT OR REPLACE INTO wanted (library, name, ext_id, filtered, held_back, position, tagged) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(library, name, ext_id, _bool_or_none(filtered), int(bool(held)), pos, int(ext_id in tagged)) for ext_id, filtered, held, pos in wanted],
         )
         conn.executemany("INSERT INTO history (library, name, recorded_at, event, rating_key, ext_id, source) VALUES (?, ?, ?, ?, ?, ?, ?)", [(library, name, now, event, rk, ext_id, SOURCE_RUN) for event, rk, ext_id in events])
         _trim_history(conn, library, name)
@@ -920,6 +931,7 @@ def build_snapshot(builder, library, metadata, add_ran, sync_ran, mapping_name=N
         "previous_members": previous_members,
         "wanted": wanted,
         "watch_urls": _watch_urls(builder),
+        "tagged": builder.exhaustive_tagged if getattr(builder, "exhaustive", False) else None,
     }
 
 
