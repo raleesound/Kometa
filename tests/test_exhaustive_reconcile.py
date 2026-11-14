@@ -83,11 +83,11 @@ class TestOwnedTags:
         open(config, "w").write(text)
         assert exhaustive_reconcile.owned_tags(config)[0] is None
 
-    @pytest.mark.parametrize("collections", ["  Picks:\n    name: 010\n    acquire: exhaustive\n"])
     def test_names_read_the_way_kometa_reads_them(self, tmp_path):
         config, _ = _config(tmp_path, "  Yes:\n    acquire: exhaustive\n  Picks:\n    name: 12:30\n    acquire: exhaustive\n")
         assert exhaustive_reconcile.owned_tags(config) == ({"exhaustive-yes", "exhaustive-12-30"}, None)
 
+    @pytest.mark.parametrize("collections", ["  Picks:\n    name: 010\n    acquire: exhaustive\n"])
     def test_a_numeric_name_answers_none(self, tmp_path, collections):
         config, _ = _config(tmp_path, collections)
         assert exhaustive_reconcile.owned_tags(config)[0] is None
