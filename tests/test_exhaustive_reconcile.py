@@ -61,6 +61,28 @@ class TestOwnedTags:
         config, _ = _config(tmp_path, collections, templates=templates)
         assert exhaustive_reconcile.owned_tags(config)[0] is None
 
+    def test_keys_and_the_value_match_the_way_the_builder_reads_them(self, tmp_path):
+        config, _ = _config(tmp_path, "  Picks:\n    Acquire: ' EXHAUSTIVE '\n    Name: Real\n")
+        assert exhaustive_reconcile.owned_tags(config) == ({"exhaustive-real"}, None)
+
+    @pytest.mark.parametrize(
+        "collections,templates",
+        [
+            ("  Picks:\n    collection_name: Real\n    acquire: exhaustive\n", ""),
+            ("  Picks:\n    translation_key: imdb_top_250\n    acquire: exhaustive\n", ""),
+            ("  Picks:\n    template: {name: t, k: acquire}\n", "templates:\n  t:\n    <<k>>: exhaustive\n"),
+        ],
+    )
+    def test_more_ways_the_name_or_key_can_move_answer_none(self, tmp_path, collections, templates):
+        config, _ = _config(tmp_path, collections, templates=templates)
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_deprecated_metadata_path_answers_none(self, tmp_path):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        text = open(config).read().replace("collection_files:", "metadata_path:")
+        open(config, "w").write(text)
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
     def test_dynamic_collections_answer_none(self, tmp_path):
         config, movies = _config(tmp_path, "  Picks:\n    tmdb_movie: 1\n")
         movies.write_text("dynamic_collections:\n  X:\n    type: genre\n    template: {name: t}\ntemplates:\n  t:\n    acquire: exhaustive\n")

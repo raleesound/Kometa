@@ -40,6 +40,8 @@ def _local_files(config, root):
     """([paths], reason): every local YAML file config.yml lists as a collection or metadata file. reason is set when one is not local."""
     paths = []
     for library, attrs in ((config or {}).get("libraries") or {}).items():
+        if isinstance(attrs, dict) and attrs.get("metadata_path"):
+            return paths, f"{library} uses the deprecated metadata_path"
         for key in FILE_LISTS:
             for entry in (attrs.get(key) if isinstance(attrs, dict) else None) or []:
                 if not isinstance(entry, dict):
@@ -54,40 +56,49 @@ def _local_files(config, root):
     return paths, None
 
 
-def _acquire_values(block, templates):
-    """Every literal ``acquire`` value a collection block (or a template it names) sets; raises ValueError when one cannot be read literally."""
-    values = []
-    sources = [block]
-    names = []
-    template = block.get("template")
+UNRESOLVABLE_NAME_KEYS = ("name_mapping", "translations", "translation_key", "translation_prefix", "key_name", "language", "collection_name", "playlist_name")
+
+
+def _lower(source):
+    """A block as Kometa reads it: attribute keys match case-insensitively. Raises ValueError when a key is a template variable."""
+    out = {}
+    for key, value in source.items():
+        if "<<" in str(key):
+            raise ValueError("it has an attribute whose key is a template variable")
+        out[str(key).strip().lower()] = value
+    return out
+
+
+def _sources(block, templates):
+    """[block, *templates it names], each key-lowercased; raises ValueError when a named template is not defined in its own file."""
+    sources = [_lower(block)]
+    template = sources[0].get("template")
     for item in template if isinstance(template, list) else [template]:
         name = item.get("name") if isinstance(item, dict) else item
         if isinstance(name, str):
-            names.append(name)
-    for name in names:
-        if not isinstance(templates.get(name), dict):
-            raise ValueError(f"it names template {name} which is not defined in its own file")
-        sources.append(templates[name])
+            if not isinstance(templates.get(name), dict):
+                raise ValueError(f"it names template {name} which is not defined in its own file")
+            sources.append(_lower(templates[name]))
+    return sources
+
+
+def _acquire_values(sources):
+    """Every literal ``acquire`` value a collection (or a template it names) sets, as the builder reads it; raises ValueError when one cannot be read literally."""
+    values = []
     for source in sources:
         if "acquire" in source:
             value = source["acquire"]
             if not isinstance(value, str) or "<<" in value:
                 raise ValueError("its acquire value is not a literal")
-            values.append(value)
+            values.append(value.strip().lower())
     return values
 
 
-def _effective_name(key, block, templates):
+def _effective_name(key, sources):
     """The name Kometa will run the collection under (the builder tags exhaustive_tag(builder.name)); raises ValueError when it cannot be read literally."""
-    sources = [block]
-    template = block.get("template")
-    for item in template if isinstance(template, list) else [template]:
-        tname = item.get("name") if isinstance(item, dict) else item
-        if isinstance(tname, str) and isinstance(templates.get(tname), dict):
-            sources.append(templates[tname])
-    if any(k in source for source in sources for k in ("name_mapping", "translations")) or any("name" in source for source in sources[1:]):
-        raise ValueError("its name may be changed by a template or translation")
-    name = block.get("name", key)
+    if any(k in source for source in sources for k in UNRESOLVABLE_NAME_KEYS) or any("name" in source for source in sources[1:]):
+        raise ValueError("its name may be changed by a template, alias or translation")
+    name = sources[0].get("name", key)
     if not isinstance(name, (str, int, float)) or "<<" in str(name):
         raise ValueError("its name is not a literal")
     return str(name)
@@ -123,14 +134,12 @@ def exhaustive_collections(config_path, root=None):
                 if not isinstance(block, dict):
                     return None, f"{os.path.basename(path)}: collection {name} is not a mapping"
                 try:
-                    values = _acquire_values(block, templates)
+                    sources = _sources(block, templates)
+                    values = _acquire_values(sources)
+                    if "exhaustive" in values:
+                        found.append((library, _effective_name(name, sources)))
                 except ValueError as e:
                     return None, f"{os.path.basename(path)}: collection {name}: {e}"
-                if "exhaustive" in values:
-                    try:
-                        found.append((library, _effective_name(name, block, templates)))
-                    except ValueError as e:
-                        return None, f"{os.path.basename(path)}: collection {name}: {e}"
     except Exception as e:
         return None, f"config.yml cannot be read ({type(e).__name__})"
     return found, None
