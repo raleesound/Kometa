@@ -182,7 +182,7 @@ class TestStorage:
         old.close()
         log = StackLogger()
         conn = live_record.connect(path, log=log)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION == 7
         assert live_record.get_collection(conn, "Movies", "Picks") is None
         assert any("schema v1 is out of date" in m for m in log.warning_messages)
         live_record.write_collection(conn, snapshot(wanted=[(5, False, False, None)]))
@@ -200,7 +200,7 @@ class TestStorage:
         recorder = live_record.RunRecorder(str(tmp_path), log)
         assert recorder.record(fake_library(), METADATA, fake_builder(), "picks", False, False) is True
         assert recorder.failures == 0
-        assert any("rebuilt it as v6" in m for m in log.warning_messages)
+        assert any("rebuilt it as v7" in m for m in log.warning_messages)
 
     def test_a_current_record_is_not_rebuilt(self, tmp_path):
         path = live_record.db_path(str(tmp_path))
@@ -1079,7 +1079,8 @@ def test_connect_rejects_a_non_database(tmp_path):
 
 
 def _v2_schema():
-    schema = live_record.SCHEMA.replace("    source TEXT,\n    added_at TEXT,\n", "").replace(",\n    source TEXT\n", "\n").replace("    watch_urls TEXT,\n", "")
+    schema = live_record.SCHEMA.replace("    source TEXT,\n    added_at TEXT,\n", "").replace(",\n    source TEXT\n", "\n").replace("    watch_urls TEXT,\n", "").replace("    tagged INTEGER NOT NULL DEFAULT 0,\n", "")
+    assert "tagged" not in schema
     assert "source TEXT" not in schema and "added_at" not in schema
     return schema
 
@@ -1249,6 +1250,7 @@ def test_v3_record_upgrades_in_place_with_the_watch_column(tmp_path):
     conn = live_record.connect(path)
     live_record.write_collection(conn, snapshot("One", members=[(1, 10, None)]))
     conn.execute("ALTER TABLE collections DROP COLUMN watch_urls")
+    conn.execute("ALTER TABLE wanted DROP COLUMN tagged")
     conn.execute("PRAGMA user_version = 3")
     conn.close()
     conn = live_record.connect(path)
@@ -1316,6 +1318,7 @@ def test_the_record_upgrades_from_v4_in_place_with_watch_seen(tmp_path):
     conn = live_record.connect(path)
     conn.execute("DROP TABLE watch_seen")
     conn.execute("ALTER TABLE builds DROP COLUMN gen")
+    conn.execute("ALTER TABLE wanted DROP COLUMN tagged")
     conn.execute("PRAGMA user_version = 4")
     conn.close()
     conn = live_record.connect(path)

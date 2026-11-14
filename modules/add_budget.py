@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 LEDGER_PREFIX = "kl-"
+EXHAUSTIVE_PREFIX = "exhaustive-"
 WINDOW = timedelta(days=7)
 _TAG_LABEL = re.compile(r"^[a-z0-9-]+$")
 
@@ -39,6 +40,12 @@ def default_ledger_tag(collection_name):
     """Stable ledger tag derived from the collection name (Radarr/Sonarr labels allow only a-z, 0-9 and -)."""
     slug = re.sub(r"[^a-z0-9]+", "-", str(collection_name).lower()).strip("-")
     return f"{LEDGER_PREFIX}{slug or 'collection'}"
+
+
+def exhaustive_tag(collection_name):
+    """Radarr tag marking every wanted film of an ``acquire: exhaustive`` collection; the bridge matches the ``exhaustive`` prefix."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(collection_name).lower()).strip("-")
+    return f"{EXHAUSTIVE_PREFIX}{slug or 'collection'}"
 
 
 def valid_ledger_tag(tag):

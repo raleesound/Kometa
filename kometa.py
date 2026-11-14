@@ -1486,6 +1486,9 @@ def run_collection(config, library, metadata, requested_collections):
                     library.stats["sonarr"] += sonarr_add
                     library.status[str(mapping_name)]["sonarr"] += sonarr_add
 
+                if builder.exhaustive:
+                    builder.run_exhaustive()
+
                 if not builder.found_items and not builder.ignore_blank_results and not builder.obj and builder.mdb_list_arr_ids is None:
                     # Nothing in Plex yet, but its wanted ids are exactly what the arrival handler needs.
                     live_ran = (builder, add_ran, sync_ran)

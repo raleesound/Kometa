@@ -243,6 +243,27 @@ class Radarr:
             for tmdb_id in not_exists:
                 logger.info(f"TMDb ID Not in Radarr | {tmdb_id}")
 
+    def sync_tag(self, tag, keep_ids, hold_ids=()):
+        """Make ``tag`` sit on exactly the Radarr movies in ``keep_ids`` (TMDb ids), touching nothing else. Only the difference is sent, in batched editor calls,
+        so a repeat run changes nothing. Tagged movies in ``hold_ids`` are left alone. Returns the TMDb ids carrying the tag afterwards."""
+        tag = tag.lower()
+        in_radarr = set()
+        tagged = set()
+        for movie in self.api.all_movies():
+            in_radarr.add(movie.tmdbId)
+            if any(_t.label.lower() == tag for _t in movie.tags):
+                tagged.add(movie.tmdbId)
+        to_add = sorted(i for i in keep_ids if i in in_radarr and i not in tagged)
+        to_remove = sorted(i for i in tagged if i not in keep_ids and i not in hold_ids)
+        absent = len([i for i in keep_ids if i not in in_radarr])
+        logger.info("")
+        logger.info(f"Radarr Exhaustive ({tag}): {len(tagged)} tagged, adding {len(to_add)}, removing {len(to_remove)}" + (f", {absent} not in Radarr" if absent else ""))
+        if to_add:
+            self.api.edit_multiple_movies(to_add, tags=[tag], apply_tags="add", per_request=100)
+        if to_remove:
+            self.api.edit_multiple_movies(to_remove, tags=[tag], apply_tags="remove", per_request=100)
+        return (tagged | set(to_add)) - set(to_remove)
+
     def remove_all_with_tags(self, tags):
         lower_tags = [_t.lower() for _t in tags]
         remove_items = []

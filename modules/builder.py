@@ -138,6 +138,7 @@ ignored_details = [
     "suppress_overlays",
     "delete_not_scheduled",
     "live_watch",
+    "acquire",
     "tmdb_person",
     "build_collection",
     "collection_order",
@@ -1199,6 +1200,9 @@ class CollectionBuilder:
         self.created = False
         self.deleted = False
         self.live_watch = False
+        # acquire: exhaustive (epic #5634 addendum 6): every wanted movie is added to Radarr with no drip and tagged exhaustive-<slug>.
+        self.exhaustive = False
+        self.exhaustive_tagged = None  # tmdb ids carrying the tag after this run; None = not evaluated (the record keeps its last set)
 
         if self.playlist:
             server_check = None
@@ -1257,6 +1261,15 @@ class CollectionBuilder:
             logger.debug("Validating Method: live_watch")
             logger.debug(f"Value: {data[methods['live_watch']]}")
             self.live_watch = util.parse(self.Type, "live_watch", self.data, datatype="bool", methods=methods, default=False)
+
+        if "acquire" in methods and not self.overlay:
+            logger.debug("")
+            logger.debug("Validating Method: acquire")
+            logger.debug(f"Value: {data[methods['acquire']]}")
+            acquire = str(self.data[methods["acquire"]]).strip().lower() if self.data[methods["acquire"]] is not None else ""
+            if acquire != "exhaustive":
+                raise Failed(f"{self.Type} Error: acquire attribute must be exhaustive")
+            self.exhaustive = True
 
         if "schedule" in methods and not self.config.requested_collections and not self.overlay:
             logger.debug("")
@@ -1747,6 +1760,8 @@ class CollectionBuilder:
             raise BuilderValidationError(f"{self.Type} Error: No builders allowed with blank_collection")
 
         self._validate_custom_sort()
+
+        self._apply_exhaustive()
 
         if "add_missing" not in self.radarr_details:
             self.radarr_details["add_missing"] = self.library.Radarr.add_missing if self.library.Radarr else False
@@ -5058,6 +5073,46 @@ class CollectionBuilder:
             if self.do_report:
                 self.library.add_missing(self.name, self.missing_parts, False)
         return added_to_radarr, added_to_sonarr
+
+    def _apply_exhaustive(self):
+        """acquire: exhaustive means radarr add_missing with no drip. Movies only: anything else is ignored with a log line."""
+        if not self.exhaustive:
+            return
+        if self.playlist or not self.library.is_movie or self.smart_url or self.collectionless:
+            logger.info(f"{self.Type} Info: acquire: exhaustive only applies to movie collections; ignored for {self.name}")
+            self.exhaustive = False
+            return
+        if not self.library.Radarr:
+            logger.warning(f"{self.Type} Warning: acquire: exhaustive has no effect because Radarr is not configured for {self.library.name}")
+            self.exhaustive = False
+            return
+        if self.radarr_details.get("add_missing") is False or "add_missing_initial" in self.radarr_details or "add_missing_per_week" in self.radarr_details or "add_missing_ledger_tag" in self.radarr_details:
+            raise BuilderValidationError(f"{self.Type} Error: acquire: exhaustive cannot be combined with radarr_add_missing: false or the add_missing drip attributes")
+        self.radarr_details["add_missing"] = True
+
+    def run_exhaustive(self):
+        """Tag every wanted movie exhaustive-<slug> in Radarr (including ones already there but not downloaded) and untag ids that left the wanted set. Never raises."""
+        self.exhaustive_tagged = None
+        if not self.exhaustive or not self.do_missing:
+            return
+        tag = add_budget.exhaustive_tag(self.name)
+        if self.budget_blockers:
+            # The list may be incomplete, so this run cannot say what is wanted: tag and untag nothing.
+            logger.info("")
+            logger.warning(f"Radarr Exhaustive ({tag}): leaving every tag as it is this run because the list may be incomplete")
+            for reason in self.budget_blockers:
+                logger.warning(f"Radarr Exhaustive Blocker | {reason}")
+            return
+        passed = set(self.missing_passed_movies)
+        # Ids run_missing never evaluated (a failed TMDb lookup) are neither wanted nor released: their tag, if any, stays.
+        unevaluated = set(self.missing_movies) - passed - set(self.missing_filtered_movies)
+        try:
+            self.exhaustive_tagged = self.library.Radarr.sync_tag(tag, passed, unevaluated)
+        except Failed as e:
+            logger.error(e)
+        except ArrException as e:
+            logger.stacktrace()
+            logger.error(f"Arr Error: {e}")
 
     def _validate_add_budgets(self):
         for arr_name, arr_details in (("radarr", self.radarr_details), ("sonarr", self.sonarr_details)):

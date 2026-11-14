@@ -150,6 +150,7 @@ def test_schema_upgrade_from_v5_keeps_the_record_and_seeds_silently(tmp_path):
     conn.commit()
     before = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("builds", "arrivals", "watch_seen")}
     conn.execute("DROP TABLE collection_defs")
+    conn.execute("ALTER TABLE wanted DROP COLUMN tagged")
     conn.execute("PRAGMA user_version = 5")
     conn.close()
     conn = live_record.connect(path)
