@@ -77,6 +77,22 @@ def _acquire_values(block, templates):
     return values
 
 
+def _effective_name(key, block, templates):
+    """The name Kometa will run the collection under (the builder tags exhaustive_tag(builder.name)); raises ValueError when it cannot be read literally."""
+    sources = [block]
+    template = block.get("template")
+    for item in template if isinstance(template, list) else [template]:
+        tname = item.get("name") if isinstance(item, dict) else item
+        if isinstance(tname, str) and isinstance(templates.get(tname), dict):
+            sources.append(templates[tname])
+    if any(k in source for source in sources for k in ("name_mapping", "translations")) or any("name" in source for source in sources[1:]):
+        raise ValueError("its name may be changed by a template or translation")
+    name = block.get("name", key)
+    if not isinstance(name, (str, int, float)) or "<<" in str(name):
+        raise ValueError("its name is not a literal")
+    return str(name)
+
+
 def exhaustive_collections(config_path, root=None):
     """([(library, mapping_name)], reason): the collections the config defines with ``acquire: exhaustive``. reason is None when the whole config was read."""
     root = root or os.path.dirname(os.path.dirname(config_path))
@@ -95,6 +111,8 @@ def exhaustive_collections(config_path, root=None):
                 return None, f"{os.path.basename(path)} cannot be read now ({type(e).__name__})"
             if not isinstance(data, dict):
                 return None, f"{os.path.basename(path)} is not a mapping document"
+            if data.get("dynamic_collections"):
+                return None, f"{os.path.basename(path)} has dynamic_collections, whose names this scan cannot resolve"
             collections = data.get("collections")
             if collections is None:
                 continue
@@ -109,9 +127,10 @@ def exhaustive_collections(config_path, root=None):
                 except ValueError as e:
                     return None, f"{os.path.basename(path)}: collection {name}: {e}"
                 if "exhaustive" in values:
-                    if "<<" in str(name):
-                        return None, f"{os.path.basename(path)}: collection name {name} is a template variable"
-                    found.append((library, str(name)))
+                    try:
+                        found.append((library, _effective_name(name, block, templates)))
+                    except ValueError as e:
+                        return None, f"{os.path.basename(path)}: collection {name}: {e}"
     except Exception as e:
         return None, f"config.yml cannot be read ({type(e).__name__})"
     return found, None

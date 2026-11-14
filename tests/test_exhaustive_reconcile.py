@@ -44,6 +44,28 @@ class TestOwnedTags:
         owned, reason = exhaustive_reconcile.owned_tags(config)
         assert owned is None and reason
 
+    def test_a_literal_name_override_is_the_name_that_owns_the_tag(self, tmp_path):
+        config, _ = _config(tmp_path, "  Picks:\n    name: Rob's Best Picks\n    acquire: exhaustive\n")
+        assert exhaustive_reconcile.owned_tags(config) == ({add_budget.exhaustive_tag("Rob's Best Picks")}, None)
+
+    @pytest.mark.parametrize(
+        "collections,templates",
+        [
+            ("  Picks:\n    name: <<x>>\n    acquire: exhaustive\n", ""),
+            ("  Picks:\n    name_mapping: Other\n    acquire: exhaustive\n", ""),
+            ("  Picks:\n    translations: {fr: Choix}\n    acquire: exhaustive\n", ""),
+            ("  Picks:\n    template: {name: t}\n", "templates:\n  t:\n    acquire: exhaustive\n    name: Other\n"),
+        ],
+    )
+    def test_a_name_it_cannot_resolve_answers_none(self, tmp_path, collections, templates):
+        config, _ = _config(tmp_path, collections, templates=templates)
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_dynamic_collections_answer_none(self, tmp_path):
+        config, movies = _config(tmp_path, "  Picks:\n    tmdb_movie: 1\n")
+        movies.write_text("dynamic_collections:\n  X:\n    type: genre\n    template: {name: t}\ntemplates:\n  t:\n    acquire: exhaustive\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
     def test_a_missing_unparsable_or_remote_file_answers_none(self, tmp_path):
         config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
         movies.write_text("collections: [unclosed\n")
