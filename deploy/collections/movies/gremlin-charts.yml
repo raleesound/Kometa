@@ -2,12 +2,14 @@
 # Gremlins' Letterboxd ratings. How to add one: the gremlin-charts skill
 # (.agent/skills/gremlin-charts.md in the monorepo). Sort titles
 # "!020_LB_!NN_<slug>" put these ahead of every other Letterboxd chart.
-# live_watch / acquire (#5634 S6, S9b) are added here only once live.
+# live_watch (#5634 S7): the bridge publishes each chart list's change the moment Gizmo's write is
+# verified, and the trigger reruns just that collection. acquire (S9b) is added here only once live.
 # Posters are host-local like every movies/assets PNG (deploy.sh syncs YAML
 # only): file_poster PNGs are copied to CONFIG_DIR/movies/assets/ by hand.
 collections:
   "The Cinema Gremlins' Top 100":
     letterboxd_list: https://letterboxd.com/thisnames2long/list/the-cinema-gremlins-top-100/
+    live_watch: true
     sort_title: "!020_LB_!01_the_cinema_gremlins_top_100"
     collection_order: custom
     summary: "The films the Cinema Gremlins love most, from every star each of us has given on Letterboxd.\n\nHow it's ranked: a film needs at least three Gremlins' ratings to place. Its score starts from our average, pulled toward the group's overall average as if it had five more ratings, so a couple of perfect scores can't carry it. Then it gives up 0.3 for every tenfold its Letterboxd audience grows past 50,000 ratings.\n\nWhy: ranked on our stars alone, this came out as every other top 100, the classics everyone has seen and everyone loves. The popularity weight makes room for the films we love more than the rest of Letterboxd does, without letting a film three of us found…"
@@ -16,6 +18,7 @@ collections:
     radarr_add_missing: true
   "Gremlins Trending":
     letterboxd_list: https://letterboxd.com/thisnames2long/list/gremlins-trending/
+    live_watch: true
     sort_title: "!020_LB_!02_gremlins_trending"
     collection_order: custom
     summary: "What the Cinema Gremlins are watching right now, from every film we log on Letterboxd.\n\nHow it's ranked: the chart looks back over the group's last few hundred diary logs, somewhere between three days and three weeks depending on how busy we've been. A fresh log counts most: a log loses half its weight every third of that window. Each Gremlin counts once per film, so a rewatch doesn't stack, and a film needs at least two of us to make the chart. Stars don't change the order; it is only what we are watching."
@@ -24,6 +27,7 @@ collections:
     radarr_add_missing: true
   "The Divisive 50":
     letterboxd_list: https://letterboxd.com/thisnames2long/list/the-divisive-50/
+    live_watch: true
     sort_title: "!020_LB_!03_the_divisive_50"
     collection_order: custom
     summary: "The films that split the Cinema Gremlins, from every star each of us has given on Letterboxd.\n\nHow it's ranked: pick any two Gremlins who rated a film and count how many stars apart they are. A film's gap is that distance, averaged over every pair of us who rated it. A film needs at least four of us to place, and the gap is pulled toward the gap a typical film gets, so a film four of us argued over can't outrank one a dozen of us did. Only the distance counts, not whether the stars are high or low: a film we all gave half a star isn't divisive, it's unanimous."
@@ -32,6 +36,7 @@ collections:
     radarr_add_missing: true
   "Gremlin Deep Cuts":
     letterboxd_list: https://letterboxd.com/thisnames2long/list/gremlin-deep-cuts/
+    live_watch: true
     sort_title: "!020_LB_!04_gremlin_deep_cuts"
     collection_order: custom
     summary: "The films the Cinema Gremlins love that hardly anyone else has found, from every star each of us has given on Letterboxd.\n\nHow it's ranked: a film needs at least three Gremlins' ratings, and fewer Letterboxd ratings than 9 in 10 films we've rated. Then it's scored like our Top 100: our average, pulled toward the group's overall average as if it had five more ratings, so a couple of perfect scores can't carry it. The line is worked out again as we rate more, so a film can age out when the rest of Letterboxd catches up with it."
@@ -40,6 +45,7 @@ collections:
     radarr_add_missing: true
   "The Cinema Gremlins' Bottom 50":
     letterboxd_list: https://letterboxd.com/thisnames2long/list/the-cinema-gremlins-bottom-50/
+    live_watch: true
     sort_title: "!020_LB_!05_the_cinema_gremlins_bottom_50"
     collection_order: custom
     summary: "The films the Cinema Gremlins rate worst, from every star each of us has given on Letterboxd. Our Top 100, upside down.\n\nHow it's ranked: a film needs at least three Gremlins' ratings to place. Its score starts from our average, pulled toward the group's overall average as if it had five more ratings, so three half-stars can't sink a film below one six of us panned. Lowest score first."
