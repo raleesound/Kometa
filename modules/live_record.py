@@ -745,13 +745,15 @@ def fail_build(conn, library, mapping_name, max_attempts, gen=None):
 
 DEFS_SEEDED = "collection_defs_seeded"
 DEFS_GONE = "collection_defs_gone"
+DEFS_UNSEEDED = "collection_defs_unseeded"
 
 
 def apply_collection_defs(conn, found, held_files=(), now=None, renew=True):
     """Diff the collection definitions now configured against the table and queue a scoped run of every new or changed one.
 
     ``found`` maps (library, mapping_name) -> (source_file, hash). The first call ever (no DEFS_SEEDED marker) only records
-    them: a deploy must not rebuild every collection. A collection that is gone just loses its row. One transaction, so a
+    them: a deploy must not rebuild every collection. A file held (unreadable) then is remembered as unseeded: its collections are
+    recorded silently the first time it reads, while every other file's edits queue normally from the start. A collection that is gone just loses its row. One transaction, so a
     crash queues and records nothing or both. Rows of a file in ``held_files`` (unreadable right now) are left alone. Returns the (library, mapping_name) list queued."""
     stamp = _stamp(now or datetime.now(timezone.utc))
     conn.execute("BEGIN IMMEDIATE")
@@ -760,6 +762,8 @@ def apply_collection_defs(conn, found, held_files=(), now=None, renew=True):
         known, files = {}, {}
         for r in conn.execute("SELECT library, mapping_name, source_file, hash FROM collection_defs"):
             known[(r["library"], r["mapping_name"])], files[(r["library"], r["mapping_name"])] = r["hash"], r["source_file"]
+        row = conn.execute("SELECT value FROM record_meta WHERE key = ?", (DEFS_UNSEEDED,)).fetchone()
+        unseeded = set(json.loads(row["value"])) if row else set()
         queued = []
         for key in sorted(found):
             source_file, digest = found[key]
@@ -770,7 +774,7 @@ def apply_collection_defs(conn, found, held_files=(), now=None, renew=True):
                 "ON CONFLICT (library, mapping_name) DO UPDATE SET source_file = excluded.source_file, hash = excluded.hash, seen_at = excluded.seen_at",
                 (key[0], key[1], source_file, digest, stamp),
             )
-            if seeded:
+            if seeded and source_file not in unseeded:
                 queue_build(conn, key[0], key[1], source_file, now=now, renew=renew)
                 queued.append(key)
         # A collection leaves the table only when two passes in a row find it gone: a file read half-written can parse and
@@ -781,9 +785,13 @@ def apply_collection_defs(conn, found, held_files=(), now=None, renew=True):
         for key in gone & before:
             conn.execute("DELETE FROM collection_defs WHERE library = ? AND mapping_name = ?", key)
         conn.execute("INSERT OR REPLACE INTO record_meta (key, value) VALUES (?, ?)", (DEFS_GONE, json.dumps(sorted(gone - before))))
-        # Seeded only from a complete read: with a file held, its collections would all be "new" when it next reads.
-        if not seeded and found and not held_files:
+        # The first read that found collections is the seed. A file held then has nothing recorded yet: it is seeded when it first reads.
+        if not seeded and found:
             conn.execute("INSERT OR IGNORE INTO record_meta (key, value) VALUES (?, ?)", (DEFS_SEEDED, stamp))
+            unseeded = set(held_files)
+        else:
+            unseeded &= set(held_files)
+        conn.execute("INSERT OR REPLACE INTO record_meta (key, value) VALUES (?, ?)", (DEFS_UNSEEDED, json.dumps(sorted(unseeded))))
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
