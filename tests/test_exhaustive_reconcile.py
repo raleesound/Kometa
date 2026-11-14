@@ -154,13 +154,13 @@ def _api(tags, movies):
     return api
 
 
-TAGS = {"exhaustive-picks": 1, "exhaustive-gone": 2, "exhaustive": 3, "exhaustive_x": 4, "exhaustive-": 5, "kl-gone": 6, "Exhaustive-Loud": 7}
+TAGS = {"exhaustive-picks": 1, "exhaustive-gone": 2, "exhaustive": 3, "exhaustive_x": 4, "exhaustive-": 5, "kl-gone": 6, "Exhaustive-Loud": 7, "exhaustive-a": 8, "exhaustive-b": 9}
 
 
 class TestStripOrphans:
     def test_only_unowned_exhaustive_slug_tags_are_stripped_and_deleted(self):
         api = _api(TAGS, {10: ["exhaustive-gone"], 11: ["exhaustive-gone", "exhaustive-picks"], 12: ["exhaustive"], 13: ["kl-gone", "exhaustive_x"], 14: ["exhaustive-picks"]})
-        result = exhaustive_reconcile.strip_orphans(api, {"exhaustive-picks"}, logging.getLogger("t"))
+        result = exhaustive_reconcile.strip_orphans(api, {"exhaustive-picks", "exhaustive-a", "exhaustive-b"}, logging.getLogger("t"))
         assert result == {"exhaustive-gone": 2, "exhaustive-loud": 0}
         calls = [(c.args[0], c.kwargs["tags"], c.kwargs["apply_tags"]) for c in api.edit_multiple_movies.call_args_list]
         assert calls == [([10, 11], ["exhaustive-gone"], "remove")]
@@ -168,7 +168,7 @@ class TestStripOrphans:
 
     def test_nothing_orphaned_touches_nothing_and_reads_no_movies(self):
         api = _api(TAGS, {10: ["exhaustive-picks"]})
-        assert exhaustive_reconcile.strip_orphans(api, {"exhaustive-picks", "exhaustive-gone", "exhaustive-loud"}, logging.getLogger("t")) == {}
+        assert exhaustive_reconcile.strip_orphans(api, {"exhaustive-picks", "exhaustive-gone", "exhaustive-loud", "exhaustive-a", "exhaustive-b"}, logging.getLogger("t")) == {}
         api.all_movies.assert_not_called()
         api.delete_tag.assert_not_called()
 
@@ -182,18 +182,18 @@ class TestStripOrphans:
             raise ValueError("no JSON")
 
         api.delete_tag.side_effect = delete
-        assert "exhaustive-gone" in exhaustive_reconcile.strip_orphans(api, {"exhaustive-picks"}, logging.getLogger("t"))
+        assert "exhaustive-gone" in exhaustive_reconcile.strip_orphans(api, {"exhaustive-picks", "exhaustive-a", "exhaustive-b", "exhaustive-loud"}, logging.getLogger("t"))
 
     def test_a_delete_that_really_failed_raises(self):
         api = _api(TAGS, {10: ["exhaustive-gone"]})
         api.delete_tag.side_effect = ValueError("no JSON")
         with pytest.raises(ValueError):
-            exhaustive_reconcile.strip_orphans(api, {"exhaustive-picks"}, logging.getLogger("t"))
+            exhaustive_reconcile.strip_orphans(api, {"exhaustive-picks", "exhaustive-a", "exhaustive-b", "exhaustive-loud"}, logging.getLogger("t"))
 
 
 class TestReconcile:
     def test_a_deleted_chart_loses_its_tag_and_a_broken_config_touches_nothing(self, tmp_path):
-        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n  A:\n    acquire: exhaustive\n  B:\n    acquire: exhaustive\n")
         api = _api(TAGS, {10: ["exhaustive-gone"], 14: ["exhaustive-picks"]})
         log = logging.getLogger("t")
         assert exhaustive_reconcile.reconcile(config, log=log, make_api=lambda url, token: api) == {1: {"exhaustive-gone": 1, "exhaustive-loud": 0}}
@@ -201,6 +201,33 @@ class TestReconcile:
         movies.write_text("collections: [unclosed\n")
         assert exhaustive_reconcile.reconcile(config, log=log, make_api=lambda url, token: api) is None
         api.all_tags.assert_not_called()
+
+    def test_a_scan_that_lost_collections_strips_nothing_past_the_cap(self, tmp_path):
+        log = logging.getLogger("t")
+        names = ["a", "b", "c", "d", "e", "f"]
+        tags = {f"exhaustive-{n}": i for i, n in enumerate(names, 1)}
+        full = "".join(f"  {n}:\n    acquire: exhaustive\n" for n in names)
+        config, movies = _config(tmp_path, full)
+        api = _api(tags, {i: [f"exhaustive-{n}"] for i, n in enumerate(names, 1)})
+        assert exhaustive_reconcile.reconcile(config, log=log, make_api=lambda url, token: api) == {1: {}}
+        # the file is cut off mid-write after two collections: four orphans, over the cap of two
+        movies.write_text("collections:\n" + "".join(f"  {n}:\n    acquire: exhaustive\n" for n in names[:2]))
+        assert exhaustive_reconcile.reconcile(config, log=log, make_api=lambda url, token: api) == {1: {}}
+        api.edit_multiple_movies.assert_not_called()
+        api.delete_tag.assert_not_called()
+        # cut after five: one orphan is within the cap and is stripped (and re-added by the next run's own tagging)
+        movies.write_text("collections:\n" + "".join(f"  {n}:\n    acquire: exhaustive\n" for n in names[:5]))
+        assert exhaustive_reconcile.reconcile(config, log=log, make_api=lambda url, token: api) == {1: {"exhaustive-f": 1}}
+
+    def test_the_cap_is_two_and_half_but_a_lone_tag_can_go(self, caplog):
+        log = logging.getLogger("t")
+        tags = {"exhaustive-a": 1, "exhaustive-b": 2, "exhaustive-c": 3, "exhaustive-d": 4}
+        api = _api(tags, {})
+        with caplog.at_level(logging.ERROR):
+            assert exhaustive_reconcile.strip_orphans(api, {"exhaustive-a"}, log) == {}
+        assert "exhaustive-b" in caplog.text and "refusing" in caplog.text
+        assert set(exhaustive_reconcile.strip_orphans(api, {"exhaustive-a", "exhaustive-b"}, log)) == {"exhaustive-c", "exhaustive-d"}
+        assert set(exhaustive_reconcile.strip_orphans(_api({"exhaustive-only": 1}, {}), set(), log)) == {"exhaustive-only"}
 
     def test_removing_the_key_orphans_the_tag(self, tmp_path):
         config, movies = _config(tmp_path, "  Picks:\n    tmdb_movie: 1\n")

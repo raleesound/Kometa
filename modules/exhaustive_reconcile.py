@@ -25,6 +25,7 @@ OWNED_LABEL = re.compile(r"^exhaustive-[a-z0-9]+(?:-[a-z0-9]+)*$")
 REMOTE_KEYS = ("url", "git", "repo")
 FILE_LISTS = ("collection_files", "metadata_files")
 _seen = {}
+MAX_STRIPPED = 2
 
 
 def _read_yaml(path):
@@ -194,9 +195,20 @@ def radarr_instances(config):
 def strip_orphans(api, owned, log):
     """Remove every ``exhaustive-<slug>`` tag in this Radarr that ``owned`` does not hold: off all its films, then the tag itself.
 
-    Returns {label: films untagged}. Tags whose label is not exactly ``exhaustive-<slug>`` are not looked at."""
+    At most MAX_STRIPPED tags, and never more than half of the exhaustive-* tags that exist (at least one), go in one pass;
+    past that nothing is stripped and an error names them: a scan that went wrong must not empty Radarr's hunt list. Returns {label: films untagged}.
+    Tags whose label is not exactly ``exhaustive-<slug>`` are not looked at.
+    """
     orphans = {tag.id: tag.label.lower() for tag in api.all_tags() if OWNED_LABEL.match(tag.label.lower()) and tag.label.lower() not in owned}
     if not orphans:
+        return {}
+    existing = sum(1 for tag in api.all_tags() if OWNED_LABEL.match(tag.label.lower()))
+    cap = min(MAX_STRIPPED, max(1, existing // 2))
+    if len(orphans) > cap:
+        log.error(
+            f"Radarr Exhaustive: refusing to strip {len(orphans)} orphaned tags ({', '.join(sorted(orphans.values()))}) in one pass; the limit is {cap} of {existing}. "
+            "Cleanup is one collection at a time, so the config or its files probably changed under the scan"
+        )
         return {}
     by_tag = {label: [] for label in orphans.values()}
     for movie in api.all_movies():
