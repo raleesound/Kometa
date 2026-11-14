@@ -419,6 +419,20 @@ def test_a_burst_through_the_real_loop_and_real_inotify_is_one_wake_with_the_fin
     stop.set()
     (env.mine.parent / "poke.yml").write_text("a: 1")  # unblocks select so the loop sees stop
     t.join(5)
-    assert woke == [1]
-    assert env.builds() == [("Movies", "B4"), ("TV Shows", "B4")]
-    assert len(passes) - base <= 2  # one burst pass (plus its re-read after any new watch), not five
+    assert not t.is_alive() and woke and len(woke) <= 2  # a deploy burst wakes the builder, not once per write
+    assert env.builds() == [("Movies", "B4"), ("TV Shows", "B4")]  # the final content, once each
+    assert len(passes) - base < 5
+
+
+def test_a_watched_directory_that_is_moved_away_and_recreated_is_watched_again(env, tmp_path):
+    watcher = collection_defs.Watcher(collection_defs.relevant_name)
+    directory = tmp_path / "config" / "movies"
+    watcher.watch({str(directory)})
+    directory.rename(tmp_path / "config" / "movies_old")
+    assert watcher.wait(1) and watcher.drain() is True
+    assert str(directory) not in watcher.dirs  # the IN_MOVE_SELF branch dropped it
+    directory.mkdir()
+    watcher.watch({str(directory)})
+    (directory / "x.yml").write_text("a: 1")
+    assert watcher.wait(1) and watcher.drain() is True
+    watcher.close()

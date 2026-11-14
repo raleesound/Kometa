@@ -1538,18 +1538,18 @@ def collection_watcher(on_queued: Callable[[], None], quiet: float | None = None
         if not first and not retry_now:
             try:
                 watcher.wait(None)
+                waits_failed = 0
                 if not watcher.drain():
                     continue
                 watcher.settle(quiet)
-                waits_failed = 0
             except Exception as e:
                 # inotify itself failing must not spin: back off (a stop request ends it), then try again.
                 waits_failed += 1
                 log.error("collection watcher read failed (%s); backing off", e)
                 if stop is not None:
-                    stop.wait(min(60.0, 2.0**waits_failed))
+                    stop.wait(min(60.0, 2.0 ** min(waits_failed, 6)))
                 else:
-                    time.sleep(min(60.0, 2.0**waits_failed))
+                    time.sleep(min(60.0, 2.0 ** min(waits_failed, 6)))
                 continue
         first, retry_now = False, False
         try:
