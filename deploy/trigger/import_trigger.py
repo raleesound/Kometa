@@ -139,7 +139,7 @@ CLOCK_SKEW_SECONDS = 300
 KOMETA_DIR = os.path.dirname(os.path.abspath(KOMETA_PY))
 if KOMETA_DIR not in sys.path:
     sys.path.append(KOMETA_DIR)
-from modules import collection_defs, live_record  # noqa: E402
+from modules import collection_defs, exhaustive_reconcile, live_record  # noqa: E402
 
 RECORD_PATH = os.environ.get("RECORD_PATH", live_record.db_path(os.path.dirname(CONFIG_PATH)))
 
@@ -1514,7 +1514,17 @@ def sync_collection_defs(record_path: str | None = None, config_path: str | None
     return queued, set(held), dirs
 
 
-def collection_watcher(on_queued: Callable[[], None], quiet: float | None = None, watcher: Any = None, stop: threading.Event | None = None, gate: Any = None) -> None:
+def reconcile_orphans() -> None:
+    """Strip the exhaustive-<slug> Radarr tags no collection in the config owns (#5634 S9c): runs after every definition pass, so deleting a chart's file or
+    removing its acquire key un-tags its films within seconds. It reads the Radarr url and key from config.yml (the file this process already reads the Plex token
+    from) and refuses to touch anything when the config cannot be read completely. Never raises."""
+    try:
+        exhaustive_reconcile.reconcile(CONFIG_PATH, log=log)
+    except Exception as e:
+        log.error("orphaned exhaustive-tag check failed (%s)", type(e).__name__)
+
+
+def collection_watcher(on_queued: Callable[[], None], quiet: float | None = None, watcher: Any = None, stop: threading.Event | None = None, gate: Any = None, reconcile: Callable[[], None] | None = None) -> None:
     """Notice collection-definition changes: an initial pass (seeding the record on the first complete read), then one pass per
     burst of writes. Event driven: it sleeps in select() on the inotify fd until a YAML file in a watched directory changes.
     A pass that fails (config unreadable, say) is run again at once after the config directories are watched, so a write that
@@ -1530,6 +1540,7 @@ def collection_watcher(on_queued: Callable[[], None], quiet: float | None = None
     if gate is not None:
         gate.on_idle(lambda: watcher.nudge() if failing.is_set() else None)
     config_dir = os.path.dirname(CONFIG_PATH)
+    reconcile = reconcile or reconcile_orphans
     first = True
     retry_now = False
     waits_failed = 0
@@ -1561,6 +1572,7 @@ def collection_watcher(on_queued: Callable[[], None], quiet: float | None = None
                 queued += sync_collection_defs()[0]
             for directory, errno in sorted(getattr(watcher, "failed", {}).items()):
                 log.error("cannot watch %s (errno %s): writes there are not noticed", directory, errno)
+            reconcile()
         except Exception as e:
             log.error("collection definition pass failed (%s); retrying on the next write", describe_config_error(e))
             was_failing = failing.is_set()

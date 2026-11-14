@@ -13,7 +13,9 @@ uses up both the first-week and the rolling-week allowance.
 Known and accepted for now: the ledger is the tagged items themselves, so deleting a list's tagged items from the arr resets its first-week ``initial`` burst.
 """
 
+import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -43,9 +45,16 @@ def default_ledger_tag(collection_name):
 
 
 def exhaustive_tag(collection_name):
-    """Radarr tag marking every wanted film of an ``acquire: exhaustive`` collection; the bridge matches the ``exhaustive`` prefix."""
-    slug = re.sub(r"[^a-z0-9]+", "-", str(collection_name).lower()).strip("-")
-    return f"{EXHAUSTIVE_PREFIX}{slug or 'collection'}"
+    """Radarr tag marking every wanted film of an ``acquire: exhaustive`` collection; the bridge matches the ``exhaustive`` prefix.
+
+    A name that loses letters or digits in the ASCII slug (any non-ASCII one: "映画", "Фильмы", "Amélie") gets a short hash of the whole name,
+    so two different names never share a tag. An all-ASCII name is its plain slug; names that differ only in punctuation or case are
+    refused where the config is read (exhaustive_reconcile.clashes)."""
+    name = unicodedata.normalize("NFC", str(collection_name))
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    if not slug or any(ord(c) > 127 and c.isalnum() for c in name):
+        slug = f"{slug or 'collection'}-{hashlib.sha1(name.casefold().encode('utf-8')).hexdigest()[:6]}"
+    return f"{EXHAUSTIVE_PREFIX}{slug}"
 
 
 def valid_ledger_tag(tag):

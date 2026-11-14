@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import modules.builder  # noqa: F401
-from modules import add_budget, live_record
+from modules import add_budget, exhaustive_reconcile, live_record
 from modules.builder import BuilderValidationError, CollectionBuilder
 from tests.conftest import FakeLogger
 
@@ -38,7 +38,14 @@ def _edits(radarr):
 class TestSlug:
     def test_the_tag_is_the_prefix_plus_a_kebab_slug(self):
         assert add_budget.exhaustive_tag("The Cinema Gremlins' Bottom 50") == "exhaustive-the-cinema-gremlins-bottom-50"
-        assert add_budget.exhaustive_tag("!!!") == "exhaustive-collection"
+
+    def test_names_that_lose_letters_get_a_hash_so_they_never_share_a_tag(self):
+        tags = {add_budget.exhaustive_tag(n) for n in ("映画", "Фильмы", "!!!", "Amélie", "Amelie", "Top 10")}
+        assert len(tags) == 6
+        assert add_budget.exhaustive_tag("映画").startswith("exhaustive-collection-")
+        assert add_budget.exhaustive_tag("Amélie").startswith("exhaustive-am-lie-")
+        assert add_budget.exhaustive_tag("Top 10") == "exhaustive-top-10"
+        assert add_budget.exhaustive_tag("映画") == add_budget.exhaustive_tag("映画")
 
 
 class TestSyncTag:
@@ -85,6 +92,7 @@ def _builder(monkeypatch, radarr, **attrs):
     b.collectionless = False
     b.radarr_details = {}
     b.library = SimpleNamespace(is_movie=True, Radarr=radarr, name="Movies")
+    b.config = SimpleNamespace(config_path="/nonexistent/config.yml")
     for key, value in attrs.items():
         setattr(b, key, value)
     return b
@@ -113,12 +121,33 @@ class TestRunExhaustive:
         r.api.edit_multiple_movies.assert_not_called()
         assert b.exhaustive_tagged is None
 
-    def test_an_emptied_wanted_set_untags_everything(self, monkeypatch):
+    def test_nothing_wanted_after_a_run_that_wanted_something_untags_nothing(self, monkeypatch):
+        r = _radarr(monkeypatch, [_movie(1, TAG)])
+        b = _builder(monkeypatch, r, missing_movies=[], missing_passed_movies=[], missing_filtered_movies=[])
+        b.run_exhaustive(previous_wanted=3)
+        r.api.edit_multiple_movies.assert_not_called()
+        assert b.exhaustive_tagged == {1}
+
+    def test_nothing_wanted_with_no_record_to_judge_by_untags_nothing(self, monkeypatch):
         r = _radarr(monkeypatch, [_movie(1, TAG)])
         b = _builder(monkeypatch, r, missing_movies=[], missing_passed_movies=[], missing_filtered_movies=[])
         b.run_exhaustive()
+        r.api.edit_multiple_movies.assert_not_called()
+
+    def test_nothing_wanted_twice_running_untags_everything(self, monkeypatch):
+        r = _radarr(monkeypatch, [_movie(1, TAG)])
+        b = _builder(monkeypatch, r, missing_movies=[], missing_passed_movies=[], missing_filtered_movies=[])
+        b.run_exhaustive(previous_wanted=0)
         assert _edits(r) == [([1], "remove")]
         assert b.exhaustive_tagged == set()
+
+    def test_any_error_is_logged_and_leaves_the_tags_alone(self, monkeypatch):
+        r = _radarr(monkeypatch, [_movie(1)])
+        r.api.all_movies.side_effect = ConnectionError("down")
+        b = _builder(monkeypatch, r, **{"library": SimpleNamespace(is_movie=True, Radarr=r, name="Movies")})
+        modules.builder.logger.stacktrace = MagicMock()
+        b.run_exhaustive(previous_wanted=1)
+        assert b.exhaustive_tagged is None
 
     def test_a_radarr_error_is_logged_not_raised(self, monkeypatch):
         r = _radarr(monkeypatch, [_movie(1)])
@@ -152,6 +181,27 @@ class TestApply:
         b._apply_exhaustive()
         assert b.exhaustive is False and b.radarr_details == {}
         assert any("only applies to movie" in m for m in modules.builder.logger.info_messages)
+
+    def test_two_collections_that_map_to_one_tag_are_both_refused(self, monkeypatch, tmp_path):
+        config = tmp_path / "config.yml"
+        files = tmp_path / "movies.yml"
+        config.write_text("libraries:\n  Movies:\n    collection_files:\n      - file: " + str(files) + "\n")
+        files.write_text("collections:\n  Top 10:\n    acquire: exhaustive\n  Top-10!:\n    acquire: exhaustive\n")
+        exhaustive_reconcile.forget_run()
+        for name in ("Top 10", "Top-10!"):
+            b = _builder(monkeypatch, MagicMock(), name=name, config=SimpleNamespace(config_path=str(config)))
+            with pytest.raises(BuilderValidationError, match="share the Radarr tag"):
+                b._apply_exhaustive()
+        exhaustive_reconcile.forget_run()
+
+    def test_the_same_name_in_two_libraries_in_one_run_is_refused(self, monkeypatch):
+        exhaustive_reconcile.forget_run()
+        _builder(monkeypatch, MagicMock())._apply_exhaustive()
+        other = _builder(monkeypatch, MagicMock())
+        other.library = SimpleNamespace(is_movie=True, Radarr=MagicMock(), name="Films 4K")
+        with pytest.raises(BuilderValidationError):
+            other._apply_exhaustive()
+        exhaustive_reconcile.forget_run()
 
     def test_no_radarr_is_a_warning_not_a_crash(self, monkeypatch):
         b = _builder(monkeypatch, None)

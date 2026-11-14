@@ -11,7 +11,7 @@ from plexapi.video import Episode, Movie, Season, Show
 from tmdbapis import TMDbException
 from tmdbapis.tmdb import discover_movie_sort_options, discover_tv_sort_options
 
-from modules import add_budget, anidb, anilist, floppy, icheckmovies, imdb, letterboxd, mal, mdblist, mojo, plex, radarr, serializd, simkl, sonarr, stevenlu, tautulli, textfile, timings, tmdb, tracearr, trakt, tvdb, util, yamtrack
+from modules import add_budget, anidb, anilist, exhaustive_reconcile, floppy, icheckmovies, imdb, letterboxd, mal, mdblist, mojo, plex, radarr, serializd, simkl, sonarr, stevenlu, tautulli, textfile, timings, tmdb, tracearr, trakt, tvdb, util, yamtrack
 from modules.overlay import Overlay, rating_sources
 from modules.poster import KometaImage
 from modules.request import quote
@@ -5088,10 +5088,17 @@ class CollectionBuilder:
             return
         if self.radarr_details.get("add_missing") is False or "add_missing_initial" in self.radarr_details or "add_missing_per_week" in self.radarr_details or "add_missing_ledger_tag" in self.radarr_details:
             raise BuilderValidationError(f"{self.Type} Error: acquire: exhaustive cannot be combined with radarr_add_missing: false or the add_missing drip attributes")
+        tag = add_budget.exhaustive_tag(self.name)
+        others = exhaustive_reconcile.clashes(self.config.config_path, self.library.name, self.name)
+        if others:
+            raise BuilderValidationError(f"{self.Type} Error: acquire: exhaustive for {self.name} would share the Radarr tag {tag} with {', '.join(f'{n} ({lib})' for lib, n in others)}; rename one so each has its own tag")
         self.radarr_details["add_missing"] = True
 
-    def run_exhaustive(self):
-        """Tag every wanted movie exhaustive-<slug> in Radarr (including ones already there but not downloaded) and untag ids that left the wanted set. Never raises."""
+    def run_exhaustive(self, previous_wanted=None):
+        """Tag every wanted movie exhaustive-<slug> in Radarr (including ones already there but not downloaded) and untag ids that left the wanted set. Never raises.
+
+        ``previous_wanted`` is how many wanted ids the live record held for this collection before this run (None = unknown). A run that finds nothing wanted
+        after one that found something removes no tags: it may be a list that failed without saying so; the next run, finding it still empty, does."""
         self.exhaustive_tagged = None
         if not self.exhaustive or not self.do_missing:
             return
@@ -5110,12 +5117,12 @@ class CollectionBuilder:
             # A failed IMDb lookup counts as filtered out, so with IMDb filters a filtered id may just be unevaluated: its tag stays.
             unevaluated |= set(self.missing_filtered_movies)
         try:
-            self.exhaustive_tagged = self.library.Radarr.sync_tag(tag, passed, unevaluated)
+            self.exhaustive_tagged = self.library.Radarr.sync_tag(tag, passed, unevaluated, refuse_empty=previous_wanted is None or previous_wanted > 0)
         except Failed as e:
             logger.error(e)
-        except ArrException as e:
+        except Exception as e:  # a dropped connection must not take the collection's record write down with it
             logger.stacktrace()
-            logger.error(f"Arr Error: {e}")
+            logger.error(f"Radarr Exhaustive ({tag}): left every tag as it was ({type(e).__name__}: {e})")
 
     def _validate_add_budgets(self):
         for arr_name, arr_details in (("radarr", self.radarr_details), ("sonarr", self.sonarr_details)):
