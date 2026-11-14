@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 from arrapi import RadarrAPI
 from arrapi.exceptions import ArrException
 
-from modules import timings, util
+from modules import exhaustive_reconcile, timings, util
 from modules.util import Continue, Failed
 
 logger = util.logger
@@ -248,6 +248,7 @@ class Radarr:
         so a repeat run changes nothing. Tagged movies in ``hold_ids`` are left alone. With ``refuse_empty``, an empty keep and hold set (nothing wanted at all)
         removes nothing: an empty answer from a list that did not raise is as likely a soft failure as a finished collection. Returns the TMDb ids carrying the tag afterwards."""
         tag = tag.lower()
+        exhaustive_reconcile.bound(self.api)
         in_radarr = set()
         tagged = set()
         # Compare tag ids: a movie's Tag objects load their label with one request each.

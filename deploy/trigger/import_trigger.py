@@ -63,6 +63,7 @@ What makes it more than a shell-out:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import json
 import logging
@@ -74,7 +75,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import yaml
 
@@ -1514,12 +1515,32 @@ def sync_collection_defs(record_path: str | None = None, config_path: str | None
     return queued, set(held), dirs
 
 
+@contextlib.contextmanager
+def run_lock_free() -> Iterator[bool]:
+    """Yield True while holding a non-blocking flock on Kometa's run lock (nobody is mid-run, and none starts until this exits); False when anything holds it.
+    The hold is exclusive so a Kometa item run that fails to start waits on the kernel (wait_for_run_lock takes a shared lock) instead of seeing a spurious free lock."""
+    with open(RUN_LOCK_PATH, "a+") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def reconcile_orphans() -> None:
     """Strip the exhaustive-<slug> Radarr tags no collection in the config owns (#5634 S9c): runs after every definition pass, so deleting a chart's file or
     removing its acquire key un-tags its films within seconds. It reads the Radarr url and key from config.yml (the file this process already reads the Plex token
     from) and refuses to touch anything when the config cannot be read completely. Never raises."""
     try:
-        exhaustive_reconcile.reconcile(CONFIG_PATH, log=log)
+        with run_lock_free() as free:
+            if not free:
+                log.info("a Kometa run is in progress; its own end-of-run reconcile covers the orphaned exhaustive tags")
+                return
+            exhaustive_reconcile.reconcile(CONFIG_PATH, log=log, record_path=RECORD_PATH)
     except Exception as e:
         log.error("orphaned exhaustive-tag check failed (%s)", type(e).__name__)
 

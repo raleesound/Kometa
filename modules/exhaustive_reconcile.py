@@ -16,10 +16,11 @@ import glob
 import logging
 import os
 import re
+from types import SimpleNamespace
 
 import ruamel.yaml
 
-from modules import add_budget
+from modules import add_budget, live_record
 
 OWNED_LABEL = re.compile(r"^exhaustive-[a-z0-9]+(?:-[a-z0-9]+)*$")
 REMOTE_KEYS = ("url", "git", "repo")
@@ -192,30 +193,56 @@ def radarr_instances(config):
     return out
 
 
-def strip_orphans(api, owned, log):
-    """Remove every ``exhaustive-<slug>`` tag in this Radarr that ``owned`` does not hold: off all its films, then the tag itself.
+TIMEOUT = (5, 60)  # (connect, read) seconds for every Radarr call made here and by sync_tag; arrapi sets none, so a half-open Radarr would hang forever
 
-    At most MAX_STRIPPED tags, and never more than half of the exhaustive-* tags that exist (at least one), go in one pass;
-    past that nothing is stripped and an error names them: a scan that went wrong must not empty Radarr's hunt list. Returns {label: films untagged}.
-    Tags whose label is not exactly ``exhaustive-<slug>`` are not looked at.
-    """
-    orphans = {tag.id: tag.label.lower() for tag in api.all_tags() if OWNED_LABEL.match(tag.label.lower()) and tag.label.lower() not in owned}
+
+def bound(api):
+    """Give every request ``api`` makes a timeout. A timeout surfaces as arrapi's ConnectionFailure, which callers log and skip."""
+    session = api.session
+    if getattr(session, "_exhaustive_bound", False):
+        return api
+    request = session.request
+
+    def with_timeout(*args, **kwargs):
+        kwargs.setdefault("timeout", TIMEOUT)
+        return request(*args, **kwargs)
+
+    session.request = with_timeout
+    session._exhaustive_bound = True
+    return api
+
+
+def bounded_session():
+    import requests
+
+    session = requests.Session()
+    bound(SimpleNamespace(session=session))
+    return session
+
+
+def strip_orphans(api, owned, recorded, log):
+    """Remove the ``exhaustive-<slug>`` tags in this Radarr that Kometa recorded applying and ``owned`` no longer holds: off all their films, then the tag.
+
+    A lookalike tag the record has never seen (a hand-made one, the bridge's) is left alone with a warning. At most MAX_STRIPPED tags, and never more than half
+    of the recorded tags that exist in this Radarr (at least one), go in one pass; the rest wait for a later pass. Returns {label: films untagged}."""
+    lookalikes = {tag.id: tag.label.lower() for tag in api.all_tags() if OWNED_LABEL.match(tag.label.lower())}
+    ours = {i: label for i, label in lookalikes.items() if label in recorded}
+    strangers = sorted(label for label in lookalikes.values() if label not in recorded and label not in owned)
+    if strangers:
+        log.warning(f"Radarr Exhaustive: leaving {', '.join(strangers)} alone: no Kometa run recorded applying {'it' if len(strangers) == 1 else 'them'}")
+    orphans = {i: label for i, label in ours.items() if label not in owned}
     if not orphans:
         return {}
-    existing = sum(1 for tag in api.all_tags() if OWNED_LABEL.match(tag.label.lower()))
-    cap = min(MAX_STRIPPED, max(1, existing // 2))
-    if len(orphans) > cap:
-        log.error(
-            f"Radarr Exhaustive: refusing to strip {len(orphans)} orphaned tags ({', '.join(sorted(orphans.values()))}) in one pass; the limit is {cap} of {existing}. "
-            "Cleanup is one collection at a time, so the config or its files probably changed under the scan"
-        )
-        return {}
-    by_tag = {label: [] for label in orphans.values()}
+    cap = min(MAX_STRIPPED, max(1, len(ours) // 2))
+    batch = dict(sorted(orphans.items(), key=lambda item: item[1])[:cap])
+    if len(orphans) > len(batch):
+        log.warning(f"Radarr Exhaustive: {len(orphans) - len(batch)} more orphaned tag(s) ({', '.join(sorted(set(orphans.values()) - set(batch.values())))}) wait for a later pass; at most {cap} are stripped at a time")
+    by_tag = {label: [] for label in batch.values()}
     for movie in api.all_movies():
-        for tag_id in orphans.keys() & set(movie.tagsIds):
-            by_tag[orphans[tag_id]].append(movie.tmdbId)
+        for tag_id in batch.keys() & set(movie.tagsIds):
+            by_tag[batch[tag_id]].append(movie.tmdbId)
     result = {}
-    for tag_id, label in sorted(orphans.items()):
+    for tag_id, label in sorted(batch.items()):
         ids = sorted(by_tag[label])
         if ids:
             api.edit_multiple_movies(ids, tags=[label], apply_tags="remove", per_request=100)
@@ -230,10 +257,16 @@ def strip_orphans(api, owned, log):
     return result
 
 
-def reconcile(config_path, root=None, log=None, make_api=None):
-    """Strip orphan ``exhaustive-*`` tags from every Radarr the config names. Returns {instance number: {label: films}} or None when it was skipped.
+def _default_api(url, token):
+    from arrapi import RadarrAPI
 
-    Never raises: it is called from a collection watcher and from the end of a full run."""
+    return RadarrAPI(url, token, session=bounded_session())
+
+
+def reconcile(config_path, root=None, log=None, make_api=None, record_path=None):
+    """Strip orphan ``exhaustive-*`` tags Kometa applied from every Radarr the config names. Returns {instance number: {label: films}} or None when it was skipped.
+
+    Never raises: it is called from a collection watcher and from the end of a full run. Every Radarr call has a timeout; a Radarr that does not answer is a logged skip."""
     log = log or logging.getLogger("exhaustive-reconcile")
     try:
         owned, reason = owned_tags(config_path, root)
@@ -241,16 +274,26 @@ def reconcile(config_path, root=None, log=None, make_api=None):
             log.warning(f"Radarr Exhaustive: not looking for orphaned tags: {reason}")
             return None
         instances = radarr_instances(_read_yaml(config_path))
-        if make_api is None:
-            from arrapi import RadarrAPI
-
-            make_api = RadarrAPI
-        out = {}
-        for number, (url, token) in enumerate(instances, 1):
-            try:
-                out[number] = strip_orphans(make_api(url, token), owned, log)
-            except Exception as e:
-                log.error(f"Radarr Exhaustive: could not look for orphaned tags in Radarr {number} ({type(e).__name__})")
+        make_api = make_api or _default_api
+        try:
+            conn = live_record.connect(record_path or live_record.db_path(os.path.dirname(config_path)), timeout_ms=2000)
+        except Exception as e:
+            log.warning(f"Radarr Exhaustive: not looking for orphaned tags: the live record cannot be opened ({type(e).__name__})")
+            return None
+        try:
+            recorded = live_record.recorded_exhaustive_tags(conn)
+            out = {}
+            failed = False
+            for number, (url, token) in enumerate(instances, 1):
+                try:
+                    out[number] = strip_orphans(make_api(url, token), owned, recorded, log)
+                except Exception as e:
+                    failed = True
+                    log.error(f"Radarr Exhaustive: could not look for orphaned tags in Radarr {number} ({type(e).__name__})")
+            if not failed:
+                live_record.forget_exhaustive_tags(conn, {label for stripped in out.values() for label in stripped})
+        finally:
+            conn.close()
         return out
     except Exception as e:
         log.error(f"Radarr Exhaustive: orphaned-tag check failed ({type(e).__name__})")

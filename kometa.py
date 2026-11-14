@@ -1027,13 +1027,19 @@ def start(attrs):
         sys.exit(RUN_ITEMS_FAILED)
 
 
+def is_full_run(config):
+    """A run that touched every collection (never a scoped or partial one): only then does the config's whole owned-tag set mean anything to the orphan cleanup."""
+    scoped = ("collections-only", "overlays-only", "metadata-only", "operations-only", "run-items", "tests", "no-missing")
+    return not (any(run_args[key] for key in scoped) or config.requested_files)
+
+
 def run_config(config, stats):
     exhaustive_reconcile.forget_run()
     library_status, collections_ran = run_libraries(config)
 
     # #5634 S9c: a full run (never a scoped one) strips exhaustive-* tags no collection in the config owns any more.
-    if not (run_args["collections-only"] or run_args["overlays-only"] or run_args["metadata-only"] or run_args["operations-only"] or run_args["run-items"] or run_args["tests"] or run_args["no-missing"] or config.requested_files):
-        exhaustive_reconcile.reconcile(config.config_path, log=logger)
+    if is_full_run(config):
+        exhaustive_reconcile.reconcile(config.config_path, log=logger, record_path=live_record.db_path(config.default_dir))
 
     playlist_status = {}
     playlist_stats = {}

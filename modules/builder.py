@@ -1202,6 +1202,7 @@ class CollectionBuilder:
         self.live_watch = False
         # acquire: exhaustive (epic #5634 addendum 6): every wanted movie is added to Radarr with no drip and tagged exhaustive-<slug>.
         self.exhaustive = False
+        self.exhaustive_tag_applied = None  # the tag label once sync_tag ran: recorded so orphan cleanup knows the tag is Kometa's
         self.exhaustive_tagged = None  # tmdb ids carrying the tag after this run; None = not evaluated (the record keeps its last set)
 
         if self.playlist:
@@ -5100,6 +5101,7 @@ class CollectionBuilder:
         ``previous_wanted`` is how many wanted ids the live record held for this collection before this run (None = unknown). A run that finds nothing wanted
         after one that found something removes no tags: it may be a list that failed without saying so; the next run, finding it still empty, does."""
         self.exhaustive_tagged = None
+        self.exhaustive_tag_applied = None
         if not self.exhaustive or not self.do_missing:
             return
         tag = add_budget.exhaustive_tag(self.name)
@@ -5118,6 +5120,7 @@ class CollectionBuilder:
             unevaluated |= set(self.missing_filtered_movies)
         try:
             self.exhaustive_tagged = self.library.Radarr.sync_tag(tag, passed, unevaluated, refuse_empty=previous_wanted is None or previous_wanted > 0)
+            self.exhaustive_tag_applied = tag
         except Failed as e:
             logger.error(e)
         except Exception as e:  # a dropped connection must not take the collection's record write down with it

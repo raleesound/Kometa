@@ -81,6 +81,7 @@ def _builder(monkeypatch, radarr, **attrs):
     b.Type = "Collection"
     b.exhaustive = True
     b.exhaustive_tagged = None
+    b.exhaustive_tag_applied = None
     b.do_missing = True
     b.budget_blockers = []
     b.missing_movies = [1, 2, 3, 4]
@@ -106,6 +107,7 @@ class TestRunExhaustive:
         # 2 is not in Radarr; 3 was filtered out; 4 was never evaluated so it keeps its tag
         assert _edits(r) == [([1], "add"), ([3], "remove")]
         assert b.exhaustive_tagged == {1, 4}
+        assert b.exhaustive_tag_applied == TAG
 
     def test_imdb_filters_make_filtered_ids_hold_their_tag(self, monkeypatch):
         r = _radarr(monkeypatch, [_movie(3, TAG)])
@@ -120,6 +122,7 @@ class TestRunExhaustive:
         b.run_exhaustive()
         r.api.edit_multiple_movies.assert_not_called()
         assert b.exhaustive_tagged is None
+        assert b.exhaustive_tag_applied is None
 
     def test_nothing_wanted_after_a_run_that_wanted_something_untags_nothing(self, monkeypatch):
         r = _radarr(monkeypatch, [_movie(1, TAG)])
@@ -267,4 +270,37 @@ class TestRecord:
         old.close()
         c = live_record.connect(path, log=FakeLogger())
         assert c.execute("SELECT tagged FROM wanted WHERE ext_id = 511").fetchone()[0] == 0
+        c.close()
+
+    def test_the_tag_a_run_applied_is_recorded_as_kometas_and_survives_a_rebuild(self, tmp_path):
+        conn = live_record.connect(live_record.db_path(str(tmp_path)), log=FakeLogger())
+        assert live_record.recorded_exhaustive_tags(conn) == set()
+        live_record.write_collection(conn, _snap([1], {1}))
+        assert live_record.recorded_exhaustive_tags(conn) == set()
+        live_record.write_collection(conn, {**_snap([1], {1}), "exhaustive_tag": "Exhaustive-Picks"})
+        assert live_record.recorded_exhaustive_tags(conn) == {"exhaustive-picks"}
+        live_record.forget_exhaustive_tags(conn, {"exhaustive-picks", "exhaustive-other"})
+        assert live_record.recorded_exhaustive_tags(conn) == set()
+        live_record.write_collection(conn, {**_snap([1], {1}), "exhaustive_tag": "exhaustive-picks"})
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+        conn.close()
+        conn = live_record.connect(live_record.db_path(str(tmp_path)), log=FakeLogger())
+        assert live_record.recorded_exhaustive_tags(conn) == {"exhaustive-picks"}
+        conn.close()
+
+    def test_a_v7_record_is_upgraded_in_place_and_gains_the_tag_table(self, tmp_path):
+        import sqlite3
+
+        path = live_record.db_path(str(tmp_path))
+        old = sqlite3.connect(path)
+        old.executescript(live_record.SCHEMA + live_record.SCHEMA_V3)
+        old.execute("DROP TABLE IF EXISTS exhaustive_tags")
+        old.execute("INSERT INTO wanted VALUES ('Movies', 'Picks', 511, 0, 0, NULL, 1)")
+        old.execute("PRAGMA user_version = 7")
+        old.commit()
+        old.close()
+        c = live_record.connect(path, log=FakeLogger())
+        assert c.execute("SELECT tagged FROM wanted WHERE ext_id = 511").fetchone()[0] == 1
+        assert live_record.recorded_exhaustive_tags(c) == set()
         c.close()
