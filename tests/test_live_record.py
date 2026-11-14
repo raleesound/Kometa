@@ -182,7 +182,7 @@ class TestStorage:
         old.close()
         log = StackLogger()
         conn = live_record.connect(path, log=log)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION == 5
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION == 6
         assert live_record.get_collection(conn, "Movies", "Picks") is None
         assert any("schema v1 is out of date" in m for m in log.warning_messages)
         live_record.write_collection(conn, snapshot(wanted=[(5, False, False, None)]))
@@ -200,7 +200,7 @@ class TestStorage:
         recorder = live_record.RunRecorder(str(tmp_path), log)
         assert recorder.record(fake_library(), METADATA, fake_builder(), "picks", False, False) is True
         assert recorder.failures == 0
-        assert any("rebuilt it as v5" in m for m in log.warning_messages)
+        assert any("rebuilt it as v6" in m for m in log.warning_messages)
 
     def test_a_current_record_is_not_rebuilt(self, tmp_path):
         path = live_record.db_path(str(tmp_path))

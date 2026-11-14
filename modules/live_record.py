@@ -22,11 +22,11 @@ from datetime import datetime, timedelta, timezone
 DB_NAME = "live-collections.db"
 # Bump on any schema change: an older record is dropped and rebuilt (it is derived data; the next
 # sweep repopulates it).
-SCHEMA_VERSION = 5
-TABLES = ("collections", "members", "wanted", "history", "arrivals", "builds", "record_meta", "watch_seen")
+SCHEMA_VERSION = 6
+TABLES = ("collections", "members", "wanted", "history", "arrivals", "builds", "record_meta", "watch_seen", "collection_defs")
 # What an out-of-date record keeps when it is dropped and rebuilt: the outbox remembers which items
 # were announced, and losing it would announce them all again.
-KEEP_ON_REBUILD = ("arrivals", "record_meta")
+KEEP_ON_REBUILD = ("arrivals", "record_meta", "collection_defs")
 # Items Plex added before the arrivals outbox existed are recorded as announced, not announced: the
 # first deploy must not post a week of catch-up arrivals at once.
 ARRIVALS_SINCE = "arrivals_since"
@@ -44,6 +44,8 @@ MIGRATIONS = {
     # v5: builds.gen (added in _create when the table predates it; a request made while its run is in flight survives that run) and watch_seen (CREATE IF NOT EXISTS in _create):
     # the last content hash of each watched list the trigger acted on.
     4: (),
+    # v6: collection_defs (CREATE IF NOT EXISTS in _create): the definition hash of each configured collection, which the trigger diffs to run a new or edited collection by itself.
+    5: (),
 }
 # Readers (the arrival handler) can afford to wait; a Kometa run must not stall on a held lock,
 # so its writes use a short timeout and give up for the rest of the run after repeated failures.
@@ -140,6 +142,14 @@ CREATE TABLE IF NOT EXISTS watch_seen (
     url TEXT PRIMARY KEY,
     hash TEXT NOT NULL,
     seen_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collection_defs (
+    library TEXT NOT NULL,
+    mapping_name TEXT NOT NULL,
+    source_file TEXT,
+    hash TEXT NOT NULL,
+    seen_at TEXT NOT NULL,
+    PRIMARY KEY (library, mapping_name)
 );
 """
 
@@ -731,6 +741,54 @@ def fail_build(conn, library, mapping_name, max_attempts, gen=None):
         finish_build(conn, library, mapping_name, gen)
         return True
     return False
+
+
+DEFS_SEEDED = "collection_defs_seeded"
+DEFS_GONE = "collection_defs_gone"
+
+
+def apply_collection_defs(conn, found, held_files=(), now=None, renew=True):
+    """Diff the collection definitions now configured against the table and queue a scoped run of every new or changed one.
+
+    ``found`` maps (library, mapping_name) -> (source_file, hash). The first call ever (no DEFS_SEEDED marker) only records
+    them: a deploy must not rebuild every collection. A collection that is gone just loses its row. One transaction, so a
+    crash queues and records nothing or both. Rows of a file in ``held_files`` (unreadable right now) are left alone. Returns the (library, mapping_name) list queued."""
+    stamp = _stamp(now or datetime.now(timezone.utc))
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        seeded = conn.execute("SELECT 1 FROM record_meta WHERE key = ?", (DEFS_SEEDED,)).fetchone() is not None
+        known, files = {}, {}
+        for r in conn.execute("SELECT library, mapping_name, source_file, hash FROM collection_defs"):
+            known[(r["library"], r["mapping_name"])], files[(r["library"], r["mapping_name"])] = r["hash"], r["source_file"]
+        queued = []
+        for key in sorted(found):
+            source_file, digest = found[key]
+            if known.get(key) == digest:
+                continue
+            conn.execute(
+                "INSERT INTO collection_defs (library, mapping_name, source_file, hash, seen_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT (library, mapping_name) DO UPDATE SET source_file = excluded.source_file, hash = excluded.hash, seen_at = excluded.seen_at",
+                (key[0], key[1], source_file, digest, stamp),
+            )
+            if seeded:
+                queue_build(conn, key[0], key[1], source_file, now=now, renew=renew)
+                queued.append(key)
+        # A collection leaves the table only when two passes in a row find it gone: a file read half-written can parse and
+        # simply be short, and the rewrite that completes it must not find every collection "new".
+        gone = {key for key in set(known) - set(found) if files[key] not in held_files}
+        row = conn.execute("SELECT value FROM record_meta WHERE key = ?", (DEFS_GONE,)).fetchone()
+        before = {tuple(k) for k in json.loads(row["value"])} if row else set()
+        for key in gone & before:
+            conn.execute("DELETE FROM collection_defs WHERE library = ? AND mapping_name = ?", key)
+        conn.execute("INSERT OR REPLACE INTO record_meta (key, value) VALUES (?, ?)", (DEFS_GONE, json.dumps(sorted(gone - before))))
+        # Seeded only from a complete read: with a file held, its collections would all be "new" when it next reads.
+        if not seeded and found and not held_files:
+            conn.execute("INSERT OR IGNORE INTO record_meta (key, value) VALUES (?, ?)", (DEFS_SEEDED, stamp))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return queued
 
 
 # ── Snapshot from a finished CollectionBuilder ─────────────────────────
