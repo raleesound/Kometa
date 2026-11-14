@@ -144,10 +144,16 @@ def test_a_queued_request_is_renewed_not_duplicated(env):
 def test_schema_upgrade_from_v5_keeps_the_record_and_seeds_silently(tmp_path):
     path = str(tmp_path / "r.db")
     conn = live_record.connect(path)
+    live_record.queue_build(conn, "Movies", "Old", "f.yml", renew=True)
+    conn.execute("INSERT INTO arrivals (library, rating_key, payload, created_at) VALUES ('Movies', 1, '{}', 'now')")
+    conn.execute("INSERT INTO watch_seen (url, hash, seen_at) VALUES ('u', 'h', 'now')")
+    conn.commit()
+    before = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("builds", "arrivals", "watch_seen")}
     conn.execute("DROP TABLE collection_defs")
     conn.execute("PRAGMA user_version = 5")
     conn.close()
     conn = live_record.connect(path)
+    assert {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in before} == before and before == {"builds": 1, "arrivals": 1, "watch_seen": 1}
     assert conn.execute("PRAGMA user_version").fetchone()[0] == live_record.SCHEMA_VERSION
     assert live_record.apply_collection_defs(conn, {("Movies", "A"): ("f", "h")}) == []
     assert live_record.apply_collection_defs(conn, {("Movies", "A"): ("f", "h2")}) == [("Movies", "A")]
@@ -188,6 +194,9 @@ class FakeWatcher:
 
     def settle(self, quiet):
         self.settled += 1
+
+    def nudge(self):
+        self.nudged = getattr(self, "nudged", 0) + 1
 
 
 def test_watcher_loop_seeds_then_runs_once_per_burst(env):
@@ -242,14 +251,20 @@ def test_a_collection_gone_on_two_passes_in_a_row_is_dropped(env):
     assert {r["mapping_name"] for r in conn.execute("SELECT mapping_name FROM collection_defs")} == {"Cats"}
 
 
-def test_a_seed_that_met_a_held_file_is_not_the_seed(env):
-    env.mine.write_text("collections:\n  Dogs: [\n")
-    env.sync()
-    env.mine.write_text(FILE)
-    env.sync()  # the first complete read seeds, silently
+def test_a_file_held_at_the_seed_is_seeded_silently_while_other_files_queue_from_the_start(env):
+    other = env.mine.parent / "other.yml"
+    other.write_text("collections:\n  Owls:\n    letterboxd_list: o\n")
+    env.config.write_text(env.config.read_text().replace("    - default: basic\n", "    - default: basic\n    - file: config/movies/other.yml\n"))
+    other.write_text("collections:\n  Owls: [\n")  # held at the first pass
+    env.sync()  # seeds from mine.yml
     assert env.builds() == []
-    env.mine.write_text(FILE + "  Birds:\n    letterboxd_list: y\n")
+    mine_text = env.mine.read_text()
+    env.mine.write_text(mine_text + "  Birds:\n    letterboxd_list: y\n")  # an edit elsewhere is not swallowed by the held file
     assert {n for _l, n in env.sync()} == {"Birds"}
+    other.write_text("collections:\n  Owls:\n    letterboxd_list: o\n")  # the held file's first good read: silent
+    assert env.sync() == []
+    other.write_text("collections:\n  Owls:\n    letterboxd_list: o2\n")  # then it is an ordinary file
+    assert {n for _l, n in env.sync()} == {"Owls"}
 
 
 def test_a_pathological_file_is_held_and_the_rest_still_work(env):
@@ -313,3 +328,97 @@ def test_queued_collections_wake_the_builder_even_when_the_second_pass_fails(env
     fake = FakeWatcher([], stop)
     env.trig.collection_watcher(lambda: woke.append(1), quiet=0, watcher=fake, stop=stop)
     assert woke == [1] and len(calls) >= 2
+
+
+def test_a_failed_pass_is_retried_once_the_dirs_are_watched_and_on_gate_idle(env):
+    gate = env.trig.BuildGate()
+    stop, woke = threading.Event(), []
+    env.config.write_text("libraries: [")
+    fake = FakeWatcher([], stop)
+    t = threading.Thread(target=env.trig.collection_watcher, args=(lambda: woke.append(1),), kwargs={"quiet": 0, "watcher": fake, "stop": stop, "gate": gate})
+    t.start()
+    t.join(5)
+    assert not t.is_alive()
+    gate.worker_idle()
+    assert getattr(fake, "nudged", 0) == 1  # still failing: the idle gate asks for another pass
+
+
+def test_a_write_during_a_failed_first_pass_is_not_absorbed(env, monkeypatch):
+    real, calls = env.trig.sync_collection_defs, []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ValueError("half written")
+        return real(*a, **k)
+
+    monkeypatch.setattr(env.trig, "sync_collection_defs", flaky)
+    stop = threading.Event()
+    fake = FakeWatcher([], stop)
+    env.trig.collection_watcher(lambda: None, quiet=0, watcher=fake, stop=stop)
+    assert len(calls) >= 2 and env.builds() == []  # retried at once, and that retry seeded
+
+
+def test_a_watcher_whose_reads_raise_backs_off_instead_of_spinning(env, monkeypatch):
+    stop, waits = threading.Event(), []
+    monkeypatch.setattr(stop, "wait", lambda t: waits.append(t) or len(waits) >= 3 and stop.set())
+
+    class Broken(FakeWatcher):
+        def wait(self, timeout=None):
+            raise OSError(9, "bad fd")
+
+    env.trig.collection_watcher(lambda: None, quiet=0, watcher=Broken([], stop), stop=stop)
+    assert waits[:3] == [2.0, 4.0, 8.0]
+
+
+def test_a_new_subdirectory_and_a_moved_directory_are_noticed(env, tmp_path):
+    watcher = collection_defs.Watcher(collection_defs.relevant_name)
+    base = tmp_path / "config"
+    watcher.watch({str(base)})
+    (base / "tv").mkdir()  # a new directory: relevant, so the next pass can watch it
+    assert watcher.wait(1) and watcher.drain() is True
+    (base / "movies").rename(base / "movies_old")
+    assert watcher.wait(1) and watcher.drain() is True
+    watcher.close()
+
+
+def test_the_watcher_nudge_wakes_wait_and_counts_as_relevant(env):
+    watcher = collection_defs.Watcher(collection_defs.relevant_name)
+    watcher.nudge()
+    assert watcher.wait(1) and watcher.drain() is True and watcher.wait(0) is False
+    watcher.close()
+
+
+def test_a_burst_through_the_real_loop_and_real_inotify_is_one_wake_with_the_final_content(env):
+    stop, woke, ready = threading.Event(), [], threading.Event()
+    real = env.trig.sync_collection_defs
+    passes = []
+
+    def counted(*a, **k):
+        out = real(*a, **k)
+        passes.append(1)
+        ready.set()
+        return out
+
+    env.trig.sync_collection_defs = counted
+    t = threading.Thread(target=env.trig.collection_watcher, args=(lambda: woke.append(1),), kwargs={"quiet": 0.3, "stop": stop}, daemon=True)
+    t.start()
+    assert ready.wait(5)  # seeded, watching
+    import time
+
+    time.sleep(0.5)  # its second read (after the first watch) is done
+    base = len(passes)
+    for i in range(5):  # a deploy rsync: temp file renamed into place, five times in a burst
+        tmp = env.mine.parent / f".mine.yml.{i}"
+        tmp.write_text(FILE + f"  B{i}:\n    letterboxd_list: y\n")
+        tmp.rename(env.mine)
+    deadline = time.monotonic() + 5
+    while not woke and time.monotonic() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.5)
+    stop.set()
+    (env.mine.parent / "poke.yml").write_text("a: 1")  # unblocks select so the loop sees stop
+    t.join(5)
+    assert woke == [1]
+    assert env.builds() == [("Movies", "B4"), ("TV Shows", "B4")]
+    assert len(passes) - base <= 2  # one burst pass (plus its re-read after any new watch), not five

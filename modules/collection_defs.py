@@ -32,6 +32,7 @@ IN_DELETE_SELF = 0x00000400
 IN_MOVE_SELF = 0x00000800
 IN_Q_OVERFLOW = 0x00004000
 IN_IGNORED = 0x00008000
+IN_ISDIR = 0x40000000
 WATCH_MASK = IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF
 EVENT_HEADER = struct.Struct("iIII")
 YAML_SUFFIXES = (".yml", ".yaml")
@@ -126,15 +127,16 @@ def scan(config_path, root):
 
 def libc_inotify():
     lib = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
-    return lib.inotify_init1, lib.inotify_add_watch
+    return lib.inotify_init1, lib.inotify_add_watch, lib.inotify_rm_watch
 
 
 class Watcher:
     """inotify on directories (a rename-into-place replaces the file's inode, so a file watch would go blind)."""
 
-    def __init__(self, wanted, init=None, add=None):
-        if init is None or add is None:
-            init, add = libc_inotify()
+    def __init__(self, wanted, init=None, add=None, remove=None):
+        if init is None or add is None or remove is None:
+            init, add, remove = libc_inotify()
+        self._remove = remove
         self.wanted = wanted  # filenames that matter, e.g. a predicate on the basename
         self._add = add
         self.fd = init(os.O_NONBLOCK | os.O_CLOEXEC)
@@ -143,6 +145,14 @@ class Watcher:
         self.dirs = set()
         self._wds = {}
         self.failed = {}
+        self._nudge_r, self._nudge_w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+
+    def nudge(self):
+        """Wake a wait() from another thread: the next drain() reports a relevant change (a pass to run again)."""
+        try:
+            os.write(self._nudge_w, b"x")
+        except BlockingIOError:
+            pass  # already nudged
 
     def watch(self, dirs):
         """Watch each directory not already watched. A directory that cannot be watched (missing, no room) is recorded in
@@ -158,11 +168,17 @@ class Watcher:
 
     def drain(self):
         """Read what is queued. Returns True when a relevant file changed (or the kernel queue overflowed)."""
+        relevant = False
+        try:
+            os.read(self._nudge_r, 4096)
+            relevant = True
+        except BlockingIOError:
+            pass
         try:
             data = os.read(self.fd, 65536)
         except BlockingIOError:
-            return False
-        relevant, pos = False, 0
+            return relevant
+        pos = 0
         while pos + EVENT_HEADER.size <= len(data):
             wd, mask, _cookie, length = EVENT_HEADER.unpack_from(data, pos)
             name = data[pos + EVENT_HEADER.size : pos + EVENT_HEADER.size + length].split(b"\0", 1)[0].decode(errors="replace")
@@ -171,13 +187,19 @@ class Watcher:
                 # The directory was deleted or moved away: its watch is gone, so forget it and let the next pass add it again.
                 self.dirs.discard(self._wds.pop(wd, None))
                 relevant = True
-            elif mask & (IN_Q_OVERFLOW | IN_DELETE_SELF | IN_MOVE_SELF) or self.wanted(name):
+            elif mask & IN_MOVE_SELF:
+                # Moved away: the watch follows the old inode, not the path, so drop it and let the next pass watch the path again.
+                directory = self._wds.pop(wd, None)
+                self.dirs.discard(directory)
+                self._remove(self.fd, wd)
+                relevant = True
+            elif mask & (IN_Q_OVERFLOW | IN_DELETE_SELF) or (mask & IN_ISDIR and mask & (IN_CREATE | IN_MOVED_TO)) or self.wanted(name):
                 relevant = True
         return relevant
 
     def wait(self, timeout=None):
         """Block until the fd is readable or ``timeout`` passes (None = forever). True when readable."""
-        return bool(select.select([self.fd], [], [], timeout)[0])
+        return bool(select.select([self.fd, self._nudge_r], [], [], timeout)[0])
 
     def settle(self, quiet):
         """After a relevant event: return once no relevant event has arrived for ``quiet`` seconds."""
@@ -187,7 +209,8 @@ class Watcher:
                 deadline = time.monotonic() + quiet
 
     def close(self):
-        os.close(self.fd)
+        for fd in (self.fd, self._nudge_r, self._nudge_w):
+            os.close(fd)
 
 
 def relevant_name(name):

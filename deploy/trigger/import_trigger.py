@@ -730,6 +730,11 @@ class BuildGate:
         self._protected = False
         self._stopped: Any = None
         self._stops: dict[tuple[str, str], int] = {}
+        self._idle_hooks: list[Callable[[], None]] = []
+
+    def on_idle(self, hook: Callable[[], None]) -> None:
+        """Call ``hook`` each time the item worker goes idle (after its own wake)."""
+        self._idle_hooks.append(hook)
 
     def note_stop(self, key: tuple[str, str]) -> int:
         with self._mu:
@@ -748,6 +753,11 @@ class BuildGate:
         with self._mu:
             self._idle = True
         self.woken.set()
+        for hook in self._idle_hooks:
+            try:
+                hook()
+            except Exception as e:
+                log.error("idle hook failed: %s", e)
 
     def worker_busy(self) -> None:
         with self._mu:
@@ -1504,28 +1514,47 @@ def sync_collection_defs(record_path: str | None = None, config_path: str | None
     return queued, set(held), dirs
 
 
-def collection_watcher(on_queued: Callable[[], None], quiet: float | None = None, watcher: Any = None, stop: threading.Event | None = None) -> None:
+def collection_watcher(on_queued: Callable[[], None], quiet: float | None = None, watcher: Any = None, stop: threading.Event | None = None, gate: Any = None) -> None:
     """Notice collection-definition changes: an initial pass (seeding the record on the first complete read), then one pass per
     burst of writes. Event driven: it sleeps in select() on the inotify fd until a YAML file in a watched directory changes.
-    Never raises; a pass that fails is retried on the next write."""
+    A pass that fails (config unreadable, say) is run again at once after the config directories are watched, so a write that
+    landed during the failure is not lost, and again each time the item worker goes idle while it is still failing (an event
+    from the gate, not a timer). Never raises; an inotify failure backs off and is logged."""
     quiet = COLLECTION_QUIET_SECONDS if quiet is None else quiet
     try:
         watcher = watcher or collection_defs.Watcher(collection_defs.relevant_name)
     except Exception as e:
         log.error("cannot start the collection watcher (%s): new or edited collections wait for the scheduled sweep", e)
         return
+    failing = threading.Event()
+    if gate is not None:
+        gate.on_idle(lambda: watcher.nudge() if failing.is_set() else None)
     config_dir = os.path.dirname(CONFIG_PATH)
     first = True
+    retry_now = False
+    waits_failed = 0
     while stop is None or not stop.is_set():
         queued: list[tuple[str, str]] = []
-        try:
-            if not first:
+        if not first and not retry_now:
+            try:
                 watcher.wait(None)
                 if not watcher.drain():
                     continue
                 watcher.settle(quiet)
-            first = False
+                waits_failed = 0
+            except Exception as e:
+                # inotify itself failing must not spin: back off (a stop request ends it), then try again.
+                waits_failed += 1
+                log.error("collection watcher read failed (%s); backing off", e)
+                if stop is not None:
+                    stop.wait(min(60.0, 2.0**waits_failed))
+                else:
+                    time.sleep(min(60.0, 2.0**waits_failed))
+                continue
+        first, retry_now = False, False
+        try:
             queued, _held, dirs = sync_collection_defs()
+            failing.clear()
             if dirs - watcher.dirs:
                 # Watch before the next read: a write between this pass's read and the watch would otherwise be missed.
                 watcher.watch(dirs)
@@ -1534,18 +1563,22 @@ def collection_watcher(on_queued: Callable[[], None], quiet: float | None = None
                 log.error("cannot watch %s (errno %s): writes there are not noticed", directory, errno)
         except Exception as e:
             log.error("collection definition pass failed (%s); retrying on the next write", describe_config_error(e))
+            was_failing = failing.is_set()
+            failing.set()
             # Without a readable config the collection directories are unknown: watch the config's own, and its subdirectories.
             try:
                 watcher.watch({config_dir} | {entry.path for entry in os.scandir(config_dir) if entry.is_dir() and entry.name not in ("logs", "anidb_cache")})
             except Exception as watch_error:
                 log.error("cannot watch %s: %s", config_dir, watch_error)
+            # One immediate retry now that the directories are watched (a write during the failed read is otherwise absorbed).
+            retry_now = not was_failing
         finally:
             if queued:
                 on_queued()
 
 
 def start_collection_watcher(on_queued: Callable[[], None]) -> None:
-    threading.Thread(target=collection_watcher, args=(on_queued,), daemon=True, name="collection-defs").start()
+    threading.Thread(target=collection_watcher, args=(on_queued,), kwargs={"gate": GATE}, daemon=True, name="collection-defs").start()
 
 
 def take_seed() -> str:
