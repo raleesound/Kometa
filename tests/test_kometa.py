@@ -279,3 +279,30 @@ class TestUnrecognisedArguments:
     def test_secret_arguments_are_still_accepted(self):
         result = self._run("--kometa-some-secret", "value", "--help")
         assert result.returncode == 0
+
+
+def _kometa_tree():
+    return ast.parse((Path(__file__).resolve().parent.parent / "kometa.py").read_text(encoding="utf-8"))
+
+
+def test_only_a_full_run_reconciles_exhaustive_tags() -> None:
+    """#5634 S9c: orphan cleanup must never run at the end of a scoped run, whose owned-tag picture is partial. Always-reconcile must fail here."""
+    from types import SimpleNamespace
+
+    tree = _kometa_tree()
+    func = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "is_full_run")
+    keys = ("collections-only", "overlays-only", "metadata-only", "operations-only", "run-items", "tests", "no-missing")
+    namespace = {"run_args": {k: False for k in keys}}
+    exec(compile(ast.Module([func], []), "kometa.py", "exec"), namespace)  # noqa: S102 - a pure function from our own source
+    full = SimpleNamespace(requested_files=[])
+    assert namespace["is_full_run"](full) is True
+    for key in keys:
+        namespace["run_args"][key] = True
+        assert namespace["is_full_run"](full) is False, key
+        namespace["run_args"][key] = False
+    assert namespace["is_full_run"](SimpleNamespace(requested_files=["x.yml"])) is False
+
+    run_config = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_config")
+    guarded = [n for n in ast.walk(run_config) if isinstance(n, ast.If) and isinstance(n.test, ast.Call) and getattr(n.test.func, "id", "") == "is_full_run" and any("reconcile" in ast.dump(c) for c in n.body)]
+    calls = [n for n in ast.walk(run_config) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "reconcile"]
+    assert len(calls) == 1 and len(guarded) == 1

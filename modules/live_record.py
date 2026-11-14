@@ -22,11 +22,11 @@ from datetime import datetime, timedelta, timezone
 DB_NAME = "live-collections.db"
 # Bump on any schema change: an older record is dropped and rebuilt (it is derived data; the next
 # sweep repopulates it).
-SCHEMA_VERSION = 7
-TABLES = ("collections", "members", "wanted", "history", "arrivals", "builds", "record_meta", "watch_seen", "collection_defs")
+SCHEMA_VERSION = 8
+TABLES = ("collections", "members", "wanted", "history", "arrivals", "builds", "record_meta", "watch_seen", "collection_defs", "exhaustive_tags")
 # What an out-of-date record keeps when it is dropped and rebuilt: the outbox remembers which items
 # were announced, and losing it would announce them all again.
-KEEP_ON_REBUILD = ("arrivals", "record_meta", "collection_defs")
+KEEP_ON_REBUILD = ("arrivals", "record_meta", "collection_defs", "exhaustive_tags")
 # Items Plex added before the arrivals outbox existed are recorded as announced, not announced: the
 # first deploy must not post a week of catch-up arrivals at once.
 ARRIVALS_SINCE = "arrivals_since"
@@ -48,6 +48,8 @@ MIGRATIONS = {
     5: (),
     # v7: wanted.tagged: the ids an acquire: exhaustive collection has tagged exhaustive-<slug> in Radarr.
     6: ("ALTER TABLE wanted ADD COLUMN tagged INTEGER NOT NULL DEFAULT 0",),
+    # v8: exhaustive_tags (CREATE IF NOT EXISTS in _create): the Radarr tag labels a Kometa run applied for an acquire: exhaustive collection. Orphan cleanup only ever strips these.
+    7: (),
 }
 # Readers (the arrival handler) can afford to wait; a Kometa run must not stall on a held lock,
 # so its writes use a short timeout and give up for the rest of the run after repeated failures.
@@ -145,6 +147,12 @@ CREATE TABLE IF NOT EXISTS watch_seen (
     url TEXT PRIMARY KEY,
     hash TEXT NOT NULL,
     seen_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS exhaustive_tags (
+    label TEXT PRIMARY KEY,
+    library TEXT NOT NULL,
+    name TEXT NOT NULL,
+    applied_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS collection_defs (
     library TEXT NOT NULL,
@@ -284,6 +292,7 @@ def write_collection(conn, snapshot):
     unknown; used only when there is no earlier record to diff against),
     wanted (list of (ext_id, filtered, held_back, position); filtered is True/False, or None when
     run_missing never evaluated the id),
+    exhaustive_tag (optional: the Radarr tag label this run's sync_tag applied; it is what makes the tag Kometa's to strip later),
     tagged (optional: tmdb ids an acquire: exhaustive collection carries the Radarr tag on after this run; None or absent keeps the last recorded set),
     observed_at (optional aware datetime: when this run started reading the collection from Plex).
 
@@ -389,6 +398,8 @@ def write_collection(conn, snapshot):
                 "INSERT OR REPLACE INTO members (library, name, rating_key, ext_id, position, source, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [(library, name, rk, ext_id, pos, SOURCE_TRIGGER if rk in kept else SOURCE_RUN, kept.get(rk)) for rk, ext_id, pos in members],
             )
+        if snapshot.get("exhaustive_tag"):
+            conn.execute("INSERT OR REPLACE INTO exhaustive_tags (label, library, name, applied_at) VALUES (?, ?, ?, ?)", (snapshot["exhaustive_tag"].lower(), library, name, now))
         conn.execute("DELETE FROM wanted WHERE library = ? AND name = ?", (library, name))
         conn.executemany(
             "INSERT OR REPLACE INTO wanted (library, name, ext_id, filtered, held_back, position, tagged) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -401,6 +412,15 @@ def write_collection(conn, snapshot):
         conn.execute("ROLLBACK")
         raise
     return events
+
+
+def recorded_exhaustive_tags(conn):
+    """The Radarr tag labels (lowercase) a Kometa run has applied for acquire: exhaustive collections: the only tags orphan cleanup may strip."""
+    return {row["label"] for row in conn.execute("SELECT label FROM exhaustive_tags")}
+
+
+def forget_exhaustive_tags(conn, labels):
+    conn.executemany("DELETE FROM exhaustive_tags WHERE label = ?", [(label.lower(),) for label in labels])
 
 
 def mark_deleted(conn, library, mapping_name):
@@ -932,6 +952,7 @@ def build_snapshot(builder, library, metadata, add_ran, sync_ran, mapping_name=N
         "wanted": wanted,
         "watch_urls": _watch_urls(builder),
         "tagged": builder.exhaustive_tagged if getattr(builder, "exhaustive", False) else None,
+        "exhaustive_tag": getattr(builder, "exhaustive_tag_applied", None) if getattr(builder, "exhaustive", False) else None,
     }
 
 
