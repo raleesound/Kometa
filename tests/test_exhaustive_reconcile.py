@@ -83,6 +83,20 @@ class TestOwnedTags:
         open(config, "w").write(text)
         assert exhaustive_reconcile.owned_tags(config)[0] is None
 
+    @pytest.mark.parametrize("collections", ["  Yes:\n    acquire: exhaustive\n", "  Picks:\n    name: 12:30\n    acquire: exhaustive\n", "  Picks:\n    name: 010\n    acquire: exhaustive\n"])
+    def test_a_name_yaml_1_1_and_1_2_read_differently_answers_none(self, tmp_path, collections):
+        config, _ = _config(tmp_path, collections)
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_a_folder_with_brackets_is_read_and_an_empty_or_missing_one_answers_none(self, tmp_path):
+        folder = tmp_path / "charts [new]"
+        folder.mkdir()
+        config = tmp_path / "config.yml"
+        config.write_text(f"libraries:\n  Movies:\n    collection_files:\n      - folder: {folder}\n")
+        assert exhaustive_reconcile.owned_tags(str(config))[0] is None
+        (folder / "x.yml").write_text("collections:\n  Picks:\n    acquire: exhaustive\n")
+        assert exhaustive_reconcile.owned_tags(str(config)) == ({"exhaustive-picks"}, None)
+
     def test_dynamic_collections_answer_none(self, tmp_path):
         config, movies = _config(tmp_path, "  Picks:\n    tmdb_movie: 1\n")
         movies.write_text("dynamic_collections:\n  X:\n    type: genre\n    template: {name: t}\ntemplates:\n  t:\n    acquire: exhaustive\n")

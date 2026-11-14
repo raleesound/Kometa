@@ -52,7 +52,11 @@ def _local_files(config, root):
                     paths.append((str(library), _resolve(entry["file"], root)))
                 if isinstance(entry.get("folder"), str):
                     folder = _resolve(entry["folder"], root)
-                    paths.extend((str(library), p) for p in sorted(glob.glob(os.path.join(folder, "*.yml")) + glob.glob(os.path.join(folder, "*.yaml"))))
+                    escaped = glob.escape(folder)
+                    found = sorted(glob.glob(os.path.join(escaped, "*.yml")) + glob.glob(os.path.join(escaped, "*.yaml")))
+                    if not found:
+                        return paths, f"{library} {key} folder {os.path.basename(folder)} holds no yaml files right now"
+                    paths.extend((str(library), p) for p in found)
     return paths, None
 
 
@@ -99,7 +103,8 @@ def _effective_name(key, sources):
     if any(k in source for source in sources for k in UNRESOLVABLE_NAME_KEYS) or any("name" in source for source in sources[1:]):
         raise ValueError("its name may be changed by a template, alias or translation")
     name = sources[0].get("name", key)
-    if not isinstance(name, (str, int, float)) or "<<" in str(name):
+    # PyYAML (YAML 1.1) and Kometa's ruamel (1.2) read Yes / 12:30 / 010 differently; only a string is the same under both.
+    if not isinstance(name, str) or "<<" in name:
         raise ValueError("its name is not a literal")
     return str(name)
 
