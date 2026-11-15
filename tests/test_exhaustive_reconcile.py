@@ -118,6 +118,98 @@ class TestOwnedTags:
         movies.write_text("dynamic_collections:\n  X:\n    type: genre\n    template: {name: t}\ntemplates:\n  t:\n    acquire: exhaustive\n")
         assert exhaustive_reconcile.owned_tags(config)[0] is None
 
+    SEASONAL = (
+        "external_templates:\n  default: templates\ntemplates:\n  holiday:\n    default:\n      sync_mode: sync\n"
+        "dynamic_collections:\n  Seasonal:\n    type: custom\n    data: {easter: Easter}\n    template: [holiday, shared, arr]\n    template_variables:\n      emoji: {easter: x}\n"
+    )
+
+    def test_a_dynamic_block_that_cannot_carry_the_key_does_not_stop_the_scan(self, tmp_path):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        movies.write_text(self.SEASONAL + "collections:\n  Picks:\n    acquire: exhaustive\n")
+        assert exhaustive_reconcile.owned_tags(config) == ({"exhaustive-picks"}, None)
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            "    type: custom\n    template_variables: {acquire: exhaustive}\n",
+            "    type: custom\n    template_variables: {x: acquire}\n",
+            "    type: custom\n    template: [holiday, no_such_template]\n",
+            "    type: custom\n    template: {name: <<which>>}\n",
+            "    type: custom\n    template: holiday\n    other_template: no_such_template\n",
+            "    type: custom\n    <<key>>: exhaustive\n",
+        ],
+    )
+    def test_a_dynamic_block_that_might_carry_the_key_still_stops_the_scan(self, tmp_path, block):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        movies.write_text("templates:\n  holiday:\n    default: {sync_mode: sync}\ndynamic_collections:\n  Seasonal:\n" + block + "collections:\n  Picks:\n    acquire: exhaustive\n")
+        owned, reason = exhaustive_reconcile.owned_tags(config)
+        assert owned is None and "dynamic_collections" in reason
+
+    def test_a_local_template_with_the_key_stops_the_scan(self, tmp_path):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        movies.write_text("templates:\n  t:\n    default: {acquire: exhaustive}\ndynamic_collections:\n  D:\n    type: custom\n    template: t\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+        # a local template shadowing a built-in name and setting the key
+        movies.write_text("templates:\n  shared:\n    acquire: exhaustive\ndynamic_collections:\n  D:\n    type: custom\n    template: shared\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+        # other_template as a list naming a defined template that sets the key, and an upper-case key
+        movies.write_text("templates:\n  t:\n    Acquire: exhaustive\ndynamic_collections:\n  D:\n    type: custom\n    other_template: [t]\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+        movies.write_text("dynamic_collections:\n  D:\n    type: custom\n    template_variables: {Acquire: exhaustive}\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    @pytest.mark.parametrize("body", ["dynamic_collections: [x]\n", "dynamic_collections:\n  D: nope\n"])
+    def test_a_dynamic_collections_value_that_is_not_a_mapping_stops_the_scan(self, tmp_path, body):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        movies.write_text(body)
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    @pytest.mark.parametrize("external", ["  file: /somewhere/else.yml\n", "  url: https://example.com/t.yml\n", "  git: x\n", "  repo: x\n", "  default: templates\n  file: /x.yml\n", "  default: other\n"])
+    def test_built_in_names_are_not_trusted_when_external_templates_can_supply_them(self, tmp_path, external):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        head = "external_templates:\n" + external
+        movies.write_text(head + "dynamic_collections:\n  D:\n    type: custom\n    template: shared\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+        movies.write_text(head + "collections:\n  Picks:\n    template: shared\n    acquire: exhaustive\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_external_templates_that_are_unparseable_stop_the_scan(self, tmp_path):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        movies.write_text("external_templates: [a, b]\ndynamic_collections:\n  D:\n    type: custom\n    template: shared\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_a_template_defined_only_in_config_yml_is_not_defined(self, tmp_path):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        movies.write_text("dynamic_collections:\n  D:\n    type: custom\n    template: from_config\ncollections:\n  Picks:\n    acquire: exhaustive\n")
+        open(config, "w").write("templates:\n  from_config:\n    sync_mode: sync\n" + open(config).read())
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_a_failed_built_in_read_is_not_remembered(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(exhaustive_reconcile, "_BUILTINS", [])
+        real = exhaustive_reconcile._read_yaml
+        monkeypatch.setattr(exhaustive_reconcile, "_read_yaml", lambda p: (_ for _ in ()).throw(OSError("boom")))
+        assert exhaustive_reconcile._builtin_templates() == {}
+        monkeypatch.setattr(exhaustive_reconcile, "_read_yaml", real)
+        assert "shared" in exhaustive_reconcile._builtin_templates()
+
+    def test_a_template_full_of_suffix_variable_keys_is_fine_but_a_key_that_could_spell_the_attribute_is_not(self, tmp_path):
+        assert exhaustive_reconcile._mentions_acquire({"default": {"sync_mode_<<key>>": "x", "radarr_tag_<<key>>": 1}}) is False
+        for key in ("<<k>>", "ac<<x>>", "<<a>>quire"):
+            assert exhaustive_reconcile._mentions_acquire({"default": {key: 1}}) is True
+
+    def test_a_collection_may_name_a_built_in_template_but_one_that_can_rename_it_cannot_own_a_tag(self, tmp_path):
+        config, movies = _config(tmp_path, "  Picks:\n    template: {name: arr}\n    acquire: exhaustive\n  Sep:\n    template: {name: separator}\n")
+        assert exhaustive_reconcile.owned_tags(config) == ({"exhaustive-picks"}, None)
+        movies.write_text("collections:\n  Picks:\n    template: {name: shared}\n    acquire: exhaustive\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+        movies.write_text("collections:\n  Picks:\n    template: {name: not_a_builtin}\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_the_built_in_templates_the_scan_trusts_are_real_and_never_mention_the_key(self):
+        builtin = exhaustive_reconcile._builtin_templates()
+        assert {"shared", "arr"} <= set(builtin)
+        assert not any(exhaustive_reconcile._mentions_acquire(v, variable_keys=False) for v in builtin.values())
+
     def test_a_missing_unparsable_or_remote_file_answers_none(self, tmp_path):
         config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
         movies.write_text("collections: [unclosed\n")
