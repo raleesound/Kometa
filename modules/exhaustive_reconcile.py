@@ -6,7 +6,7 @@ would leave its films tagged (and hunted) forever. This module reads the collect
 the configured ``acquire: exhaustive`` collections own, and removes every other ``exhaustive-<slug>`` tag from Radarr.
 
 It is built never to guess. ``owned_tags`` answers ``None`` (and why) whenever the config cannot be read completely and
-literally: a file that will not parse or is missing, a remote (url/git/repo) collection file, a template that is not defined in its own
+literally: a file that will not parse or is missing, a remote (url/git/repo) or inline-data collection file, a dynamic_collections block that could carry the key, a template that is not defined in its own
 file, an ``acquire`` value or collection name that is a template variable. Nothing is untagged then. Only labels of the exact form
 ``exhaustive-<slug>`` (lowercase a-z, 0-9, single hyphens) are touched: the bare ``exhaustive`` tag, ``exhaustive_x`` and every other
 tag are never read as ours. Only the stdlib, ruamel.yaml (Kometa's own loader) and arrapi are used, so the import trigger can run it.
@@ -54,6 +54,10 @@ def _local_files(config, root):
                     return paths, f"{library} {key} has an entry that is not a mapping"
                 if any(k in entry for k in REMOTE_KEYS):
                     return paths, f"{library} {key} lists a remote file"
+                if any(str(k).strip().lower() in ("data", "pmm") for k in entry):
+                    return paths, f"{library} {key} has an entry with inline data or pmm that this scan does not read"
+                if _mentions_acquire(entry):
+                    return paths, f"{library} {key} has an entry that mentions acquire"
                 if isinstance(entry.get("file"), str):
                     paths.append((str(library), _resolve(entry["file"], root)))
                 if isinstance(entry.get("folder"), str):
@@ -94,6 +98,8 @@ def _sources(block, templates, builtin):
     template = sources[0].get("template")
     for item in template if isinstance(template, list) else [template]:
         name = item.get("name") if isinstance(item, dict) else item
+        if item is not None and not isinstance(name, str):
+            raise ValueError("it names a template this scan cannot read")
         if isinstance(name, str):
             if isinstance(templates.get(name), dict):
                 sources.append(_lower(templates[name]))
@@ -186,18 +192,21 @@ def _dynamic_blocker(data, defined, builtin):
             return f"dynamic collection {key} is not a mapping"
         if _mentions_acquire(block) or _mentions_acquire(key):
             return f"dynamic collection {key} mentions acquire"
-        lowered = _lower(block)
+        try:
+            lowered = _lower(block)
+        except ValueError:
+            return f"dynamic collection {key} has an attribute whose key is a template variable"
         names = []
         for field in ("template", "other_template"):
             value = lowered.get(field)
             for item in value if isinstance(value, list) else [value]:
                 name = item.get("name") if isinstance(item, dict) else item
-                if name is not None:
+                if item is not None:
                     names.append(name)
         for name in names:
             if not isinstance(name, str) or "<<" in name:
                 return f"dynamic collection {key} names a template this scan cannot read"
-            if name in defined:
+            if isinstance(defined.get(name), dict):
                 if _mentions_acquire(defined[name]):
                     return f"dynamic collection {key} uses template {name}, which mentions acquire"
             elif name not in builtin or _mentions_acquire(builtin[name], variable_keys=False):
