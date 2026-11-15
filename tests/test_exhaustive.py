@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 
 import modules.builder  # noqa: F401
 from modules import add_budget, exhaustive_reconcile, live_record
@@ -304,3 +307,102 @@ class TestRecord:
         assert c.execute("SELECT tagged FROM wanted WHERE ext_id = 511").fetchone()[0] == 1
         assert live_record.recorded_exhaustive_tags(c) == set()
         c.close()
+
+
+class _StubRadarr(requests.adapters.BaseAdapter):
+    """A Radarr that answers over a real requests.Session, so arrapi's real RadarrAPI/RadarrRawAPI classes run unmodified."""
+
+    def __init__(self, movies):
+        super().__init__()
+        self.movies = movies  # {tmdbId: [tag ids]}
+        self.tags = [{"id": 1, "label": "exhaustive-picks"}]
+        self.requests = []
+        self.timeouts = []
+
+    def close(self):
+        pass
+
+    def send(self, request, **kwargs):
+        self.timeouts.append(kwargs.get("timeout"))
+        path = request.path_url.split("?")[0]
+        body = json.loads(request.body) if request.body else None
+        self.requests.append((request.method, path, body))
+        if path.endswith("/system/status"):
+            payload = {"version": "5.0.0.0"}
+        elif path.endswith("/tag"):
+            payload = self.tags
+        elif path.endswith("/movie"):
+            payload = [{"id": i, "tmdbId": t, "title": f"T{t}", "tags": tags} for i, (t, tags) in enumerate(self.movies.items(), start=100)]
+        elif path.endswith("/movie/editor"):
+            payload = []
+            for tmdb_id, ids in [(t, self.movies[t]) for t in self.movies if 100 + list(self.movies).index(t) in body["movieIds"]]:
+                tag_ids = body.get("tags") or []
+                self.movies[tmdb_id] = sorted(set(ids) | set(tag_ids)) if body.get("applyTags") == "add" else [i for i in ids if i not in tag_ids]
+        elif re.search(r"/movie/\d+$", path):
+            tmdb_id, tags = list(self.movies.items())[int(path.rsplit("/", 1)[1]) - 100]
+            payload = {"id": int(path.rsplit("/", 1)[1]), "tmdbId": tmdb_id, "title": f"T{tmdb_id}", "tags": tags}
+        elif request.method == "DELETE" and re.search(r"/tag/\d+$", path):
+            self.tags = [t for t in self.tags if t["id"] != int(path.rsplit("/", 1)[1])]
+            payload = {}
+        else:
+            raise AssertionError(f"unexpected Radarr call {request.method} {path}")
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(payload).encode()
+        response.url = request.url
+        return response
+
+
+def _real_radarr(monkeypatch, movies):
+    """A modules.radarr.Radarr holding a REAL arrapi.RadarrAPI built the way Kometa builds it: RadarrAPI(url, token, session=<requests session>)."""
+    from arrapi import RadarrAPI
+
+    monkeypatch.setattr("modules.radarr.logger", FakeLogger())
+    from modules.radarr import Radarr
+
+    session = requests.Session()
+    stub = _StubRadarr(movies)
+    session.mount("http://", stub)
+    r = Radarr.__new__(Radarr)
+    r.api = RadarrAPI("http://radarr:7878", "key", session=session)
+    return r, stub
+
+
+class TestRealArrapiShape:
+    def test_the_real_api_keeps_its_session_on_the_raw_client_not_on_itself(self):
+        from arrapi import RadarrAPI
+
+        api = RadarrAPI("http://radarr:7878", "key", session=_session_with(_StubRadarr({})))
+        assert not hasattr(api, "session") and api._raw.session is not None  # the shape that S9d's fake API hid
+
+    def test_sync_tag_on_the_real_class_tags_with_a_timeout_on_every_request(self, monkeypatch):
+        r, stub = _real_radarr(monkeypatch, {1: [], 2: [1], 3: []})
+        stub.timeouts.clear()  # building the API probes system/status before sync_tag can bind: Kometa's own, out of scope here
+        assert r.sync_tag(TAG, {1}) == {1}
+        edits = [(method, path, body) for method, path, body in stub.requests if path.endswith("/movie/editor")]
+        assert [m for m, _, _ in edits] == ["PUT", "PUT"] and {len(body["movieIds"]) for _, _, body in edits} == {1}
+        assert {tuple(body["movieIds"]) for _, _, body in edits} == {(100,), (101,)}
+        assert stub.timeouts and all(t == exhaustive_reconcile.TIMEOUT for t in stub.timeouts)
+
+    def test_run_exhaustive_end_to_end_through_the_real_class_records_the_tag(self, monkeypatch):
+        r, stub = _real_radarr(monkeypatch, {1: [], 2: []})
+        b = _builder(monkeypatch, r, missing_passed_movies=[1], missing_movies=[1], missing_filtered_movies=[])
+        b.run_exhaustive()
+        assert b.exhaustive_tagged == {1} and b.exhaustive_tag_applied == TAG
+        assert any(p.endswith("/movie/editor") for _, p, _ in stub.requests)
+
+    def test_strip_orphans_on_the_real_class(self):
+        from arrapi import RadarrAPI
+
+        stub = _StubRadarr({1: [1], 2: []})
+        api = RadarrAPI("http://radarr:7878", "key", session=_session_with(stub))
+        exhaustive_reconcile.bound(api)
+        log = MagicMock()
+        assert exhaustive_reconcile.strip_orphans(api, set(), {TAG}, log) == {TAG: 1}
+        assert any(m == "DELETE" and p.endswith("/tag/1") for m, p, _ in stub.requests)
+
+
+def _session_with(stub):
+    session = requests.Session()
+    session.mount("http://", stub)
+    return session

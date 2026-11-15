@@ -299,7 +299,7 @@ TIMEOUT = (5, 60)  # (connect, read) seconds for every Radarr call made here and
 
 def bound(api):
     """Give every request ``api`` makes a timeout. A timeout surfaces as arrapi's ConnectionFailure, which callers log and skip."""
-    session = api.session
+    session = getattr(api, "_raw", api).session  # arrapi's RadarrAPI holds its requests.Session on the raw client
     if getattr(session, "_exhaustive_bound", False):
         return api
     request = session.request
