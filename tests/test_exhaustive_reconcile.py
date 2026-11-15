@@ -178,6 +178,34 @@ class TestOwnedTags:
         movies.write_text("external_templates: [a, b]\ndynamic_collections:\n  D:\n    type: custom\n    template: shared\n")
         assert exhaustive_reconcile.owned_tags(config)[0] is None
 
+    @pytest.mark.parametrize("value", ["null", "[x]", "bar"])
+    def test_a_non_mapping_template_does_not_count_as_defined(self, tmp_path, value):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        movies.write_text("external_templates:\n  file: /x.yml\ntemplates:\n  foo: " + value + "\ndynamic_collections:\n  D:\n    type: custom\n    template: foo\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+        movies.write_text("external_templates:\n  file: /x.yml\ntemplates:\n  foo: " + value + "\ncollections:\n  Picks:\n    template: foo\n    acquire: exhaustive\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_a_template_item_with_no_name_stops_the_scan(self, tmp_path):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        movies.write_text("dynamic_collections:\n  D:\n    type: custom\n    template: {Name: shared}\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+        movies.write_text("collections:\n  Picks:\n    template: {Name: shared}\n    acquire: exhaustive\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    @pytest.mark.parametrize("entry", ["data: {collections: {X: {acquire: exhaustive}}}", "pmm: basic", "default: imdb\n        template_variables: {acquire: exhaustive}"])
+    def test_a_collection_files_entry_the_scan_cannot_read_stops_it(self, tmp_path, entry):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        text = open(config).read().replace("      - file:", "      - " + entry + "\n      - file:", 1)
+        open(config, "w").write(text)
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_a_default_entry_that_never_mentions_the_key_is_fine(self, tmp_path):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        text = open(config).read().replace("      - file:", "      - default: imdb\n        template_variables: {use_lowest: false}\n      - file:", 1)
+        open(config, "w").write(text)
+        assert exhaustive_reconcile.owned_tags(config) == ({"exhaustive-picks"}, None)
+
     def test_a_template_defined_only_in_config_yml_is_not_defined(self, tmp_path):
         config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
         movies.write_text("dynamic_collections:\n  D:\n    type: custom\n    template: from_config\ncollections:\n  Picks:\n    acquire: exhaustive\n")
