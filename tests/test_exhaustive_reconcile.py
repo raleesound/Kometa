@@ -145,14 +145,52 @@ class TestOwnedTags:
         owned, reason = exhaustive_reconcile.owned_tags(config)
         assert owned is None and "dynamic_collections" in reason
 
-    def test_a_local_template_with_the_key_stops_the_scan_and_one_from_config_yml_counts_as_defined(self, tmp_path):
+    def test_a_local_template_with_the_key_stops_the_scan(self, tmp_path):
         config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
         movies.write_text("templates:\n  t:\n    default: {acquire: exhaustive}\ndynamic_collections:\n  D:\n    type: custom\n    template: t\n")
         assert exhaustive_reconcile.owned_tags(config)[0] is None
+        # a local template shadowing a built-in name and setting the key
+        movies.write_text("templates:\n  shared:\n    acquire: exhaustive\ndynamic_collections:\n  D:\n    type: custom\n    template: shared\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+        # other_template as a list naming a defined template that sets the key, and an upper-case key
+        movies.write_text("templates:\n  t:\n    Acquire: exhaustive\ndynamic_collections:\n  D:\n    type: custom\n    other_template: [t]\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+        movies.write_text("dynamic_collections:\n  D:\n    type: custom\n    template_variables: {Acquire: exhaustive}\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    @pytest.mark.parametrize("body", ["dynamic_collections: [x]\n", "dynamic_collections:\n  D: nope\n"])
+    def test_a_dynamic_collections_value_that_is_not_a_mapping_stops_the_scan(self, tmp_path, body):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        movies.write_text(body)
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    @pytest.mark.parametrize("external", ["  file: /somewhere/else.yml\n", "  url: https://example.com/t.yml\n", "  git: x\n", "  repo: x\n", "  default: templates\n  file: /x.yml\n", "  default: other\n"])
+    def test_built_in_names_are_not_trusted_when_external_templates_can_supply_them(self, tmp_path, external):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        head = "external_templates:\n" + external
+        movies.write_text(head + "dynamic_collections:\n  D:\n    type: custom\n    template: shared\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+        movies.write_text(head + "collections:\n  Picks:\n    template: shared\n    acquire: exhaustive\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_external_templates_that_are_unparseable_stop_the_scan(self, tmp_path):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
+        movies.write_text("external_templates: [a, b]\ndynamic_collections:\n  D:\n    type: custom\n    template: shared\n")
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_a_template_defined_only_in_config_yml_is_not_defined(self, tmp_path):
+        config, movies = _config(tmp_path, "  Picks:\n    acquire: exhaustive\n")
         movies.write_text("dynamic_collections:\n  D:\n    type: custom\n    template: from_config\ncollections:\n  Picks:\n    acquire: exhaustive\n")
-        text = open(config).read()
-        open(config, "w").write("templates:\n  from_config:\n    sync_mode: sync\n" + text)
-        assert exhaustive_reconcile.owned_tags(config) == ({"exhaustive-picks"}, None)
+        open(config, "w").write("templates:\n  from_config:\n    sync_mode: sync\n" + open(config).read())
+        assert exhaustive_reconcile.owned_tags(config)[0] is None
+
+    def test_a_failed_built_in_read_is_not_remembered(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(exhaustive_reconcile, "_BUILTINS", [])
+        real = exhaustive_reconcile._read_yaml
+        monkeypatch.setattr(exhaustive_reconcile, "_read_yaml", lambda p: (_ for _ in ()).throw(OSError("boom")))
+        assert exhaustive_reconcile._builtin_templates() == {}
+        monkeypatch.setattr(exhaustive_reconcile, "_read_yaml", real)
+        assert "shared" in exhaustive_reconcile._builtin_templates()
 
     def test_a_template_full_of_suffix_variable_keys_is_fine_but_a_key_that_could_spell_the_attribute_is_not(self, tmp_path):
         assert exhaustive_reconcile._mentions_acquire({"default": {"sync_mode_<<key>>": "x", "radarr_tag_<<key>>": 1}}) is False

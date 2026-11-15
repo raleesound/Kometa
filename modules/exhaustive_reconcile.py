@@ -12,7 +12,6 @@ file, an ``acquire`` value or collection name that is a template variable. Nothi
 tag are never read as ours. Only the stdlib, ruamel.yaml (Kometa's own loader) and arrapi are used, so the import trigger can run it.
 """
 
-import functools
 import glob
 import logging
 import os
@@ -80,10 +79,18 @@ def _lower(source):
     return out
 
 
-def _sources(block, templates):
-    """[block, *templates it names], each key-lowercased; raises ValueError when a named template is not defined in its own file."""
+def _builtins_for(data):
+    """The built-in templates a file may name without defining them: only when its ``external_templates`` is absent or exactly Kometa's shipped
+    ``default: templates``. Any file/url/git/repo entry can supply a template this scan never reads, so nothing then counts as built in."""
+    external = data.get("external_templates")
+    if external is None or external == {"default": "templates"}:
+        return _builtin_templates()
+    return {}
+
+
+def _sources(block, templates, builtin):
+    """[block, *templates it names], each key-lowercased; raises ValueError when a named template is neither defined in its own file nor a trusted built-in."""
     sources = [_lower(block)]
-    builtin = _builtin_templates()
     template = sources[0].get("template")
     for item in template if isinstance(template, list) else [template]:
         name = item.get("name") if isinstance(item, dict) else item
@@ -145,26 +152,35 @@ def _can_rename(node):
     return False
 
 
-@functools.lru_cache(maxsize=1)
+_BUILTINS = []
+
+
 def _builtin_templates():
-    """{name: definition} of the templates Kometa ships in its own defaults/templates.yml; {} when it cannot be read (then nothing counts as built in)."""
+    """{name: definition} of the templates Kometa ships in its own defaults/templates.yml; {} when it cannot be read (then nothing counts as built in).
+    Only a successful read is remembered."""
+    if _BUILTINS:
+        return _BUILTINS[0]
     try:
         data = _read_yaml(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "defaults", "templates.yml"))
         found = data.get("templates") if isinstance(data, dict) else None
-        return {k: v for k, v in found.items() if isinstance(k, str)} if isinstance(found, dict) else {}
+        built = {k: v for k, v in found.items() if isinstance(k, str)} if isinstance(found, dict) else {}
     except Exception:
         return {}
+    if built:
+        _BUILTINS.append(built)
+    return built
 
 
-def _dynamic_blocker(data, defined):
+def _dynamic_blocker(data, defined, builtin):
     """Why a file's dynamic_collections might carry ``acquire`` (so the scan cannot say which names it owns), or None when it provably cannot.
 
-    Safe only when (a) no block mentions ``acquire`` anywhere, and (b) every template a block names is defined in a scanned file (``defined``: file and config.yml
-    templates) without ``acquire``, or is one of Kometa's own built-in templates, which do not carry it. An unknown template name keeps the scan aborting."""
+    Safe only when (a) no block mentions ``acquire`` anywhere, and (b) every template a block names is defined in the file without ``acquire``, or is one of
+    Kometa's own built-in templates (``builtin``: empty unless the file's external_templates is absent or the shipped default), which do not carry it.
+    An unknown template name keeps the scan aborting.
+    """
     blocks = data.get("dynamic_collections")
     if not isinstance(blocks, dict):
         return "its dynamic_collections is not a mapping"
-    builtin = _builtin_templates()
     for key, block in blocks.items():
         if not isinstance(block, dict):
             return f"dynamic collection {key} is not a mapping"
@@ -201,7 +217,6 @@ def exhaustive_collections(config_path, root=None):
             return None, remote
         if not files:
             return None, "config.yml lists no collection files"
-        config_templates = config["templates"] if isinstance(config.get("templates"), dict) else {}
         found = []
         for library, path in files:
             try:
@@ -211,7 +226,7 @@ def exhaustive_collections(config_path, root=None):
             if not isinstance(data, dict):
                 return None, f"{os.path.basename(path)} is not a mapping document"
             if data.get("dynamic_collections"):
-                blocker = _dynamic_blocker(data, {**config_templates, **(data["templates"] if isinstance(data.get("templates"), dict) else {})})
+                blocker = _dynamic_blocker(data, data["templates"] if isinstance(data.get("templates"), dict) else {}, _builtins_for(data))
                 if blocker:
                     return None, f"{os.path.basename(path)} has dynamic_collections whose names this scan cannot resolve: {blocker}"
             collections = data.get("collections")
@@ -224,7 +239,7 @@ def exhaustive_collections(config_path, root=None):
                 if not isinstance(block, dict):
                     return None, f"{os.path.basename(path)}: collection {name} is not a mapping"
                 try:
-                    sources = _sources(block, {**config_templates, **templates})
+                    sources = _sources(block, templates, _builtins_for(data))
                     values = _acquire_values(sources)
                     if "exhaustive" in values:
                         found.append((library, _effective_name(name, sources)))
