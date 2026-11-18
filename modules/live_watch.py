@@ -1,12 +1,12 @@
 """Tell the Letterboxd bridge which third-party Letterboxd lists Kometa collections watch (epic #5634, S5).
 
-A collection with ``live_watch: true`` is built from Letterboxd list URLs. At the end of a full sweep
-Kometa PUTs the set of those URLs (read from the live record) to the bridge's ``/watched-lists``. The
+A collection with ``live_watch: true`` is built from Letterboxd list URLs. After any run that built
+collections (a full sweep or a scoped run; never an item run) Kometa PUTs the set of those URLs (read from the live record) to the bridge's ``/watched-lists``. The
 bridge reads each list on its own cadence and publishes ``letterboxd.watchedlist.updated`` when one
 really changes; the trigger consuming that event rebuilds the collection (S6).
 
 The PUT replaces the whole set, so a collection that is deleted or drops ``live_watch`` stops being
-watched at the next sweep. Configuration comes from the environment, never config.yml:
+watched at the next run that pushes. Configuration comes from the environment, never config.yml:
 ``LB_BRIDGE_URL`` (e.g. http://letterboxd-bridge/api) and ``LB_BRIDGE_TOKEN`` (the bridge's bearer
 token). Nothing here raises, and nothing here talks to letterboxd.com.
 """

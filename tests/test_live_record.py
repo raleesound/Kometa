@@ -974,11 +974,15 @@ class TestWiring:
     def test_a_full_sweep_expires(self):
         assert self._sweep() is True
 
-    def test_a_full_sweep_pushes_the_watched_lists_and_a_partial_run_does_not(self):
+    def test_a_full_sweep_pushes_the_watched_lists(self):
         assert self._sweep() is True
         assert self.pushed is True
-        assert self._sweep(requested_collections=["c1"]) is False
-        assert self.pushed is False
+
+    @pytest.mark.parametrize("override", [{"requested_collections": ["c1"]}, {"requested_files": ["picks"]}])
+    def test_a_scoped_run_pushes_the_watched_lists_without_expiring(self, override):
+        # A scoped /addlist run must hand its new list to the bridge now, not at the next sweep.
+        assert self._sweep(**override) is False
+        assert self.pushed is True
 
     def test_a_resumed_run_never_expires_even_after_resume_is_cleared(self):
         assert self._sweep(resume="c1") is False
