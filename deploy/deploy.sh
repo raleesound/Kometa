@@ -230,7 +230,9 @@ echo "==> Recreating import trigger"
 # shells out to. It listens on Plex's websocket (outbound only, no published port).
 # It refuses to start if that build has no --run-items (Kometa ignores unknown
 # flags and would run a full sweep per import instead). It publishes the arrival
-# outbox to NATS (#5634), so it gets the nkey seed by env file.
+# outbox to NATS (#5634), so it gets the nkey seed by env file. Its collection
+# rebuilds push the live_watch set like any run that builds collections, so it
+# carries the bridge env too (without it each rebuild logs "not telling the bridge").
 docker rm -f kometa-import-trigger >/dev/null 2>&1 || true
 docker run -d \
   --name kometa-import-trigger \
@@ -242,6 +244,8 @@ docker run -d \
   -e DEBOUNCE_SECONDS="${TRIGGER_DEBOUNCE_SECONDS}" \
   -e NATS_URL="${NATS_URL}" \
   --env-file "${NATS_ENV_FILE}" \
+  -e LB_BRIDGE_URL="${LB_BRIDGE_URL}" \
+  --env-file "${BRIDGE_ENV_FILE}" \
   --entrypoint python3 \
   "${IMAGE}:local" /trigger/import_trigger.py
 

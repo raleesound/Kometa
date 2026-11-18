@@ -93,3 +93,15 @@ def test_no_inline_secrets():
 def test_deploy_tree_is_kept_out_of_the_image():
     lines = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
     assert "deploy" in lines
+
+
+def test_every_kometa_container_can_tell_the_bridge():
+    # Any run that builds collections pushes the live_watch set (scoped runs too), and
+    # the import trigger runs scoped rebuilds in its own container. A container started
+    # without the bridge env silently skips the push.
+    text = (DEPLOY / "deploy.sh").read_text(encoding="utf-8")
+    blocks = [b for b in text.split("docker run -d")[1:] if '"${IMAGE}:local"' in b]
+    assert len(blocks) >= 2
+    for block in blocks:
+        assert '-e LB_BRIDGE_URL="${LB_BRIDGE_URL}"' in block, block
+        assert '--env-file "${BRIDGE_ENV_FILE}"' in block, block
