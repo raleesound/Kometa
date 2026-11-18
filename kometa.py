@@ -527,9 +527,9 @@ def expire_live_record(config):
 
 
 def push_live_watch(config):
-    """After a full sweep, tell the Letterboxd bridge which third-party lists live_watch collections
-    are built from (replace-set). Never raises; an unreadable record pushes nothing, so a bad read
-    cannot clear the bridge's set."""
+    """After any run that built collections (a sweep or a scoped run), tell the Letterboxd bridge which
+    third-party lists live_watch collections are built from (replace-set). Never raises; an unreadable
+    record pushes nothing, so a bad read cannot clear the bridge's set."""
     if config.run_items or live_recorder is None:
         return
     try:
@@ -1399,6 +1399,10 @@ def run_libraries(config) -> tuple[LibraryRunStatus, bool]:
                 item_run_failed = True
     if collections_ran and not partial_run:
         expire_live_record(config)
+    if collections_ran:
+        # The watched set is read from the whole record (every live_watch collection synced within
+        # STALE_AFTER), not from this run, so a scoped run pushes the same set a sweep would plus
+        # whatever it just built: an /addlist list is watched as soon as its scoped run finishes.
         push_live_watch(config)
     return library_status, collections_ran
 
